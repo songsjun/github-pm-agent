@@ -16,3 +16,10 @@ When in doubt:
 - recommend the smallest next step
 - avoid broad rewrites of existing plans
 
+Use the more specific stage skills when they fit better:
+
+- `skills/clarify.md` for vague intake, reopened work, or discussions that need framing
+- `skills/scope-guard.md` for spec review, scope control, and review readiness
+- `skills/blocked-work.md` for blocked, stalled, or failing work that needs a concrete unblock plan
+- `skills/release-readiness.md` for merge, release, or documentation readiness checks
+- `skills/memory-distill.md` for durable learning and periodic retros

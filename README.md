@@ -7,6 +7,7 @@ This repository is intentionally scoped as an MVP:
 - single process
 - synchronous execution
 - local file-backed queue and state
+- optional multi-repo polling from one local runtime
 - `gh api` for GitHub reads/writes
 - pluggable AI adapters
 - prompt/template/skill library
@@ -29,27 +30,33 @@ Deterministic work stays deterministic. AI is used for summarization, drafting, 
 
 ## What it covers
 
+- repo notifications for stronger mention signals
+- repo events for push, force-push, branch create/delete, and release signals
 - issue, issue comment, issue event polling
+- milestone polling and project change polling
 - pull request, review, review comment polling
-- workflow run polling
+- workflow run, deployment, release, check-run, and commit-status polling
 - commit polling from the default branch
 - discussion and discussion comment polling through GraphQL
-- mention detection from bodies/comments
+- mention detection from notifications plus bodies/comments
 - local queue and cursor state
+- follow-up scheduling and replay from local memory notes
+- typed memory signals for policy and execution trends
+- durable artifacts for brief/spec/release/retro reuse
 - handler registry for event types
+- `poll`, `cycle`, `reconcile`, `daemon`, `webhook`, `analytics`, and queue inspection commands
 - provider/model-selectable AI adapter
 - prompt, template, memory, and skill loading
-- GitHub mutation helpers with dry-run mode
+- GitHub mutation helpers with dry-run mode, including merge/review/discussion/release/project actions
+- optional second-opinion review mode for high-risk PRs
 
 ## What it does not cover yet
 
 - concurrency
-- background workers
 - database-backed state
-- webhook ingestion
 - advanced scheduling
-- cross-repo orchestration
-- rich policy engine for every PM rule
+- autonomous merge/release behavior
+- a fully declarative policy engine for every PM rule
 
 Those can come later if the loop proves useful.
 
@@ -64,14 +71,14 @@ Those can come later if the loop proves useful.
 Check `gh`:
 
 ```bash
-/opt/homebrew/bin/gh auth status
+gh auth status
 ```
 
 Check local AI CLIs:
 
 ```bash
-/opt/homebrew/bin/codex --version
-/opt/homebrew/bin/gemini --version
+codex --version
+gemini --version
 ```
 
 ### Install
@@ -92,12 +99,16 @@ cp config/example.json config/local.json
 
 Then set the target repository, mentions to watch, and AI provider settings.
 
+You can also provide `github.repos` as a list if you want one runtime to poll multiple repositories.
+
 The example config already includes two local providers:
 
 - `codex_cli` via `scripts/run_ai_cli.py`
 - `gemini_cli` via `scripts/run_ai_cli.py`
 
-`codex_cli` is the default because it is currently the more stable local path on this machine. For Gemini, prefer `gemini-2.5-flash` over the preview default because the preview model may reject requests when capacity is tight.
+The example config resolves `gh`, `codex`, and `gemini` from `PATH`. If your executables live elsewhere, set explicit paths in `config/local.json`.
+
+`codex_cli` is the default because it has been the more stable local CLI provider in practice. For Gemini, prefer `gemini-2.5-flash` over the preview default because the preview model may reject requests when capacity is tight.
 
 ### Run one cycle
 
@@ -116,10 +127,14 @@ This does:
 Current concrete handlers:
 
 - `mention`: AI drafts a bounded response
+- `issue_changed`, `issue_comment`, `pull_request_changed`, `pull_request_review_comment`, `commit`: stage-routed AI handling
 - `stale_pr_review`: deterministic reminder on open PRs with no review after threshold
 - `blocked_issue_stale`: deterministic reminder on long-blocked issues
+- `workflow_failed`, `commit_status_failed`, `check_run_failed`: deterministic triage with escalation metadata
+- `release_readiness`, `review_churn`, `repeated_ci_instability`, `stale_discussion_decision`, `docs_drift_before_release`: synthetic PM signals
 - `issue_event_labeled` with label `blocked`: deterministic blocker-template comment
-- all other events fall back to the generic AI event planner
+- unknown `issue_event_*`: memory-only observation fallback
+- other events fall back to stage-aware AI routing rather than one generic prompt
 
 ### Useful commands
 
@@ -128,6 +143,10 @@ github-pm-agent poll --config config/local.json
 github-pm-agent queue list --config config/local.json
 github-pm-agent queue peek --config config/local.json --limit 5
 github-pm-agent cycle --config config/local.json
+github-pm-agent reconcile --config config/local.json
+github-pm-agent analytics --config config/local.json
+github-pm-agent daemon --config config/local.json --interval 60
+github-pm-agent webhook --config config/local.json --event-type issues --payload-file payload.json
 ```
 
 ## Runtime layout
@@ -141,7 +160,12 @@ Everything is local files under `runtime/`:
 - `runtime/seen_ids.json`
 - `runtime/outbox.jsonl`
 - `runtime/memory_notes.jsonl`
+- `runtime/followups.jsonl`
 - `runtime/sessions/`
+- `runtime/memory/distilled.md`
+- `runtime/memory/policy.md`
+- `runtime/memory/trends.md`
+- `runtime/memory/retro.md`
 
 This keeps the MVP inspectable and easy to reset.
 
@@ -167,7 +191,6 @@ It standardizes:
 
 ## Suggested next steps
 
-- move from polling to `webhook + reconcile`
-- add richer action planning on top of the event handlers
 - introduce repo-specific PM policies
-- add a second memory synthesizer tuned for long-lived projects
+- add a more declarative cooldown and escalation policy layer
+- add richer artifact types for release checklists and roadmap sync
