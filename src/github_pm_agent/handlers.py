@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Dict, Tuple
 
+from github_pm_agent.capability_routing import route_for_event
 from github_pm_agent.models import Event
 
 if TYPE_CHECKING:
@@ -14,8 +16,16 @@ HandlerFn = Callable[["EventEngine", Event], Dict]
 def resolve_handler(engine: "EventEngine", event: Event) -> Tuple[str, HandlerFn]:
     if event.event_type == "mention":
         return "mention", handle_mention
+    if event.event_type == "workflow_run":
+        return "workflow_run_observation", handle_workflow_run
     if event.event_type == "workflow_failed":
         return "workflow_failed", handle_workflow_failed
+    if event.event_type == "issue_event_closed":
+        return "issue_closed_observation", handle_issue_event_closed
+    if event.event_type == "issue_event_reopened":
+        return "issue_reopened_followup", handle_issue_event_reopened
+    if event.event_type == "issue_event_assigned":
+        return "issue_assigned_observation", handle_issue_event_assigned
     if event.event_type == "pull_request_review":
         state = (event.metadata.get("state") or "").upper()
         if state == "CHANGES_REQUESTED":
@@ -44,23 +54,80 @@ def handle_mention(engine: "EventEngine", event: Event) -> Dict:
 
 
 def handle_fallback(engine: "EventEngine", event: Event) -> Dict:
-    return engine.run_ai_handler(
+    return _run_capability_route(engine, event)
+
+
+def handle_workflow_run(engine: "EventEngine", event: Event) -> Dict:
+    conclusion = event.metadata.get("conclusion") or "unknown"
+    status = event.metadata.get("status") or "unknown"
+    return engine.finish_plan(
         event,
-        prompt_path="prompts/actions/default_event.md",
+        _memory_only_plan(
+            engine,
+            reason="non-failing workflow runs are informational and should not trigger PM follow-up",
+            target_kind="workflow_run",
+            target_number=event.target_number,
+            memory_note=f"workflow run #{event.target_number or 0} observed with status={status} conclusion={conclusion}",
+        ),
     )
 
 
 def handle_workflow_failed(engine: "EventEngine", event: Event) -> Dict:
-    return engine.run_ai_handler(
-        event,
-        prompt_path="prompts/actions/default_event.md",
-    )
+    return _run_capability_route(engine, event)
 
 
 def handle_discussion(engine: "EventEngine", event: Event) -> Dict:
-    return engine.run_ai_handler(
+    return _run_capability_route(engine, event)
+
+
+def handle_issue_event_closed(engine: "EventEngine", event: Event) -> Dict:
+    closer = event.actor or "unknown actor"
+    return engine.finish_plan(
         event,
-        prompt_path="prompts/actions/default_event.md",
+        _memory_only_plan(
+            engine,
+            reason="closed work items do not need immediate PM follow-up",
+            target_kind="issue",
+            target_number=event.target_number,
+            memory_note=f"work item #{event.target_number} was closed by @{closer}",
+        ),
+    )
+
+
+def handle_issue_event_reopened(engine: "EventEngine", event: Event) -> Dict:
+    actor = event.actor or "someone"
+    message = (
+        f"This work item was reopened by @{actor}.\n\n"
+        "Please add a short status update with:\n"
+        "1. why it was reopened\n"
+        "2. the next concrete action\n"
+        "3. who is driving it now\n"
+        "4. when the next update should be expected"
+    )
+    plan = engine.make_plan(
+        should_act=True,
+        reason="reopened work items need a fresh status update to stay actionable",
+        action_type="comment",
+        target_kind="issue",
+        target_number=event.target_number,
+        message=message,
+        memory_note=f"work item #{event.target_number} was reopened by @{actor}",
+    )
+    return engine.finish_plan(event, plan)
+
+
+def handle_issue_event_assigned(engine: "EventEngine", event: Event) -> Dict:
+    assignee = event.metadata.get("assignee") or "unknown assignee"
+    actor = event.actor or "unknown actor"
+    return engine.finish_plan(
+        event,
+        _memory_only_plan(
+            engine,
+            reason="assignment changes are useful to remember but do not need an extra PM comment",
+            target_kind="issue",
+            target_number=event.target_number,
+            memory_note=f"work item #{event.target_number} was assigned to @{assignee} by @{actor}",
+        ),
     )
 
 
@@ -203,3 +270,34 @@ def _summarize_body(body: str) -> str:
     if len(cleaned) <= 180:
         return cleaned
     return f"{cleaned[:177].rstrip()}..."
+
+
+def _memory_only_plan(
+    engine: "EventEngine",
+    *,
+    reason: str,
+    target_kind: str,
+    target_number: int | None,
+    memory_note: str,
+) -> Dict:
+    return engine.make_plan(
+        should_act=False,
+        reason=reason,
+        action_type="none",
+        target_kind=target_kind,
+        target_number=target_number,
+        message="",
+        memory_note=memory_note,
+    )
+
+
+def _run_capability_route(engine: "EventEngine", event: Event) -> Dict:
+    project_root = Path(engine.config.get("_project_root", ".")).resolve()
+    route = route_for_event(project_root, event)
+    result = engine.run_ai_handler(
+        event,
+        prompt_path=route.prompt_path,
+        skill_refs=route.skill_refs,
+    )
+    result["routing"] = route.to_dict()
+    return result

@@ -95,3 +95,53 @@ class GitHubActionToolkit:
         result = self.client.create_issue(title, body, labels)
         action["result"] = result
         return action
+
+    def assign(self, target_kind: str, target_number: Optional[int], users: Iterable[str]) -> Dict[str, Any]:
+        users = [user for user in users if user]
+        action = {
+            "action_type": "assign",
+            "target_kind": target_kind,
+            "target_number": target_number,
+            "users": users,
+            "dry_run": self.dry_run,
+        }
+        self._record(action)
+        if self.dry_run or not target_number or not users:
+            return action
+        result = self.client.issue_assignees_add(target_number, users)
+        action["result"] = result
+        return action
+
+    def request_review(self, target_number: Optional[int], reviewers: Iterable[str]) -> Dict[str, Any]:
+        reviewers = [reviewer for reviewer in reviewers if reviewer]
+        action = {
+            "action_type": "review_request",
+            "target_kind": "pull_request",
+            "target_number": target_number,
+            "reviewers": reviewers,
+            "dry_run": self.dry_run,
+        }
+        self._record(action)
+        if self.dry_run or not target_number or not reviewers:
+            return action
+        result = self.client.pull_request_reviewers_request(target_number, reviewers)
+        action["result"] = result
+        return action
+
+    def set_state(self, target_kind: str, target_number: Optional[int], state: str) -> Dict[str, Any]:
+        action = {
+            "action_type": "state",
+            "target_kind": target_kind,
+            "target_number": target_number,
+            "state": state,
+            "dry_run": self.dry_run,
+        }
+        self._record(action)
+        if self.dry_run or not target_number or not state:
+            return action
+        if target_kind == "pull_request":
+            result = self.client.pull_request_state_update(target_number, state)
+        else:
+            result = self.client.issue_state_update(target_number, state)
+        action["result"] = result
+        return action

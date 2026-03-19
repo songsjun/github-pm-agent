@@ -4,8 +4,9 @@ import json
 from typing import Any, Dict, Iterable, Optional
 
 from github_pm_agent.handlers import resolve_handler
+from github_pm_agent.memory_loop import MemoryLoop
 from github_pm_agent.models import ActionResult, AiRequest, Event
-from github_pm_agent.utils import append_jsonl, extract_json_object
+from github_pm_agent.utils import extract_json_object
 
 
 class EventEngine:
@@ -20,12 +21,13 @@ class EventEngine:
         self.ai_manager = ai_manager
         self.actions = actions
         self.runtime_dir = runtime_dir
-        self.memory_notes_path = runtime_dir / "memory_notes.jsonl"
+        self.memory_loop = MemoryLoop(runtime_dir, config)
 
     def process(self, event: Event) -> Dict[str, Any]:
         handler_name, handler = resolve_handler(self, event)
         result = handler(self, event)
         result["handler"] = handler_name
+        self.memory_loop.note_activity()
         return result
 
     def run_ai_handler(
@@ -47,7 +49,7 @@ class EventEngine:
                 "event_type": event.event_type,
                 "event_payload": json.dumps(event.to_dict(), indent=2, ensure_ascii=False),
             },
-            memory_refs=list(memory_refs or ["memory/README.md"]),
+            memory_refs=self.memory_loop.memory_refs(memory_refs or ["memory/README.md"]),
             skill_refs=list(skill_refs or ["skills/pm-core.md"]),
             output_template_path="templates/output/action_plan.json",
             output_schema_path="templates/output/action_plan.schema.json",
@@ -89,6 +91,7 @@ class EventEngine:
         message: str,
         labels_to_add: Optional[Iterable[str]] = None,
         labels_to_remove: Optional[Iterable[str]] = None,
+        action_input: Optional[Dict[str, Any]] = None,
         memory_note: str = "",
         issue_title: str = "",
     ) -> Dict[str, Any]:
@@ -100,6 +103,7 @@ class EventEngine:
             "message": message,
             "labels_to_add": list(labels_to_add or []),
             "labels_to_remove": list(labels_to_remove or []),
+            "action_input": dict(action_input or {}),
             "memory_note": memory_note,
             "issue_title": issue_title,
         }
@@ -123,12 +127,13 @@ class EventEngine:
         target_kind = target.get("kind") or event.target_kind
         target_number = target.get("number") or event.target_number
         message = plan.get("message", "")
+        action_input = plan.get("action_input") or {}
         raw: Dict[str, Any] = {}
 
         if not plan.get("should_act"):
-            if plan.get("memory_note"):
-                append_jsonl(self.memory_notes_path, {"event_id": event.event_id, "note": plan["memory_note"]})
-            return ActionResult(False, "none", target, message, raw)
+            result = ActionResult(False, "none", target, message, raw)
+            self.memory_loop.record_plan_result(event, plan, result)
+            return result
 
         if action_type == "comment" and target_number:
             if target_kind == "discussion":
@@ -149,13 +154,18 @@ class EventEngine:
                 body=message,
                 labels=plan.get("labels_to_add", []),
             )
+        elif action_type == "assign" and target_number:
+            raw = self.actions.assign(target_kind, target_number, action_input.get("users", []))
+        elif action_type == "review_request" and target_number:
+            raw = self.actions.request_review(target_number, action_input.get("users", []))
+        elif action_type == "state" and target_number:
+            raw = self.actions.set_state(target_kind, target_number, action_input.get("state", ""))
         else:
             raw = {"note": "no executable action mapped", "message": message}
 
-        if plan.get("memory_note"):
-            append_jsonl(self.memory_notes_path, {"event_id": event.event_id, "note": plan["memory_note"]})
-
-        return ActionResult(True, action_type, target, message, raw)
+        result = ActionResult(True, action_type, target, message, raw)
+        self.memory_loop.record_plan_result(event, plan, result)
+        return result
 
     def _run_supervisor(self, request: AiRequest, response: Any) -> None:
         provider = self.ai_manager.default_provider()
@@ -185,4 +195,10 @@ class EventEngine:
         supervisor_response = self.ai_manager.generate(supervisor_request)
         note = supervisor_response.content.strip()
         if note:
-            append_jsonl(self.memory_notes_path, {"type": "supervisor", "note": note})
+            self.memory_loop.record_supervisor_note(
+                note,
+                metadata={
+                    "repo": request.variables.get("repo", ""),
+                    "prompt_path": request.prompt_path,
+                },
+            )

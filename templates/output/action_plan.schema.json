@@ -10,6 +10,7 @@
     "message",
     "labels_to_add",
     "labels_to_remove",
+    "action_input",
     "memory_note",
     "issue_title"
   ],
@@ -22,7 +23,7 @@
     },
     "action_type": {
       "type": "string",
-      "enum": ["comment", "label", "issue", "none"]
+      "enum": ["comment", "label", "issue", "assign", "review_request", "state", "none"]
     },
     "target": {
       "type": "object",
@@ -48,6 +49,9 @@
     "labels_to_remove": {
       "type": "array",
       "items": { "type": "string" }
+    },
+    "action_input": {
+      "type": "object"
     },
     "memory_note": {
       "type": "string"
