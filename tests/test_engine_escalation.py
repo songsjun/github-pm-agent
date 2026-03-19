@@ -6,6 +6,8 @@ from pathlib import Path
 from github_pm_agent.engine import EventEngine
 from github_pm_agent.models import Event
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 
 def make_event() -> Event:
     return Event(
@@ -114,9 +116,8 @@ class EventEngineEscalationTest(unittest.TestCase):
         self.assertFalse(result["action"]["executed"])
 
     def test_contract_files_include_escalation_fields(self) -> None:
-        root = Path("/Users/sjunsong/Workspace/github-pm-agent")
-        schema = json.loads((root / "templates/output/action_plan.schema.json").read_text(encoding="utf-8"))
-        template = (root / "templates/output/action_plan.json").read_text(encoding="utf-8")
+        schema = json.loads((PROJECT_ROOT / "templates/output/action_plan.schema.json").read_text(encoding="utf-8"))
+        template = (PROJECT_ROOT / "templates/output/action_plan.json").read_text(encoding="utf-8")
 
         for key in [
             "needs_human_decision",

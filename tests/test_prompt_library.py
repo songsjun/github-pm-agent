@@ -5,6 +5,8 @@ from pathlib import Path
 from github_pm_agent.artifact_store import ArtifactStore
 from github_pm_agent.prompt_library import PromptLibrary
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 
 class PromptLibraryTest(unittest.TestCase):
     def test_render_includes_refs(self) -> None:
@@ -43,8 +45,7 @@ class PromptLibraryTest(unittest.TestCase):
             self.assertIn("# Attached Artifacts", rendered)
 
     def test_render_real_stage_prompt_with_skills_and_output_template(self) -> None:
-        root = Path("/Users/sjunsong/Workspace/github-pm-agent")
-        library = PromptLibrary(root)
+        library = PromptLibrary(PROJECT_ROOT)
 
         rendered = library.render(
             system_prompt_path="prompts/system/pm.md",

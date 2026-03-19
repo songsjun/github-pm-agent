@@ -16,11 +16,13 @@ from github_pm_agent.handlers import (
 from github_pm_agent.models import Event
 from github_pm_agent.capability_routing import route_for_event
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 
 class FakeEngine:
     def __init__(self) -> None:
         self.calls = []
-        self.config = {"_project_root": str(Path("/Users/sjunsong/Workspace/github-pm-agent"))}
+        self.config = {"_project_root": str(PROJECT_ROOT)}
 
     def make_plan(self, **kwargs):
         self.calls.append(("make_plan", kwargs))
@@ -265,7 +267,7 @@ class HandlerResolutionTest(unittest.TestCase):
 
     def test_workflow_failed_route_marks_human_escalation(self) -> None:
         route = route_for_event(
-            Path("/Users/sjunsong/Workspace/github-pm-agent"),
+            PROJECT_ROOT,
             self._event("workflow_failed", target_kind="workflow_run"),
         )
         self.assertEqual(route.stage, "blocked_work")

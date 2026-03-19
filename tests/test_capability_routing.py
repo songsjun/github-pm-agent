@@ -5,7 +5,7 @@ from github_pm_agent.capability_routing import route_for_event
 from github_pm_agent.models import Event
 
 
-PROJECT_ROOT = Path("/Users/sjunsong/Workspace/github-pm-agent")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def make_event(event_type: str, *, target_kind: str = "issue", target_number: int = 1) -> Event:
