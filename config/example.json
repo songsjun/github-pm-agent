@@ -4,7 +4,7 @@
     "repos": [
       "songsjun/StudyBuddy"
     ],
-    "gh_path": "/opt/homebrew/bin/gh",
+    "gh_path": "gh",
     "default_branch": "main",
     "mentions": [
       "@songsjun",
@@ -38,7 +38,7 @@
         "provider_name": "codex",
         "script": "scripts/run_ai_cli.py",
         "python_path": "python3",
-        "codex_path": "/opt/homebrew/bin/codex",
+        "codex_path": "codex",
         "default_model": "gpt-5.4"
       },
       "gemini_cli": {
@@ -46,7 +46,7 @@
         "provider_name": "gemini",
         "script": "scripts/run_ai_cli.py",
         "python_path": "python3",
-        "gemini_path": "/opt/homebrew/bin/gemini",
+        "gemini_path": "gemini",
         "default_model": "gemini-2.5-flash"
       },
       "openai": {

@@ -18,8 +18,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cwd", required=True)
     parser.add_argument("--session-key", default="")
     parser.add_argument("--schema-file", default="")
-    parser.add_argument("--codex-path", default="/opt/homebrew/bin/codex")
-    parser.add_argument("--gemini-path", default="/opt/homebrew/bin/gemini")
+    parser.add_argument("--codex-path", default="codex")
+    parser.add_argument("--gemini-path", default="gemini")
     return parser
 
 

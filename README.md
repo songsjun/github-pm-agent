@@ -71,14 +71,14 @@ Those can come later if the loop proves useful.
 Check `gh`:
 
 ```bash
-/opt/homebrew/bin/gh auth status
+gh auth status
 ```
 
 Check local AI CLIs:
 
 ```bash
-/opt/homebrew/bin/codex --version
-/opt/homebrew/bin/gemini --version
+codex --version
+gemini --version
 ```
 
 ### Install
@@ -106,7 +106,9 @@ The example config already includes two local providers:
 - `codex_cli` via `scripts/run_ai_cli.py`
 - `gemini_cli` via `scripts/run_ai_cli.py`
 
-`codex_cli` is the default because it is currently the more stable local path on this machine. For Gemini, prefer `gemini-2.5-flash` over the preview default because the preview model may reject requests when capacity is tight.
+The example config resolves `gh`, `codex`, and `gemini` from `PATH`. If your executables live elsewhere, set explicit paths in `config/local.json`.
+
+`codex_cli` is the default because it has been the more stable local CLI provider in practice. For Gemini, prefer `gemini-2.5-flash` over the preview default because the preview model may reject requests when capacity is tight.
 
 ### Run one cycle
 

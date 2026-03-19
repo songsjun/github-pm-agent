@@ -5,7 +5,7 @@ from github_pm_agent.github_client import GitHubClient
 
 class GitHubClientMethodTest(unittest.TestCase):
     def test_issue_assignees_add_uses_issue_assignees_endpoint(self) -> None:
-        client = GitHubClient("/opt/homebrew/bin/gh", "acme/widgets")
+        client = GitHubClient("gh", "acme/widgets")
         calls = []
 
         def fake_api(path, params=None, method="GET"):
@@ -28,7 +28,7 @@ class GitHubClientMethodTest(unittest.TestCase):
         )
 
     def test_review_request_and_state_methods_use_expected_endpoints(self) -> None:
-        client = GitHubClient("/opt/homebrew/bin/gh", "acme/widgets")
+        client = GitHubClient("gh", "acme/widgets")
         calls = []
 
         def fake_api(path, params=None, method="GET"):
@@ -55,7 +55,7 @@ class GitHubClientMethodTest(unittest.TestCase):
         )
 
     def test_remaining_action_methods_use_expected_endpoints(self) -> None:
-        client = GitHubClient("/opt/homebrew/bin/gh", "acme/widgets")
+        client = GitHubClient("gh", "acme/widgets")
         calls = []
 
         def fake_api(path, params=None, method="GET"):
