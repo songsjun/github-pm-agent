@@ -113,6 +113,18 @@ class GitHubClient:
     def issue_comment(self, number: int, body: str) -> Dict[str, Any]:
         return self.api(f"repos/{self.repo}/issues/{number}/comments", {"body": body}, method="POST")
 
+    def issue_update(self, number: int, **fields: Any) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        for key in ("title", "body", "milestone", "state", "assignees", "labels"):
+            value = fields.get(key)
+            if value is None:
+                continue
+            if key in {"assignees", "labels"}:
+                params[f"{key}[]"] = list(value)
+            else:
+                params[key] = value
+        return self.api(f"repos/{self.repo}/issues/{number}", params, method="PATCH")
+
     def issue_labels_add(self, number: int, labels: Iterable[str]) -> Dict[str, Any]:
         return self.api(
             f"repos/{self.repo}/issues/{number}/labels",
@@ -123,6 +135,13 @@ class GitHubClient:
     def issue_labels_remove(self, number: int, labels: Iterable[str]) -> None:
         for label in labels:
             self.api(f"repos/{self.repo}/issues/{number}/labels/{label}", method="DELETE")
+
+    def issue_assignees_remove(self, number: int, assignees: Iterable[str]) -> Dict[str, Any]:
+        return self.api(
+            f"repos/{self.repo}/issues/{number}/assignees",
+            {"assignees[]": list(assignees)},
+            method="DELETE",
+        )
 
     def create_issue(self, title: str, body: str, labels: Optional[List[str]] = None) -> Dict[str, Any]:
         params: Dict[str, Any] = {"title": title, "body": body}
@@ -137,12 +156,37 @@ class GitHubClient:
             method="POST",
         )
 
+    def pull_request_reviewers_remove(self, number: int, reviewers: Iterable[str]) -> Dict[str, Any]:
+        return self.api(
+            f"repos/{self.repo}/pulls/{number}/requested_reviewers",
+            {"reviewers[]": list(reviewers)},
+            method="DELETE",
+        )
+
     def pull_request_reviewers_request(self, number: int, reviewers: Iterable[str]) -> Dict[str, Any]:
         return self.api(
             f"repos/{self.repo}/pulls/{number}/requested_reviewers",
             {"reviewers[]": list(reviewers)},
             method="POST",
         )
+
+    def pull_request_mark_draft(self, number: int) -> Dict[str, Any]:
+        return self.api(f"repos/{self.repo}/pulls/{number}/convert-to-draft", method="POST")
+
+    def pull_request_mark_ready(self, number: int) -> Dict[str, Any]:
+        return self.api(f"repos/{self.repo}/pulls/{number}/ready_for_review", method="POST")
+
+    def pull_request_merge(self, number: int, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = dict(params or {})
+        return self.api(f"repos/{self.repo}/pulls/{number}/merge", payload, method="PUT")
+
+    def pull_request_review_submit(self, number: int, decision: str, body: str = "", commit_id: str = "") -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"event": decision}
+        if body:
+            payload["body"] = body
+        if commit_id:
+            payload["commit_id"] = commit_id
+        return self.api(f"repos/{self.repo}/pulls/{number}/reviews", payload, method="POST")
 
     def issue_state_update(self, number: int, state: str) -> Dict[str, Any]:
         return self.api(
@@ -158,6 +202,29 @@ class GitHubClient:
             method="PATCH",
         )
 
+    def rerun_workflow_run(self, run_id: int) -> Dict[str, Any]:
+        return self.api(f"repos/{self.repo}/actions/runs/{run_id}/rerun", method="POST")
+
+    def cancel_workflow_run(self, run_id: int) -> Dict[str, Any]:
+        return self.api(f"repos/{self.repo}/actions/runs/{run_id}/cancel", method="POST")
+
+    def create_release(self, **fields: Any) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        for key in (
+            "tag_name",
+            "target_commitish",
+            "name",
+            "body",
+            "draft",
+            "prerelease",
+            "generate_release_notes",
+            "make_latest",
+        ):
+            value = fields.get(key)
+            if value is not None:
+                params[key] = value
+        return self.api(f"repos/{self.repo}/releases", params, method="POST")
+
     def add_discussion_comment(self, discussion_id: str, body: str) -> Dict[str, Any]:
         mutation = """
         mutation($discussionId: ID!, $body: String!) {
@@ -167,3 +234,107 @@ class GitHubClient:
         }
         """
         return self.graphql(mutation, {"discussionId": discussion_id, "body": body})
+
+    def create_discussion(self, repository_id: str, category_id: str, title: str, body: str) -> Dict[str, Any]:
+        mutation = """
+        mutation($repositoryId: ID!, $categoryId: ID!, $title: String!, $body: String!) {
+          createDiscussion(input: {repositoryId: $repositoryId, categoryId: $categoryId, title: $title, body: $body}) {
+            discussion { id url title }
+          }
+        }
+        """
+        return self.graphql(
+            mutation,
+            {
+                "repositoryId": repository_id,
+                "categoryId": category_id,
+                "title": title,
+                "body": body,
+            },
+        )
+
+    def update_discussion(
+        self,
+        discussion_id: str,
+        title: str = "",
+        body: str = "",
+        category_id: str = "",
+    ) -> Dict[str, Any]:
+        variables: Dict[str, Any] = {"discussionId": discussion_id}
+        input_fields = ["discussionId: $discussionId"]
+        variable_defs = ["$discussionId: ID!"]
+        if title:
+            variables["title"] = title
+            variable_defs.append("$title: String")
+            input_fields.append("title: $title")
+        if body:
+            variables["body"] = body
+            variable_defs.append("$body: String")
+            input_fields.append("body: $body")
+        if category_id:
+            variables["categoryId"] = category_id
+            variable_defs.append("$categoryId: ID")
+            input_fields.append("categoryId: $categoryId")
+        mutation = f"""
+        mutation({', '.join(variable_defs)}) {{
+          updateDiscussion(input: {{{', '.join(input_fields)}}}) {{
+            discussion {{ id url title }}
+          }}
+        }}
+        """
+        return self.graphql(mutation, variables)
+
+    def update_project_v2_item_field_value(
+        self,
+        project_id: str,
+        item_id: str,
+        field_id: str,
+        value: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not value:
+            return {}
+
+        field_key, field_type, field_value = self._project_value_payload(value)
+        if field_key is None:
+            return {}
+
+        mutation = f"""
+        mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $fieldValue: {field_type}!) {{
+          updateProjectV2ItemFieldValue(
+            input: {{
+              projectId: $projectId
+              itemId: $itemId
+              fieldId: $fieldId
+              value: {{{field_key}: $fieldValue}}
+            }}
+          ) {{
+            projectV2Item {{ id }}
+          }}
+        }}
+        """
+        return self.graphql(
+            mutation,
+            {
+                "projectId": project_id,
+                "itemId": item_id,
+                "fieldId": field_id,
+                "fieldValue": field_value,
+            },
+        )
+
+    def _project_value_payload(self, value: Dict[str, Any]) -> tuple[Optional[str], str, Any]:
+        if "text" in value:
+            return "text", "String", value["text"]
+        if "number" in value:
+            return "number", "Float", value["number"]
+        if "date" in value:
+            return "date", "Date", value["date"]
+        if "single_select_option_id" in value:
+            return "singleSelectOptionId", "String", value["single_select_option_id"]
+        if "iteration_id" in value:
+            return "iterationId", "String", value["iteration_id"]
+        if "singleSelectOptionId" in value:
+            return "singleSelectOptionId", "String", value["singleSelectOptionId"]
+        if "iterationId" in value:
+            return "iterationId", "String", value["iterationId"]
+        return None, "String", None

@@ -73,6 +73,7 @@ class AIAdapterManager:
             file_refs=request.file_refs,
             memory_refs=request.memory_refs,
             skill_refs=request.skill_refs,
+            artifact_refs=request.artifact_refs,
             transcript=transcript,
         )
 

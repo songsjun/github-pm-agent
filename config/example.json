@@ -1,6 +1,9 @@
 {
   "github": {
     "repo": "songsjun/StudyBuddy",
+    "repos": [
+      "songsjun/StudyBuddy"
+    ],
     "gh_path": "/opt/homebrew/bin/gh",
     "default_branch": "main",
     "mentions": [
@@ -19,7 +22,12 @@
     "supervisor_enabled": true,
     "continue_on_error": true,
     "stale_pr_review_hours": 48,
-    "blocked_issue_stale_hours": 48
+    "blocked_issue_stale_hours": 48,
+    "second_opinion": {
+      "enabled": false,
+      "provider": "gemini_cli",
+      "model": "gemini-2.5-flash"
+    }
   },
   "ai": {
     "default_provider": "codex_cli",

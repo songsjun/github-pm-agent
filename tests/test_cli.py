@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Tuple
 from unittest.mock import Mock, patch
@@ -88,3 +89,84 @@ class GitHubPMAgentCliTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(output), {"requeued": 2, "event_ids": ["evt-1", "evt-2"]})
         queue.retry_dead.assert_called_once_with(event_id=None, limit=2)
+
+    def test_reconcile_command_prints_processed_payload(self) -> None:
+        app = SimpleNamespace(config=self.config, reconcile=Mock(return_value={"processed": []}))
+
+        code, output = self._run_main(
+            ["github-pm-agent", "--config", "/tmp/config.json", "reconcile"],
+            app=app,
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output), {"processed": []})
+        app.reconcile.assert_called_once_with()
+
+    def test_analytics_command_prints_snapshot(self) -> None:
+        app = SimpleNamespace(config=self.config, analytics=Mock(return_value={"queue": {"pending": 1}}))
+
+        code, output = self._run_main(
+            ["github-pm-agent", "--config", "/tmp/config.json", "analytics"],
+            app=app,
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output), {"queue": {"pending": 1}})
+        app.analytics.assert_called_once_with()
+
+    def test_daemon_command_uses_interval_and_cycles(self) -> None:
+        app = SimpleNamespace(config=self.config, daemon=Mock(return_value={"cycles": 2}))
+
+        code, output = self._run_main(
+            [
+                "github-pm-agent",
+                "--config",
+                "/tmp/config.json",
+                "daemon",
+                "--interval",
+                "5",
+                "--cycles",
+                "2",
+            ],
+            app=app,
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output), {"cycles": 2})
+        app.daemon.assert_called_once_with(interval_seconds=5.0, max_cycles=2)
+
+    def test_webhook_command_reads_payload_file(self) -> None:
+        payload_path = Path(self.temp_dir.name) / "webhook.json"
+        payload_path.write_text(
+            json.dumps(
+                {
+                    "repository": {"full_name": "acme/widgets"},
+                    "action": "opened",
+                    "title": "new issue",
+                    "body": "hello",
+                }
+            ),
+            encoding="utf-8",
+        )
+        app = SimpleNamespace(
+            config=self.config,
+            ingest_webhook=Mock(return_value={"events_found": 1, "events_enqueued": 1}),
+        )
+
+        code, output = self._run_main(
+            [
+                "github-pm-agent",
+                "--config",
+                "/tmp/config.json",
+                "webhook",
+                "--event-type",
+                "issues",
+                "--payload-file",
+                str(payload_path),
+            ],
+            app=app,
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output), {"events_found": 1, "events_enqueued": 1})
+        app.ingest_webhook.assert_called_once()

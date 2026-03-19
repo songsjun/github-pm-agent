@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from github_pm_agent.utils import ensure_dir
 
@@ -34,13 +34,22 @@ def runtime_dir(config: Dict[str, Any]) -> Path:
 
 
 def repo_name(config: Dict[str, Any]) -> str:
+    repos = repo_names(config)
+    return repos[0]
+
+
+def repo_names(config: Dict[str, Any]) -> List[str]:
     github = config.get("github", {})
+    repos = github.get("repos")
+    if isinstance(repos, list) and repos:
+        normalized = [str(repo).strip() for repo in repos if str(repo).strip()]
+        if normalized:
+            return normalized
     repo = github.get("repo")
     if not repo:
         raise ConfigError("github.repo is required")
-    return repo
+    return [str(repo).strip()]
 
 
 def gh_path(config: Dict[str, Any]) -> str:
     return config.get("github", {}).get("gh_path", "gh")
-

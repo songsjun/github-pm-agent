@@ -1,12 +1,18 @@
 {
   "should_act": true,
   "reason": "short reason",
-  "action_type": "comment|label|issue|assign|review_request|state|none",
+  "action_type": "comment|label|issue|assign|unassign|review_request|remove_reviewer|edit|milestone|draft|ready_for_review|merge|review_decision|rerun_workflow|cancel_workflow|create_release|create_discussion|update_discussion|project|state|none",
   "target": {
-    "kind": "issue|pull_request|discussion|comment|none",
+    "kind": "issue|pull_request|discussion|workflow_run|release|project_item|comment|none",
     "number": 0
   },
   "message": "body to post or summary to store",
+  "needs_human_decision": false,
+  "human_decision_reason": "",
+  "urgency": "normal",
+  "follow_up_after_hours": 0,
+  "evidence": [],
+  "options": [],
   "labels_to_add": [],
   "labels_to_remove": [],
   "action_input": {},

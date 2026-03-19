@@ -39,8 +39,17 @@ class FakeEngine:
             },
         }
 
-    def run_ai_handler(self, event, prompt_path, skill_refs=None):
-        self.calls.append(("run_ai_handler", event.event_type, prompt_path, tuple(skill_refs or ())))
+    def run_ai_handler(self, event, prompt_path, skill_refs=None, risk_level="normal", requires_human=False):
+        self.calls.append(
+            (
+                "run_ai_handler",
+                event.event_type,
+                prompt_path,
+                tuple(skill_refs or ()),
+                risk_level,
+                requires_human,
+            )
+        )
         return {
             "plan": {
                 "should_act": False,
@@ -68,15 +77,35 @@ class HandlerResolutionTest(unittest.TestCase):
     def test_resolve_high_value_handlers(self) -> None:
         engine = FakeEngine()
         cases = [
+            ("issue_changed", "issue_changed_ai"),
+            ("issue_comment", "issue_comment_ai"),
+            ("pull_request_changed", "pull_request_changed_ai"),
+            ("pull_request_review_comment", "pull_request_review_comment_ai"),
+            ("commit", "commit_ai"),
+            ("milestone_changed", "milestone_changed_ai"),
+            ("project_changed", "project_changed_ai"),
             ("workflow_run", "workflow_run_observation"),
             ("workflow_failed", "workflow_failed"),
             ("issue_event_closed", "issue_closed_observation"),
             ("issue_event_reopened", "issue_reopened_followup"),
             ("issue_event_assigned", "issue_assigned_observation", {"assignee": "alice"}),
+            ("issue_event_unassigned", "issue_unassigned_observation", {"assignee": "alice"}),
+            ("issue_event_unlabeled", "issue_unlabeled_observation", {"label": "blocked"}),
+            ("issue_event_milestoned", "issue_milestoned_observation", {"milestone": "v1"}),
+            ("issue_event_demilestoned", "issue_demilestoned_observation", {"milestone": "v1"}),
+            ("issue_event_renamed", "issue_event_generic_observation", {"event": "renamed"}),
             ("pull_request_review", "pull_request_review_changes_requested", {"state": "CHANGES_REQUESTED"}),
             ("pull_request_review", "pull_request_review_approved", {"state": "APPROVED"}),
             ("issue_event_review_requested", "issue_event_review_requested", {"review_requested_reviewer": "bob"}),
             ("discussion_comment", "discussion_ai"),
+            ("release_readiness", "release_readiness"),
+            ("review_churn", "review_churn"),
+            ("repeated_ci_instability", "repeated_ci_instability"),
+            ("stale_discussion_decision", "stale_discussion_decision"),
+            ("docs_drift_before_release", "docs_drift_before_release"),
+            ("release_published", "release_published"),
+            ("deployment_status", "deployment_signal"),
+            ("deployment_failed", "deployment_failed"),
         ]
         for item in cases:
             if len(item) == 2:
@@ -127,25 +156,21 @@ class HandlerResolutionTest(unittest.TestCase):
         self.assertIn("@alice", result["plan"]["message"])
         self.assertIn("@author1", result["plan"]["message"])
 
-    def test_workflow_failed_routes_to_ai(self) -> None:
+    def test_workflow_failed_is_deterministic_triage(self) -> None:
         engine = FakeEngine()
         event = self._event(
             "workflow_failed",
             target_kind="workflow_run",
             target_number=88,
             body="workflow failed on test job",
+            metadata={"status": "completed", "conclusion": "failure"},
         )
         result = handle_workflow_failed(engine, event)
-        self.assertEqual(engine.calls[0][0], "run_ai_handler")
-        self.assertEqual(result["plan"]["reason"], "ai-route")
-        self.assertEqual(result["routing"]["stage"], "blocked_work")
-        self.assertIn(
-            result["routing"]["prompt_path"],
-            {
-                "prompts/actions/blocker_investigation.md",
-                "prompts/actions/default_event.md",
-            },
-        )
+        self.assertEqual(engine.calls[0][0], "make_plan")
+        self.assertFalse(result["plan"]["should_act"])
+        self.assertTrue(result["plan"]["needs_human_decision"])
+        self.assertEqual(result["plan"]["urgency"], "high")
+        self.assertIn("workflow failure", result["plan"]["reason"])
 
     def test_workflow_run_is_memory_only(self) -> None:
         engine = FakeEngine()
@@ -216,6 +241,36 @@ class HandlerResolutionTest(unittest.TestCase):
         result = handler(engine, event)
         self.assertEqual(result["plan"]["reason"], "ai-route")
         self.assertEqual(result["routing"]["stage"], "clarify")
+        self.assertEqual(result["routing"]["risk_level"], "high")
+
+    def test_project_changed_routes_to_clarify_with_low_risk(self) -> None:
+        engine = FakeEngine()
+        event = self._event("project_changed", target_kind="project", target_number=2)
+
+        name, handler = resolve_handler(engine, event)
+        self.assertEqual(name, "project_changed_ai")
+        result = handler(engine, event)
+        self.assertEqual(result["routing"]["stage"], "clarify")
+        self.assertEqual(result["routing"]["risk_level"], "low")
+
+    def test_commit_routes_to_release_readiness(self) -> None:
+        engine = FakeEngine()
+        event = self._event("commit", target_kind="commit", target_number=None)
+
+        name, handler = resolve_handler(engine, event)
+        self.assertEqual(name, "commit_ai")
+        routed = handler(engine, event)
+        self.assertEqual(routed["routing"]["stage"], "release_readiness")
+        self.assertEqual(routed["routing"]["risk_level"], "normal")
+
+    def test_workflow_failed_route_marks_human_escalation(self) -> None:
+        route = route_for_event(
+            Path("/Users/sjunsong/Workspace/github-pm-agent"),
+            self._event("workflow_failed", target_kind="workflow_run"),
+        )
+        self.assertEqual(route.stage, "blocked_work")
+        self.assertEqual(route.risk_level, "high")
+        self.assertTrue(route.requires_human)
 
     def test_route_for_event_prefers_stage_assets_when_present(self) -> None:
         with TemporaryDirectory() as tempdir:

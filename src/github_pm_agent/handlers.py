@@ -16,16 +16,54 @@ HandlerFn = Callable[["EventEngine", Event], Dict]
 def resolve_handler(engine: "EventEngine", event: Event) -> Tuple[str, HandlerFn]:
     if event.event_type == "mention":
         return "mention", handle_mention
+    if event.event_type == "issue_changed":
+        return "issue_changed_ai", handle_issue_changed
+    if event.event_type == "issue_comment":
+        return "issue_comment_ai", handle_issue_comment
+    if event.event_type == "pull_request_changed":
+        return "pull_request_changed_ai", handle_pull_request_changed
+    if event.event_type == "pull_request_review_comment":
+        return "pull_request_review_comment_ai", handle_pull_request_review_comment
+    if event.event_type == "commit":
+        return "commit_ai", handle_commit
+    if event.event_type == "milestone_changed":
+        return "milestone_changed_ai", handle_milestone_changed
+    if event.event_type == "project_changed":
+        return "project_changed_ai", handle_project_changed
+    if event.event_type == "push":
+        return "push_signal", handle_push
+    if event.event_type == "force_push":
+        return "force_push_signal", handle_force_push
+    if event.event_type == "branch_ref_created":
+        return "branch_ref_created_signal", handle_branch_ref_created
+    if event.event_type == "branch_ref_deleted":
+        return "branch_ref_deleted_signal", handle_branch_ref_deleted
     if event.event_type == "workflow_run":
         return "workflow_run_observation", handle_workflow_run
     if event.event_type == "workflow_failed":
         return "workflow_failed", handle_workflow_failed
+    if event.event_type == "commit_status_failed":
+        return "commit_status_failed", handle_commit_status_failed
+    if event.event_type == "commit_status_pending":
+        return "commit_status_pending", handle_commit_status_pending
+    if event.event_type == "check_run_failed":
+        return "check_run_failed", handle_check_run_failed
+    if event.event_type == "check_run_pending":
+        return "check_run_pending", handle_check_run_pending
     if event.event_type == "issue_event_closed":
         return "issue_closed_observation", handle_issue_event_closed
     if event.event_type == "issue_event_reopened":
         return "issue_reopened_followup", handle_issue_event_reopened
     if event.event_type == "issue_event_assigned":
         return "issue_assigned_observation", handle_issue_event_assigned
+    if event.event_type == "issue_event_unassigned":
+        return "issue_unassigned_observation", handle_issue_event_unassigned
+    if event.event_type == "issue_event_unlabeled":
+        return "issue_unlabeled_observation", handle_issue_event_unlabeled
+    if event.event_type == "issue_event_milestoned":
+        return "issue_milestoned_observation", handle_issue_event_milestoned
+    if event.event_type == "issue_event_demilestoned":
+        return "issue_demilestoned_observation", handle_issue_event_demilestoned
     if event.event_type == "pull_request_review":
         state = (event.metadata.get("state") or "").upper()
         if state == "CHANGES_REQUESTED":
@@ -39,8 +77,28 @@ def resolve_handler(engine: "EventEngine", event: Event) -> Tuple[str, HandlerFn
         return "stale_pr_review", handle_stale_pr_review
     if event.event_type == "blocked_issue_stale":
         return "blocked_issue_stale", handle_blocked_issue_stale
+    if event.event_type == "repeated_ci_instability":
+        return "repeated_ci_instability", handle_repeated_ci_instability
+    if event.event_type == "release_readiness":
+        return "release_readiness", handle_release_readiness
+    if event.event_type == "review_churn":
+        return "review_churn", handle_review_churn
+    if event.event_type == "stale_discussion_decision":
+        return "stale_discussion_decision", handle_stale_discussion_decision
+    if event.event_type == "docs_drift_before_release":
+        return "docs_drift_before_release", handle_docs_drift_before_release
+    if event.event_type == "release_published":
+        return "release_published", handle_release_published
+    if event.event_type == "release_draft":
+        return "release_draft", handle_release_readiness
+    if event.event_type in {"deployment", "deployment_status"}:
+        return "deployment_signal", handle_deployment_signal
+    if event.event_type == "deployment_failed":
+        return "deployment_failed", handle_deployment_signal
     if event.event_type == "issue_event_labeled" and (event.metadata.get("label") or "") == "blocked":
         return "issue_blocked_label", handle_issue_blocked_label
+    if event.event_type.startswith("issue_event_"):
+        return "issue_event_generic_observation", handle_issue_event_generic
     if event.event_type in {"discussion", "discussion_comment"}:
         return "discussion_ai", handle_discussion
     return "fallback_generic", handle_fallback
@@ -51,6 +109,50 @@ def handle_mention(engine: "EventEngine", event: Event) -> Dict:
         event,
         prompt_path="prompts/actions/mention_response.md",
     )
+
+
+def handle_issue_changed(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
+
+
+def handle_issue_comment(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
+
+
+def handle_pull_request_changed(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
+
+
+def handle_pull_request_review_comment(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
+
+
+def handle_commit(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
+
+
+def handle_milestone_changed(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
+
+
+def handle_project_changed(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
+
+
+def handle_push(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
+
+
+def handle_force_push(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
+
+
+def handle_branch_ref_created(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
+
+
+def handle_branch_ref_deleted(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
 
 
 def handle_fallback(engine: "EventEngine", event: Event) -> Dict:
@@ -73,7 +175,35 @@ def handle_workflow_run(engine: "EventEngine", event: Event) -> Dict:
 
 
 def handle_workflow_failed(engine: "EventEngine", event: Event) -> Dict:
-    return _run_capability_route(engine, event)
+    status = event.metadata.get("status") or "unknown"
+    conclusion = event.metadata.get("conclusion") or "failure"
+    evidence = [
+        f"status={status}",
+        f"conclusion={conclusion}",
+    ]
+    options = [
+        "inspect the failing workflow logs",
+        "re-run after fixing the blocker",
+    ]
+    if event.url:
+        evidence.append(event.url)
+    return engine.finish_plan(
+        event,
+        engine.make_plan(
+            should_act=False,
+            reason="workflow failure should be investigated before any follow-up action",
+            action_type="none",
+            target_kind="workflow_run",
+            target_number=event.target_number,
+            message="",
+            memory_note=f"workflow failure observed for run #{event.target_number or 0}",
+            needs_human_decision=True,
+            human_decision_reason="workflow failure needs owner triage and a failing-job summary",
+            urgency="high",
+            evidence=evidence,
+            options=options,
+        ),
+    )
 
 
 def handle_discussion(engine: "EventEngine", event: Event) -> Dict:
@@ -127,6 +257,76 @@ def handle_issue_event_assigned(engine: "EventEngine", event: Event) -> Dict:
             target_kind="issue",
             target_number=event.target_number,
             memory_note=f"work item #{event.target_number} was assigned to @{assignee} by @{actor}",
+        ),
+    )
+
+
+def handle_issue_event_unassigned(engine: "EventEngine", event: Event) -> Dict:
+    assignee = event.metadata.get("assignee") or "unknown assignee"
+    return engine.finish_plan(
+        event,
+        _memory_only_plan(
+            engine,
+            reason="unassignment should be recorded but does not need an extra response",
+            target_kind="issue",
+            target_number=event.target_number,
+            memory_note=f"work item #{event.target_number} was unassigned from @{assignee}",
+        ),
+    )
+
+
+def handle_issue_event_unlabeled(engine: "EventEngine", event: Event) -> Dict:
+    label = event.metadata.get("label") or "unknown label"
+    return engine.finish_plan(
+        event,
+        _memory_only_plan(
+            engine,
+            reason="label removal is useful context but usually not worth a new comment",
+            target_kind="issue",
+            target_number=event.target_number,
+            memory_note=f"label `{label}` was removed from issue #{event.target_number}",
+        ),
+    )
+
+
+def handle_issue_event_milestoned(engine: "EventEngine", event: Event) -> Dict:
+    milestone = event.metadata.get("milestone") or "unknown milestone"
+    return engine.finish_plan(
+        event,
+        _memory_only_plan(
+            engine,
+            reason="milestone assignment should be recorded for release tracking",
+            target_kind="issue",
+            target_number=event.target_number,
+            memory_note=f"issue #{event.target_number} was added to milestone {milestone}",
+        ),
+    )
+
+
+def handle_issue_event_demilestoned(engine: "EventEngine", event: Event) -> Dict:
+    milestone = event.metadata.get("milestone") or "unknown milestone"
+    return engine.finish_plan(
+        event,
+        _memory_only_plan(
+            engine,
+            reason="milestone removal should be recorded for release tracking",
+            target_kind="issue",
+            target_number=event.target_number,
+            memory_note=f"issue #{event.target_number} was removed from milestone {milestone}",
+        ),
+    )
+
+
+def handle_issue_event_generic(engine: "EventEngine", event: Event) -> Dict:
+    event_name = event.metadata.get("event") or event.event_type.replace("issue_event_", "")
+    return engine.finish_plan(
+        event,
+        _memory_only_plan(
+            engine,
+            reason="unclassified issue timeline events are stored as observations",
+            target_kind="issue",
+            target_number=event.target_number,
+            memory_note=f"issue #{event.target_number} emitted issue event `{event_name}`",
         ),
     )
 
@@ -242,6 +442,82 @@ def handle_blocked_issue_stale(engine: "EventEngine", event: Event) -> Dict:
     return engine.finish_plan(event, plan)
 
 
+def handle_commit_status_failed(engine: "EventEngine", event: Event) -> Dict:
+    context = event.metadata.get("context") or "status check"
+    state = event.metadata.get("state") or "failure"
+    plan = engine.make_plan(
+        should_act=False,
+        reason="commit status failure should be investigated before action",
+        action_type="none",
+        target_kind="commit",
+        target_number=None,
+        message="",
+        memory_note=f"commit status failed for {event.metadata.get('sha') or 'unknown sha'} ({context})",
+        needs_human_decision=True,
+        human_decision_reason="failed commit status needs owner triage",
+        urgency="high",
+        evidence=[f"state={state}", f"context={context}"],
+        options=["inspect the failing job", "retry after fixing the blocker"],
+    )
+    return engine.finish_plan(event, plan)
+
+
+def handle_check_run_failed(engine: "EventEngine", event: Event) -> Dict:
+    name = event.metadata.get("name") or "check run"
+    conclusion = event.metadata.get("conclusion") or "failure"
+    plan = engine.make_plan(
+        should_act=False,
+        reason="check-run failure should be investigated before action",
+        action_type="none",
+        target_kind="commit",
+        target_number=None,
+        message="",
+        memory_note=f"check run failed for {event.metadata.get('sha') or 'unknown sha'} ({name})",
+        needs_human_decision=True,
+        human_decision_reason="failed check run needs a root-cause summary",
+        urgency="high",
+        evidence=[f"conclusion={conclusion}", f"name={name}"],
+        options=["inspect the failing check", "re-run after blocker removal"],
+    )
+    return engine.finish_plan(event, plan)
+
+
+def handle_commit_status_pending(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
+
+
+def handle_check_run_pending(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
+
+
+def handle_release_readiness(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
+
+
+def handle_review_churn(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
+
+
+def handle_repeated_ci_instability(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
+
+
+def handle_stale_discussion_decision(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
+
+
+def handle_docs_drift_before_release(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
+
+
+def handle_release_published(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
+
+
+def handle_deployment_signal(engine: "EventEngine", event: Event) -> Dict:
+    return _run_capability_route(engine, event)
+
+
 def handle_issue_blocked_label(engine: "EventEngine", event: Event) -> Dict:
     message = (
         "This issue is now marked `blocked`.\n\n"
@@ -298,6 +574,8 @@ def _run_capability_route(engine: "EventEngine", event: Event) -> Dict:
         event,
         prompt_path=route.prompt_path,
         skill_refs=route.skill_refs,
+        risk_level=route.risk_level,
+        requires_human=route.requires_human,
     )
     result["routing"] = route.to_dict()
     return result

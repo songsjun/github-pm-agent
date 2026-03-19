@@ -23,7 +23,29 @@
     },
     "action_type": {
       "type": "string",
-      "enum": ["comment", "label", "issue", "assign", "review_request", "state", "none"]
+      "enum": [
+        "comment",
+        "label",
+        "issue",
+        "assign",
+        "unassign",
+        "review_request",
+        "remove_reviewer",
+        "edit",
+        "milestone",
+        "draft",
+        "ready_for_review",
+        "merge",
+        "review_decision",
+        "rerun_workflow",
+        "cancel_workflow",
+        "create_release",
+        "create_discussion",
+        "update_discussion",
+        "project",
+        "state",
+        "none"
+      ]
     },
     "target": {
       "type": "object",
@@ -32,7 +54,16 @@
       "properties": {
         "kind": {
           "type": "string",
-          "enum": ["issue", "pull_request", "discussion", "comment", "none"]
+          "enum": [
+            "issue",
+            "pull_request",
+            "discussion",
+            "workflow_run",
+            "release",
+            "project_item",
+            "comment",
+            "none"
+          ]
         },
         "number": {
           "type": "integer"
@@ -41,6 +72,36 @@
     },
     "message": {
       "type": "string"
+    },
+    "needs_human_decision": {
+      "type": "boolean"
+    },
+    "human_decision_reason": {
+      "type": "string"
+    },
+    "urgency": {
+      "type": "string",
+      "enum": ["low", "normal", "high", "urgent"]
+    },
+    "follow_up_after_hours": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "evidence": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "options": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          { "type": "string" },
+          {
+            "type": "object",
+            "additionalProperties": true
+          }
+        ]
+      }
     },
     "labels_to_add": {
       "type": "array",

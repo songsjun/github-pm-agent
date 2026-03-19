@@ -72,6 +72,81 @@ class MemoryLoopTest(unittest.TestCase):
         self.assertTrue(refreshed["refreshed"])
         self.assertIn("Supervisor signal", self.loop.distilled_path.read_text(encoding="utf-8"))
 
+    def test_memory_refs_include_generated_artifacts(self) -> None:
+        self.loop.record_supervisor_note("Keep release policy comments concise and action-oriented.")
+        self._record_plan_note(
+            "CI instability is showing up repeatedly: 2 workflow failure signals recently.",
+            recorded_at="2026-03-19T00:00:00Z",
+            target_number=17,
+        )
+        self._record_plan_note(
+            "CI instability is showing up repeatedly: 2 workflow failure signals recently.",
+            recorded_at="2026-03-19T00:20:00Z",
+            target_number=18,
+        )
+        notes = read_jsonl(self.loop.raw_notes_path)
+        notes[-2]["recorded_at"] = "2026-03-19T00:00:00Z"
+        notes[-1]["recorded_at"] = "2026-03-19T00:10:00Z"
+        notes[-3]["recorded_at"] = "2026-03-19T00:00:00Z"
+        write_jsonl(self.loop.raw_notes_path, notes)
+
+        self.loop.note_activity(now_iso="2026-03-19T01:00:00Z")
+
+        refs = self.loop.memory_refs(["memory/README.md"])
+        self.assertIn("runtime/memory/distilled.md", refs)
+        self.assertIn("runtime/memory/policy.md", refs)
+        self.assertIn("runtime/memory/trends.md", refs)
+        self.assertIn("runtime/memory/retro.md", refs)
+
+    def test_records_followup_and_emits_due_followup_event(self) -> None:
+        event = self._event(target_number=42)
+        plan = {
+            "memory_note": "follow up on issue #42",
+            "action_type": "comment",
+            "target": {"kind": "issue", "number": 42},
+            "follow_up_after_hours": 2,
+            "needs_human_decision": True,
+            "reason": "needs product decision",
+        }
+        result = ActionResult(True, "comment", {"kind": "issue", "number": 42}, "hello", {})
+        self.loop.record_plan_result(event, plan, result)
+
+        due_soon = self.loop.due_followup_events(now_iso="2026-03-19T01:00:00Z")
+        self.assertEqual(due_soon, [])
+
+        due_later = self.loop.due_followup_events(now_iso="2026-03-19T03:00:00Z")
+        self.assertEqual(len(due_later), 1)
+        self.assertEqual(due_later[0].event_type, "follow_up_due")
+        self.assertEqual(due_later[0].target_number, 42)
+
+        repeat = self.loop.due_followup_events(now_iso="2026-03-19T04:00:00Z")
+        self.assertEqual(repeat, [])
+
+    def test_analytics_snapshot_counts_signals_and_followups(self) -> None:
+        self._record_plan_note(
+            "changes requested on PR #17 by @alice",
+            recorded_at="2026-03-19T00:00:00Z",
+            target_number=17,
+        )
+        self.loop.record_supervisor_note("Keep release policy comments concise and action-oriented.")
+        self.loop.record_plan_result(
+            self._event(target_number=17),
+            {
+                "memory_note": "policy follow-up",
+                "action_type": "none",
+                "target": {"kind": "issue", "number": 17},
+                "follow_up_after_hours": 1,
+                "needs_human_decision": True,
+                "reason": "needs human decision",
+            },
+            ActionResult(False, "none", {"kind": "issue", "number": 17}, "", {}),
+        )
+
+        snapshot = self.loop.analytics_snapshot(now_iso="2026-03-19T02:00:00Z")
+        self.assertGreaterEqual(snapshot["notes_total"], 2)
+        self.assertIn("policy", snapshot["signal_counts"])
+        self.assertGreaterEqual(snapshot["followup_counts"]["scheduled"], 1)
+
     def _record_plan_note(self, memory_note: str, recorded_at: str, target_number: int) -> None:
         event = self._event(target_number=target_number)
         plan = {

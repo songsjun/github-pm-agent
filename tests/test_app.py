@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import Mock, patch
 
@@ -77,12 +78,10 @@ class GitHubPMAgentAppTest(unittest.TestCase):
         poller.poll.return_value = polled_events
         probe = Mock()
         probe.scan.return_value = synthetic_events
+        app.repo_runtimes[0].poller = poller
+        app.repo_runtimes[0].probe = probe
 
-        with (
-            patch("github_pm_agent.app.GitHubPoller", return_value=poller),
-            patch("github_pm_agent.app.StatusProbe", return_value=probe),
-            patch("github_pm_agent.app.utc_now_iso", return_value="2026-03-19T12:00:00Z"),
-        ):
+        with patch("github_pm_agent.app.utc_now_iso", return_value="2026-03-19T12:00:00Z"):
             result = app.poll()
 
         self.assertEqual(
@@ -132,3 +131,53 @@ class GitHubPMAgentAppTest(unittest.TestCase):
             app.cycle()
 
         queue.mark_failed.assert_called_once_with(event, "boom")
+
+    def test_poll_aggregates_multiple_repos_and_followups(self) -> None:
+        config = json.loads(json.dumps(self.config))
+        config["github"]["repos"] = ["acme/widgets", "acme/widgets-2"]
+        queue = Mock()
+        queue.enqueue.return_value = 4
+        client_one = Mock()
+        client_two = Mock()
+        poller_one = Mock()
+        poller_two = Mock()
+        probe_one = Mock()
+        probe_two = Mock()
+        followup_event = make_event("follow-1", 99)
+        poller_one.poll.return_value = [make_event("event-1", 1)]
+        poller_two.poll.return_value = [make_event("event-2", 2)]
+        probe_one.scan.return_value = []
+        probe_two.scan.return_value = [make_event("event-3", 3)]
+        engine_one = Mock()
+        engine_one.memory_loop = SimpleNamespace(
+            due_followup_events=Mock(return_value=[followup_event]),
+            analytics_snapshot=Mock(return_value={}),
+        )
+        engine_two = Mock()
+        engine_two.memory_loop = SimpleNamespace(
+            due_followup_events=Mock(return_value=[]),
+            analytics_snapshot=Mock(return_value={}),
+        )
+
+        with (
+            patch("github_pm_agent.app.GitHubClient", side_effect=[client_one, client_two]),
+            patch("github_pm_agent.app.QueueStore", return_value=queue),
+            patch("github_pm_agent.app.PromptLibrary", return_value=object()),
+            patch("github_pm_agent.app.SessionStore", return_value=object()),
+            patch("github_pm_agent.app.AIAdapterManager", return_value=object()),
+            patch("github_pm_agent.app.GitHubActionToolkit", side_effect=[object(), object()]),
+            patch("github_pm_agent.app.EventEngine", side_effect=[engine_one, engine_two]),
+            patch("github_pm_agent.app.GitHubPoller", side_effect=[poller_one, poller_two]),
+            patch("github_pm_agent.app.StatusProbe", side_effect=[probe_one, probe_two]),
+            patch("github_pm_agent.app.utc_now_iso", return_value="2026-03-19T12:00:00Z"),
+        ):
+            app = GitHubPMAgentApp(config, self.project_root)
+            result = app.poll()
+
+        self.assertEqual(result["events_found"], 2)
+        self.assertEqual(result["synthetic_events_found"], 1)
+        self.assertEqual(result["followup_events_found"], 1)
+        self.assertEqual(result["events_enqueued"], 4)
+        self.assertEqual(result["repositories"][0]["repo"], "acme/widgets")
+        self.assertEqual(result["repositories"][1]["repo"], "acme/widgets-2")
+        queue.enqueue.assert_called_once()

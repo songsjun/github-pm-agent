@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("poll", help="Poll GitHub and enqueue new events")
     subparsers.add_parser("cycle", help="Poll GitHub and process the queue")
+    subparsers.add_parser("reconcile", help="Process pending queue items without polling")
+    subparsers.add_parser("analytics", help="Report runtime, memory, and action analytics")
+
+    daemon_parser = subparsers.add_parser("daemon", help="Run poll/process in a loop")
+    daemon_parser.add_argument("--interval", type=float, default=60.0)
+    daemon_parser.add_argument("--cycles", type=int)
+
+    webhook_parser = subparsers.add_parser("webhook", help="Ingest a GitHub webhook payload")
+    webhook_parser.add_argument("--event-type", default="")
+    webhook_parser.add_argument("--payload-file")
 
     queue_parser = subparsers.add_parser("queue", help="Inspect the local queue")
     queue_subparsers = queue_parser.add_subparsers(dest="queue_command", required=True)
@@ -52,6 +63,13 @@ def _app_from_args(args: Any) -> GitHubPMAgentApp:
     return GitHubPMAgentApp(config, project_root(config))
 
 
+def _load_payload(path: str | None) -> Any:
+    if path:
+        payload_path = Path(path).expanduser().resolve()
+        return json.loads(payload_path.read_text(encoding="utf-8"))
+    return json.loads(sys.stdin.read() or "{}")
+
+
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
@@ -63,6 +81,35 @@ def main() -> int:
 
     if args.command == "cycle":
         print(json.dumps(app.cycle(), indent=2, ensure_ascii=False))
+        return 0
+
+    if args.command == "reconcile":
+        print(json.dumps(app.reconcile(), indent=2, ensure_ascii=False))
+        return 0
+
+    if args.command == "analytics":
+        print(json.dumps(app.analytics(), indent=2, ensure_ascii=False))
+        return 0
+
+    if args.command == "daemon":
+        print(
+            json.dumps(
+                app.daemon(interval_seconds=args.interval, max_cycles=args.cycles),
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return 0
+
+    if args.command == "webhook":
+        payload = _load_payload(getattr(args, "payload_file", None))
+        print(
+            json.dumps(
+                app.ingest_webhook(payload, event_type=getattr(args, "event_type", "")),
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
         return 0
 
     if args.command == "queue":

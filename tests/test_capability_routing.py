@@ -55,6 +55,8 @@ class CapabilityRoutingTest(unittest.TestCase):
         self.assertEqual(route.prompt_path, "prompts/actions/intake_clarify.md")
         self.assertIn("skills/clarify.md", route.skill_refs)
         self.assertIn("skills/pm-core.md", route.skill_refs)
+        self.assertEqual(route.risk_level, "normal")
+        self.assertFalse(route.requires_human)
 
     def test_pull_request_events_use_review_readiness_assets(self) -> None:
         route = route_for_event(PROJECT_ROOT, make_event("pull_request_changed", target_kind="pull_request"))
@@ -71,6 +73,28 @@ class CapabilityRoutingTest(unittest.TestCase):
         self.assertEqual(route.stage, "release_readiness")
         self.assertEqual(route.prompt_path, "prompts/actions/release_readiness.md")
         self.assertEqual(route.skill_refs, ("skills/release-readiness.md", "skills/pm-core.md"))
+        self.assertEqual(route.risk_level, "normal")
+
+    def test_blocked_work_events_require_human_attention(self) -> None:
+        route = route_for_event(PROJECT_ROOT, make_event("workflow_failed", target_kind="workflow_run"))
+
+        self.assertEqual(route.stage, "blocked_work")
+        self.assertTrue(route.requires_human)
+        self.assertEqual(route.risk_level, "high")
+
+    def test_release_ready_events_can_flag_human_review(self) -> None:
+        route = route_for_event(PROJECT_ROOT, make_event("docs_drift_before_release", target_kind="release"))
+
+        self.assertEqual(route.stage, "release_readiness")
+        self.assertEqual(route.risk_level, "high")
+        self.assertTrue(route.requires_human)
+
+    def test_project_changed_uses_low_risk_clarify_route(self) -> None:
+        route = route_for_event(PROJECT_ROOT, make_event("project_changed", target_kind="project", target_number=2))
+
+        self.assertEqual(route.stage, "clarify")
+        self.assertEqual(route.risk_level, "low")
+        self.assertFalse(route.requires_human)
 
     def test_unknown_events_stay_on_generic_route(self) -> None:
         route = route_for_event(PROJECT_ROOT, make_event("unhandled_event"))

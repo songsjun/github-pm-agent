@@ -24,9 +24,10 @@ The roadmap is intentionally aligned with the current runtime:
 | Skills | Core policy plus stage skills for clarify, scope, blocked work, review readiness, release readiness, and memory distill |
 | AI prompts | System prompt plus stage prompts for intake, spec, blocker, review, release, mention, and retro |
 | Event routing | Deterministic handlers plus a lightweight lifecycle router for AI-handled events |
-| Automation | Comments, labels, create issue, assign, request review, state change |
-| Memory | Batched local distillation plus session transcript replay |
-| Escalation | Implicit in handler behavior, not modeled as first-class policy |
+| Automation | Comments, labels, issues, assign/unassign, review request/removal, state change, merge/release/discussion/project actions |
+| Runtime control | Poll, cycle, reconcile, daemon, webhook, analytics, and follow-up replay |
+| Memory | Batched local distillation, local artifact store, policy/trend memory, and session transcript replay |
+| Escalation | Typed action-plan metadata for human decision, urgency, evidence, options, and follow-up |
 
 ## Capability Stages
 
@@ -68,7 +69,7 @@ The roadmap is intentionally aligned with the current runtime:
 | `issue_event_reopened` | Execution Support | deterministic follow-up plus `blocked-work.md` | keep comments short |
 | `blocked_issue_stale` | Execution Support | deterministic reminder | keep deterministic |
 | `stale_pr_review` | Review Readiness | deterministic reminder plus `review-readiness.md` | keep deterministic |
-| merge/release candidate | Release Readiness | `release_readiness.md` + `release-readiness.md` | future state, not yet wired |
+| merge/release candidate | Release Readiness | `release_readiness.md` + `release-readiness.md` | wired through release, docs-drift, and readiness synthetic signals |
 | memory batch synthesis | Learning | `retro_summary.md` + `memory-distill.md` | batched, never per-event |
 
 ## Automation Boundaries
@@ -104,10 +105,11 @@ The roadmap is intentionally aligned with the current runtime:
 | P0 | Add stage-specific skills and prompt files | completed |
 | P0 | Introduce lightweight lifecycle routing | completed |
 | P0 | Add prompt/skill validation tests | completed |
-| P1 | Add typed escalation metadata to action plans | explicit human decision boundaries |
-| P1 | Add durable artifacts: brief, spec-review, release-readiness, retro | reusable downstream context |
-| P2 | Add richer policy engine and cooldown/escalation rules | move beyond raw event routing |
-| P2 | Add release and docs-drift gates | operational maturity |
+| P1 | Add typed escalation metadata to action plans | completed |
+| P1 | Add durable artifacts: brief, spec-review, release-readiness, retro | completed |
+| P1 | Add runtime control, multi-repo polling, and analytics | completed |
+| P2 | Add richer policy engine and explicit cooldown key support | move beyond raw event routing |
+| P2 | Add release and docs-drift gates | completed |
 
 ## Exit Criteria For The Next Phase
 

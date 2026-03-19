@@ -32,8 +32,9 @@ poller
 | Routing | mostly raw `event_type` routing | add lifecycle stage and risk classification |
 | Prompts | generic fallback prompt is overloaded | stage-specific prompts for intake, spec, blocker, review, release, retro |
 | Skills | one PM core skill | split into focused policy skills |
-| Escalation | implied in handlers | make auto vs human-required decisions explicit |
-| Artifacts | memory only | add brief/spec/release/retro artifacts |
+| Escalation | typed metadata now exists, but no policy engine yet | add stage-aware auto vs human-required decisions |
+| Artifacts | file-backed brief/spec/release/retro artifacts exist | feed them more selectively and generate richer artifacts |
+| Control plane | single-repo poll/cycle only in the first cut | runtime now exposes `poll`, `reconcile`, `daemon`, `webhook`, and `analytics` |
 | Validation | code tests exist, prompt/skill drift tests do not | add inventory and routing validation tests |
 
 ## Minimal New Components
@@ -68,6 +69,7 @@ Initial artifact types:
 - `retro-summary`
 
 Storage can remain local-file based in the MVP.
+This is now implemented with a file-backed runtime artifact store.
 
 ### 3. Typed Escalation
 
@@ -82,6 +84,8 @@ Initial fields worth adding later:
 - `options`
 - `follow_up_after`
 - `cooldown_key`
+
+The first four are now implemented in the action-plan contract, except `cooldown_key`.
 
 ## What Should Stay Simple
 
@@ -102,10 +106,10 @@ Initial fields worth adding later:
 
 | Phase | Focus | Expected code impact |
 |---|---|---|
-| Phase 1 | docs + prompt/skill structure | docs, prompts, skills |
-| Phase 2 | lifecycle routing | handlers plus one routing module |
-| Phase 3 | validation and artifact tests | tests only |
-| Phase 4 | richer escalation schema | engine, templates, selected handlers |
+| Phase 1 | docs + prompt/skill structure | completed |
+| Phase 2 | lifecycle routing | completed |
+| Phase 3 | validation and artifact tests | completed |
+| Phase 4 | richer escalation and policy control | engine, templates, selected handlers, runtime control |
 
 ## Success Metrics
 
