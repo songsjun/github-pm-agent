@@ -1,0 +1,14 @@
+{
+  "should_act": true,
+  "reason": "short reason",
+  "action_type": "comment|label|issue|discussion|none",
+  "target": {
+    "kind": "issue|pull_request|discussion|comment|none",
+    "number": 0
+  },
+  "message": "body to post or summary to store",
+  "labels_to_add": [],
+  "labels_to_remove": [],
+  "memory_note": "durable note or empty string"
+}
+

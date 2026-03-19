@@ -1,0 +1,8 @@
+{
+  "important": true,
+  "summary": "durable summary",
+  "tags": [
+    "pm",
+    "event-type"
+  ]
+}

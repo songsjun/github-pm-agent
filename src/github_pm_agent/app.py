@@ -1,0 +1,66 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, List
+
+from github_pm_agent.actions import GitHubActionToolkit
+from github_pm_agent.ai_adapter import AIAdapterManager
+from github_pm_agent.config import gh_path, repo_name, runtime_dir
+from github_pm_agent.engine import EventEngine
+from github_pm_agent.github_client import GitHubClient
+from github_pm_agent.poller import GitHubPoller
+from github_pm_agent.prompt_library import PromptLibrary
+from github_pm_agent.queue_store import QueueStore
+from github_pm_agent.session_store import SessionStore
+from github_pm_agent.utils import read_json, utc_now_iso, write_json
+
+
+class GitHubPMAgentApp:
+    def __init__(self, config: Dict[str, Any], project_root: Path) -> None:
+        self.config = config
+        self.project_root = project_root
+        self.runtime_dir = runtime_dir(config)
+        self.client = GitHubClient(gh_path(config), repo_name(config))
+        self.queue = QueueStore(self.runtime_dir)
+        self.prompts = PromptLibrary(project_root)
+        self.sessions = SessionStore(self.runtime_dir)
+        self.ai = AIAdapterManager(project_root, config, self.prompts, self.sessions)
+        self.actions = GitHubActionToolkit(
+            self.client,
+            self.runtime_dir,
+            dry_run=config.get("engine", {}).get("dry_run", True),
+        )
+        self.engine = EventEngine(config, self.ai, self.actions, self.runtime_dir)
+        self.cursors_path = self.runtime_dir / "cursors.json"
+
+    def poll(self) -> Dict[str, Any]:
+        cursor = read_json(self.cursors_path, {"since": "1970-01-01T00:00:00Z"})
+        since = cursor.get("since", "1970-01-01T00:00:00Z")
+        poller = GitHubPoller(
+            self.client,
+            repo_name(self.config),
+            self.config.get("github", {}).get("default_branch", "main"),
+            self.config.get("github", {}).get("mentions", []),
+        )
+        events = poller.poll(since)
+        enqueued = self.queue.enqueue(events)
+        write_json(self.cursors_path, {"since": utc_now_iso()})
+        return {"since": since, "events_found": len(events), "events_enqueued": enqueued}
+
+    def cycle(self) -> Dict[str, Any]:
+        poll_result = self.poll()
+        processed: List[Dict[str, Any]] = []
+        while True:
+            event = self.queue.pop()
+            if event is None:
+                break
+            try:
+                result = self.engine.process(event)
+                self.queue.mark_done(event, result)
+                processed.append({"event_id": event.event_id, "result": result})
+            except Exception as exc:  # noqa: BLE001
+                self.queue.mark_failed(event, str(exc))
+                if not self.config.get("engine", {}).get("continue_on_error", True):
+                    raise
+        return {"poll": poll_result, "processed": processed}
+

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "github-pm-agent"
+version = "0.1.0"
+description = "Polling-driven GitHub PM AI agent runtime"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "songsjun" }
+]
+dependencies = []
+
+[project.scripts]
+github-pm-agent = "github_pm_agent.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

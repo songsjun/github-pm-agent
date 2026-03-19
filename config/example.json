@@ -1,0 +1,44 @@
+{
+  "github": {
+    "repo": "songsjun/StudyBuddy",
+    "gh_path": "/opt/homebrew/bin/gh",
+    "default_branch": "main",
+    "mentions": [
+      "@songsjun",
+      "@github-pm-agent"
+    ],
+    "poll": {
+      "max_items_per_source": 100
+    }
+  },
+  "runtime": {
+    "state_dir": "runtime"
+  },
+  "engine": {
+    "dry_run": true,
+    "supervisor_enabled": true,
+    "continue_on_error": true
+  },
+  "ai": {
+    "default_provider": "shell",
+    "default_model": "gpt-5",
+    "providers": {
+      "shell": {
+        "type": "shell",
+        "command": [
+          "python3",
+          "-c",
+          "import json,sys; print(json.dumps({'provider':'shell','model':sys.argv[1],'output':'stub response','session_id':sys.argv[2] if len(sys.argv) > 2 else None}))",
+          "$model",
+          "$session_id"
+        ]
+      },
+      "openai": {
+        "type": "openai_compatible",
+        "base_url": "https://api.openai.com/v1/chat/completions",
+        "api_key_env": "OPENAI_API_KEY"
+      }
+    }
+  }
+}
+
