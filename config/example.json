@@ -17,21 +17,29 @@
   "engine": {
     "dry_run": true,
     "supervisor_enabled": true,
-    "continue_on_error": true
+    "continue_on_error": true,
+    "stale_pr_review_hours": 48,
+    "blocked_issue_stale_hours": 48
   },
   "ai": {
-    "default_provider": "shell",
-    "default_model": "gpt-5",
+    "default_provider": "codex_cli",
+    "default_model": "gpt-5.4",
     "providers": {
-      "shell": {
-        "type": "shell",
-        "command": [
-          "python3",
-          "-c",
-          "import json,sys; print(json.dumps({'provider':'shell','model':sys.argv[1],'output':'stub response','session_id':sys.argv[2] if len(sys.argv) > 2 else None}))",
-          "$model",
-          "$session_id"
-        ]
+      "codex_cli": {
+        "type": "cli_script",
+        "provider_name": "codex",
+        "script": "scripts/run_ai_cli.py",
+        "python_path": "python3",
+        "codex_path": "/opt/homebrew/bin/codex",
+        "default_model": "gpt-5.4"
+      },
+      "gemini_cli": {
+        "type": "cli_script",
+        "provider_name": "gemini",
+        "script": "scripts/run_ai_cli.py",
+        "python_path": "python3",
+        "gemini_path": "/opt/homebrew/bin/gemini",
+        "default_model": "gemini-2.5-flash"
       },
       "openai": {
         "type": "openai_compatible",
@@ -41,4 +49,3 @@
     }
   }
 }
-

@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
 import subprocess
 import tempfile
 import urllib.request
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict
 
 from github_pm_agent.models import AiRequest, AiResponse
 from github_pm_agent.prompt_library import PromptLibrary
@@ -32,6 +32,8 @@ class AIAdapterManager:
         provider_type = provider_config.get("type", "shell")
         if provider_type == "shell":
             response = self._run_shell(provider_config, request, rendered)
+        elif provider_type == "cli_script":
+            response = self._run_cli_script(provider_config, request, rendered)
         elif provider_type == "openai_compatible":
             response = self._run_openai_compatible(provider_config, request, rendered)
         else:
@@ -45,6 +47,14 @@ class AIAdapterManager:
         if provider_name not in providers:
             raise RuntimeError(f"provider not configured: {provider_name}")
         return providers[provider_name]
+
+    def default_provider(self) -> str:
+        return self.config.get("ai", {}).get("default_provider", "shell")
+
+    def default_model(self, provider_name: str = "") -> str:
+        provider_name = provider_name or self.default_provider()
+        provider_config = self._provider_config(provider_name)
+        return provider_config.get("default_model") or self.config.get("ai", {}).get("default_model", "gpt-5")
 
     def _render_request(self, request: AiRequest) -> str:
         transcript = ""
@@ -102,6 +112,48 @@ class AIAdapterManager:
             session_key=request.session_key,
         )
 
+    def _run_cli_script(self, provider_config: Dict[str, Any], request: AiRequest, rendered: str) -> AiResponse:
+        script_path = Path(provider_config["script"])
+        if not script_path.is_absolute():
+            script_path = Path(self.project_root) / script_path
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+            handle.write(rendered)
+            input_file = handle.name
+
+        command = [
+            provider_config.get("python_path", "python3"),
+            str(script_path),
+            "--provider",
+            provider_config["provider_name"],
+            "--model",
+            request.model,
+            "--input-file",
+            input_file,
+            "--cwd",
+            str(self.project_root),
+        ]
+        if request.session_key:
+            command.extend(["--session-key", request.session_key])
+        if request.output_schema_path:
+            schema_path = Path(request.output_schema_path)
+            if not schema_path.is_absolute():
+                schema_path = Path(self.project_root) / schema_path
+            command.extend(["--schema-file", str(schema_path)])
+        if provider_config.get("codex_path"):
+            command.extend(["--codex-path", provider_config["codex_path"]])
+        if provider_config.get("gemini_path"):
+            command.extend(["--gemini-path", provider_config["gemini_path"]])
+
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        raw = json.loads(result.stdout.strip()) if result.stdout.strip() else {}
+        return AiResponse(
+            provider=request.provider,
+            model=request.model,
+            content=raw.get("output", ""),
+            raw=raw,
+            session_key=raw.get("session_key") or request.session_key,
+        )
+
     def _run_openai_compatible(self, provider_config: Dict[str, Any], request: AiRequest, rendered: str) -> AiResponse:
         api_key = os.environ.get(provider_config.get("api_key_env", "OPENAI_API_KEY"))
         if not api_key:
@@ -138,4 +190,3 @@ class AIAdapterManager:
             raw=payload,
             session_key=request.session_key,
         )
-

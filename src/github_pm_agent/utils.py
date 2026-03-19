@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
@@ -61,3 +62,30 @@ def load_text(path: Optional[Path]) -> str:
         return ""
     return path.read_text(encoding="utf-8")
 
+
+def extract_json_object(text: str) -> Optional[Any]:
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", text, flags=re.DOTALL)
+    if fenced:
+        try:
+            return json.loads(fenced.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char not in "[{":
+            continue
+        try:
+            payload, _ = decoder.raw_decode(text[index:])
+            return payload
+        except json.JSONDecodeError:
+            continue
+    return None

@@ -59,11 +59,19 @@ Those can come later if the loop proves useful.
 
 - Python 3.9+
 - GitHub CLI installed and authenticated
+- local Codex CLI and/or Gemini CLI installed if you want to use CLI-backed providers
 
 Check `gh`:
 
 ```bash
 /opt/homebrew/bin/gh auth status
+```
+
+Check local AI CLIs:
+
+```bash
+/opt/homebrew/bin/codex --version
+/opt/homebrew/bin/gemini --version
 ```
 
 ### Install
@@ -84,6 +92,13 @@ cp config/example.json config/local.json
 
 Then set the target repository, mentions to watch, and AI provider settings.
 
+The example config already includes two local providers:
+
+- `codex_cli` via `scripts/run_ai_cli.py`
+- `gemini_cli` via `scripts/run_ai_cli.py`
+
+`codex_cli` is the default because it is currently the more stable local path on this machine. For Gemini, prefer `gemini-2.5-flash` over the preview default because the preview model may reject requests when capacity is tight.
+
 ### Run one cycle
 
 ```bash
@@ -97,6 +112,14 @@ This does:
 3. drain the queue
 4. route each event to a handler
 5. write proposed or executed actions
+
+Current concrete handlers:
+
+- `mention`: AI drafts a bounded response
+- `stale_pr_review`: deterministic reminder on open PRs with no review after threshold
+- `blocked_issue_stale`: deterministic reminder on long-blocked issues
+- `issue_event_labeled` with label `blocked`: deterministic blocker-template comment
+- all other events fall back to the generic AI event planner
 
 ### Useful commands
 
@@ -122,6 +145,18 @@ Everything is local files under `runtime/`:
 
 This keeps the MVP inspectable and easy to reset.
 
+## Provider adapter
+
+The normalized CLI adapter script is `scripts/run_ai_cli.py`.
+
+It standardizes:
+
+- provider selection: `codex` or `gemini`
+- prompt file input
+- cwd pinning
+- optional schema handoff for Codex
+- normalized JSON output back to the runtime
+
 ## Design decisions
 
 - GitHub access uses `gh api` instead of a custom auth stack.
@@ -136,4 +171,3 @@ This keeps the MVP inspectable and easy to reset.
 - add richer action planning on top of the event handlers
 - introduce repo-specific PM policies
 - add a second memory synthesizer tuned for long-lived projects
-

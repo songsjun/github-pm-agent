@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict
+from typing import Any, Dict, Iterable, Optional
 
+from github_pm_agent.handlers import resolve_handler
 from github_pm_agent.models import ActionResult, AiRequest, Event
-from github_pm_agent.utils import append_jsonl
+from github_pm_agent.utils import append_jsonl, extract_json_object
 
 
 class EventEngine:
@@ -22,9 +23,20 @@ class EventEngine:
         self.memory_notes_path = runtime_dir / "memory_notes.jsonl"
 
     def process(self, event: Event) -> Dict[str, Any]:
-        prompt_path = "prompts/actions/mention_response.md" if event.event_type == "mention" else "prompts/actions/default_event.md"
-        provider = self.config.get("ai", {}).get("default_provider", "shell")
-        model = self.config.get("ai", {}).get("default_model", "gpt-5")
+        handler_name, handler = resolve_handler(self, event)
+        result = handler(self, event)
+        result["handler"] = handler_name
+        return result
+
+    def run_ai_handler(
+        self,
+        event: Event,
+        prompt_path: str,
+        memory_refs: Optional[Iterable[str]] = None,
+        skill_refs: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Any]:
+        provider = self.ai_manager.default_provider()
+        model = self.ai_manager.default_model(provider)
         request = AiRequest(
             provider=provider,
             model=model,
@@ -35,16 +47,65 @@ class EventEngine:
                 "event_type": event.event_type,
                 "event_payload": json.dumps(event.to_dict(), indent=2, ensure_ascii=False),
             },
-            memory_refs=["memory/README.md"],
-            skill_refs=["skills/pm-core.md"],
+            memory_refs=list(memory_refs or ["memory/README.md"]),
+            skill_refs=list(skill_refs or ["skills/pm-core.md"]),
             output_template_path="templates/output/action_plan.json",
+            output_schema_path="templates/output/action_plan.schema.json",
             session_key=f"{event.repo.replace('/', '__')}__{event.target_kind}__{event.target_number or event.event_id}",
         )
         response = self.ai_manager.generate(request)
-        plan = self._parse_action_plan(response.content)
-        result = self._execute_plan(event, plan)
+        plan = self.parse_action_plan(response.content)
+        result = self.finish_plan(event, plan)
         if self.config.get("engine", {}).get("supervisor_enabled", False):
             self._run_supervisor(request, response)
+        result["ai"] = {
+            "provider": response.provider,
+            "model": response.model,
+            "session_key": response.session_key,
+        }
+        return result
+
+    def parse_action_plan(self, content: str) -> Dict[str, Any]:
+        parsed = extract_json_object(content)
+        if isinstance(parsed, dict):
+            return parsed
+        return self.make_plan(
+            should_act=False,
+            reason="model output was not valid JSON; stored as observation only",
+            action_type="none",
+            target_kind="none",
+            target_number=0,
+            message=content,
+        )
+
+    def make_plan(
+        self,
+        *,
+        should_act: bool,
+        reason: str,
+        action_type: str,
+        target_kind: str,
+        target_number: Optional[int],
+        message: str,
+        labels_to_add: Optional[Iterable[str]] = None,
+        labels_to_remove: Optional[Iterable[str]] = None,
+        memory_note: str = "",
+        issue_title: str = "",
+    ) -> Dict[str, Any]:
+        return {
+            "should_act": should_act,
+            "reason": reason,
+            "action_type": action_type,
+            "target": {"kind": target_kind, "number": target_number or 0},
+            "message": message,
+            "labels_to_add": list(labels_to_add or []),
+            "labels_to_remove": list(labels_to_remove or []),
+            "memory_note": memory_note,
+            "issue_title": issue_title,
+        }
+
+    def finish_plan(self, event: Event, plan: Dict[str, Any]) -> Dict[str, Any]:
+        result = self._execute_plan(event, plan)
         return {
             "plan": plan,
             "action": {
@@ -54,24 +115,6 @@ class EventEngine:
                 "message": result.message,
                 "raw": result.raw,
             },
-        }
-
-    def _parse_action_plan(self, content: str) -> Dict[str, Any]:
-        try:
-            parsed = json.loads(content)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-        return {
-            "should_act": False,
-            "reason": "model output was not valid JSON; stored as observation only",
-            "action_type": "none",
-            "target": {"kind": "none", "number": 0},
-            "message": content,
-            "labels_to_add": [],
-            "labels_to_remove": [],
-            "memory_note": "",
         }
 
     def _execute_plan(self, event: Event, plan: Dict[str, Any]) -> ActionResult:
@@ -115,18 +158,28 @@ class EventEngine:
         return ActionResult(True, action_type, target, message, raw)
 
     def _run_supervisor(self, request: AiRequest, response: Any) -> None:
-        provider = self.config.get("ai", {}).get("default_provider", "shell")
-        model = self.config.get("ai", {}).get("default_model", "gpt-5")
+        provider = self.ai_manager.default_provider()
+        model = self.ai_manager.default_model(provider)
         supervisor_request = AiRequest(
             provider=provider,
             model=model,
             system_prompt_path="prompts/system/pm.md",
             prompt_path="prompts/supervisor/review.md",
             variables={
-                "request": request.prompt_path,
+                "request": json.dumps(
+                    {
+                        "prompt_path": request.prompt_path,
+                        "provider": request.provider,
+                        "model": request.model,
+                        "variables": request.variables,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
                 "response": response.content,
             },
             output_template_path="templates/output/supervisor_note.json",
+            output_schema_path="templates/output/supervisor_note.schema.json",
             session_key=None,
         )
         supervisor_response = self.ai_manager.generate(supervisor_request)

@@ -64,6 +64,7 @@ class AiRequest:
     memory_refs: List[str] = field(default_factory=list)
     skill_refs: List[str] = field(default_factory=list)
     output_template_path: Optional[str] = None
+    output_schema_path: Optional[str] = None
     session_key: Optional[str] = None
 
 
@@ -83,4 +84,3 @@ class ActionResult:
     target: Dict[str, Any]
     message: str
     raw: Dict[str, Any] = field(default_factory=dict)
-

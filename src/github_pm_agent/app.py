@@ -12,6 +12,7 @@ from github_pm_agent.poller import GitHubPoller
 from github_pm_agent.prompt_library import PromptLibrary
 from github_pm_agent.queue_store import QueueStore
 from github_pm_agent.session_store import SessionStore
+from github_pm_agent.status_probe import StatusProbe
 from github_pm_agent.utils import read_json, utc_now_iso, write_json
 
 
@@ -43,9 +44,16 @@ class GitHubPMAgentApp:
             self.config.get("github", {}).get("mentions", []),
         )
         events = poller.poll(since)
-        enqueued = self.queue.enqueue(events)
+        probe = StatusProbe(self.client, repo_name(self.config), self.config)
+        synthetic_events = probe.scan()
+        enqueued = self.queue.enqueue(events + synthetic_events)
         write_json(self.cursors_path, {"since": utc_now_iso()})
-        return {"since": since, "events_found": len(events), "events_enqueued": enqueued}
+        return {
+            "since": since,
+            "events_found": len(events),
+            "synthetic_events_found": len(synthetic_events),
+            "events_enqueued": enqueued,
+        }
 
     def cycle(self) -> Dict[str, Any]:
         poll_result = self.poll()
@@ -63,4 +71,3 @@ class GitHubPMAgentApp:
                 if not self.config.get("engine", {}).get("continue_on_error", True):
                     raise
         return {"poll": poll_result, "processed": processed}
-

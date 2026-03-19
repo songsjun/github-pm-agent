@@ -59,7 +59,13 @@ class GitHubPoller:
                 body=body,
                 target_kind=target_kind,
                 target_number=item.get("number"),
-                metadata={"state": item.get("state"), "labels": [(label or {}).get("name") for label in item.get("labels", [])]},
+                metadata={
+                    "state": item.get("state"),
+                    "labels": [(label or {}).get("name") for label in item.get("labels", [])],
+                    "draft": item.get("draft", False),
+                    "author": (item.get("user") or {}).get("login", ""),
+                    "requested_reviewers": [(reviewer or {}).get("login") for reviewer in item.get("requested_reviewers", [])],
+                },
             )
             events.append(event)
             events.extend(self._mention_events(event, body))
@@ -120,7 +126,13 @@ class GitHubPoller:
                     body=body,
                     target_kind="issue",
                     target_number=number,
-                    metadata={"event": item.get("event"), "commit_id": item.get("commit_id")},
+                    metadata={
+                        "event": item.get("event"),
+                        "commit_id": item.get("commit_id"),
+                        "label": ((item.get("label") or {}).get("name")),
+                        "assignee": ((item.get("assignee") or {}).get("login")),
+                        "review_requested_reviewer": ((item.get("requested_reviewer") or {}).get("login")),
+                    },
                 )
             )
         return events

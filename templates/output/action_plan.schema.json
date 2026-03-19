@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "should_act",
+    "reason",
+    "action_type",
+    "target",
+    "message",
+    "labels_to_add",
+    "labels_to_remove",
+    "memory_note",
+    "issue_title"
+  ],
+  "properties": {
+    "should_act": {
+      "type": "boolean"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "action_type": {
+      "type": "string",
+      "enum": ["comment", "label", "issue", "none"]
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "number"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["issue", "pull_request", "discussion", "comment", "none"]
+        },
+        "number": {
+          "type": "integer"
+        }
+      }
+    },
+    "message": {
+      "type": "string"
+    },
+    "labels_to_add": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "labels_to_remove": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "memory_note": {
+      "type": "string"
+    },
+    "issue_title": {
+      "type": "string"
+    }
+  }
+}
