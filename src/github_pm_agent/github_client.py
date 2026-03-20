@@ -29,8 +29,13 @@ class GitHubClient:
             values = value if isinstance(value, (list, tuple)) else [value]
             for item in values:
                 if isinstance(item, bool):
-                    item = "true" if item else "false"
-                args.extend(["-F", f"{key}={item}"])
+                    # -F interprets booleans correctly
+                    args.extend(["-F", f"{key}={'true' if item else 'false'}"])
+                elif isinstance(item, (int, float)):
+                    args.extend(["-F", f"{key}={item}"])
+                else:
+                    # -f treats value as literal string; -F would interpret @prefix as a file path
+                    args.extend(["-f", f"{key}={item}"])
         output = self._run(args)
         if not output:
             return {}
