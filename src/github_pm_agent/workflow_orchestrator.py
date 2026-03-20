@@ -7,6 +7,53 @@ from typing import Any, Dict, List, Optional
 import yaml
 
 
+class _PermissionBoundActions:
+    """Wraps real actions and blocks any action_type listed in forbidden permissions."""
+
+    def __init__(self, real_actions: Any, allowed: List[str], forbidden: List[str]) -> None:
+        self._real = real_actions
+        self._allowed = set(allowed)
+        self._forbidden = set(forbidden)
+
+    def _is_permitted(self, action_type: str) -> bool:
+        if action_type in self._forbidden:
+            return False
+        if self._allowed and action_type not in self._allowed:
+            return False
+        return True
+
+    def _block(self, action_type: str) -> Dict[str, Any]:
+        return {"action_type": action_type, "skipped": True, "reason": "forbidden_by_role_permissions"}
+
+    def comment(self, target_kind: str, target_number: Optional[int], message: str) -> Dict[str, Any]:
+        if not self._is_permitted("comment"):
+            return self._block("comment")
+        return self._real.comment(target_kind, target_number, message)
+
+    def comment_on_discussion(self, discussion_id: str, number: Optional[int], message: str) -> Dict[str, Any]:
+        if not self._is_permitted("comment"):
+            return self._block("comment")
+        return self._real.comment_on_discussion(discussion_id, number, message)
+
+    def add_labels(self, number: int, labels: List[str]) -> Dict[str, Any]:
+        if not self._is_permitted("label"):
+            return self._block("label")
+        return self._real.add_labels(number, labels)
+
+    def remove_labels(self, number: int, labels: List[str]) -> Dict[str, Any]:
+        if not self._is_permitted("label"):
+            return self._block("label")
+        return self._real.remove_labels(number, labels)
+
+    def create_issue(self, title: str, body: str, labels: Optional[List[str]] = None) -> Dict[str, Any]:
+        if not self._is_permitted("issue"):
+            return self._block("issue")
+        return self._real.create_issue(title=title, body=body, labels=labels)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+
 class _NoOpActions:
     def _skip(self, action_type: str, **extra: Any) -> Dict[str, Any]:
         return {"action_type": action_type, "skipped": True, "dry_run": True, **extra}
@@ -81,10 +128,6 @@ class WorkflowOrchestrator:
                 self._escalate(event, failure["type"], self._build_escalation_detail(event, failure))
 
         combined: Dict[str, Any] = {}
-        if participant_results:
-            last_result = participant_results[-1]["result"]
-            if isinstance(last_result, dict):
-                combined.update(last_result)
         combined["workflow"] = {
             "event_type": workflow.get("event_type", "default"),
             "participants": participants,
@@ -135,6 +178,13 @@ class WorkflowOrchestrator:
         self.engine.run_ai_handler = run_ai_handler_with_role
         if action_mode == "observe":
             self.engine.actions = _NoOpActions()
+        else:
+            role_config = self.engine.role_registry.load(role) if self.engine.role_registry else {}
+            permissions = role_config.get("permissions", {})
+            allowed = permissions.get("allowed", [])
+            forbidden = permissions.get("forbidden", [])
+            if allowed or forbidden:
+                self.engine.actions = _PermissionBoundActions(original_actions, allowed, forbidden)
 
         try:
             result = self.engine.process(event)
@@ -142,6 +192,12 @@ class WorkflowOrchestrator:
             self.engine.actions = original_actions
             self.engine.run_ai_handler = original_run_ai_handler
 
+        if action_mode == "observe" and isinstance(result, dict):
+            action = result.get("action")
+            if isinstance(action, dict):
+                action["executed"] = False
+
+        self._enforce_permissions(result, role)
         return result
 
     def _condition_matches(
@@ -295,15 +351,13 @@ class WorkflowOrchestrator:
                 if key in issue.get("title", ""):
                     return
 
-        had_dry_run = hasattr(self.actions, "dry_run")
-        original_dry_run = getattr(self.actions, "dry_run", None)
-        if had_dry_run:
-            self.actions.dry_run = False
-        try:
-            self.actions.create_issue(title=title, body=detail, labels=["agent-escalate"])
-        finally:
-            if had_dry_run:
-                self.actions.dry_run = original_dry_run
+        self.actions.create_issue(title=title, body=detail, labels=["agent-escalate"])
+
+    def _enforce_permissions(self, result: Dict[str, Any], role: str) -> None:
+        """Mark action as skipped if it was blocked by role permissions (already skipped by wrapper)."""
+        action = result.get("action") if isinstance(result, dict) else None
+        if isinstance(action, dict) and action.get("raw", {}).get("reason") == "forbidden_by_role_permissions":
+            action["executed"] = False
 
     def _build_escalation_detail(self, event: Any, failure: Dict[str, str]) -> str:
         target_number = event.target_number or 0
