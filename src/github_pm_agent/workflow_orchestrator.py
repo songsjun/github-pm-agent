@@ -208,6 +208,12 @@ class WorkflowOrchestrator:
             if condition:
                 participant["condition"] = condition
             participants.append(participant)
+        # If no config agent participates in this event_type, fall back to workflow YAML
+        if not participants:
+            return sorted(
+                workflow.get("participants", []),
+                key=lambda p: int(p.get("priority", 0) or 0),
+            )
         return sorted(participants, key=lambda p: int(p.get("priority", 0) or 0))
 
     def _execute_participant(

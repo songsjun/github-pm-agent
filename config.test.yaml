@@ -1,0 +1,33 @@
+github:
+  repos:
+    - songsjun/github-pm-agent
+  default_branch: main
+  owner: songsjun                # escalation @mention 目标
+  gh_path: gh
+
+agents:
+  - id: pm
+    role: pm
+    # token_env 未设置 → 使用 gh CLI 当前活跃账户 (songsjun)
+    priority: 1
+    participates_in:
+      pull_request_changed: respond
+      issue_changed: respond
+
+engine:
+  dry_run: true                  # Phase 1: 只观察，不执行真实 GitHub 操作
+  continue_on_error: true
+  supervisor_enabled: false
+
+ai:
+  default_provider: codex
+  providers:
+    codex:
+      type: cli_script
+      script: scripts/run_ai_cli.py
+      provider_name: codex
+      default_model: gpt-5.4
+      codex_path: /opt/homebrew/bin/codex
+      reasoning_effort: low          # 测试时用 low，生产可改为 high
+
+runtime_dir: .runtime-test

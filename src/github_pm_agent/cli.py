@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,15 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("poll", help="Poll GitHub and enqueue new events")
-    subparsers.add_parser("cycle", help="Poll GitHub and process the queue")
+
+    cycle_parser = subparsers.add_parser("cycle", help="Poll GitHub and process the queue")
+    cycle_parser.add_argument(
+        "--loop",
+        type=int,
+        default=0,
+        metavar="SECONDS",
+        help="Run in daemon mode, repeating every N seconds (0 = run once)",
+    )
 
     queue_parser = subparsers.add_parser("queue", help="Inspect the local queue")
     queue_subparsers = queue_parser.add_subparsers(dest="queue_command", required=True)
@@ -42,7 +51,14 @@ def main() -> int:
         return 0
 
     if args.command == "cycle":
-        print(json.dumps(app.cycle(), indent=2, ensure_ascii=False))
+        if args.loop:
+            print(f"[daemon] starting loop every {args.loop}s — Ctrl-C to stop", flush=True)
+            while True:
+                result = app.cycle()
+                print(json.dumps(result, indent=2, ensure_ascii=False), flush=True)
+                time.sleep(args.loop)
+        else:
+            print(json.dumps(app.cycle(), indent=2, ensure_ascii=False))
         return 0
 
     if args.command == "queue":

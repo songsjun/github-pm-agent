@@ -143,6 +143,8 @@ class AIAdapterManager:
             command.extend(["--codex-path", provider_config["codex_path"]])
         if provider_config.get("gemini_path"):
             command.extend(["--gemini-path", provider_config["gemini_path"]])
+        if provider_config.get("reasoning_effort"):
+            command.extend(["--reasoning-effort", provider_config["reasoning_effort"]])
 
         result = subprocess.run(command, check=True, capture_output=True, text=True)
         raw = json.loads(result.stdout.strip()) if result.stdout.strip() else {}
