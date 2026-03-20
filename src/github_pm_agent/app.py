@@ -38,6 +38,10 @@ class GitHubPMAgentApp:
         self.orchestrator = WorkflowOrchestrator(
             project_root, self.engine, self.actions, self.client, config
         )
+        from github_pm_agent.queue_store import SuspendedEventScanner
+
+        owner_login = config.get("github", {}).get("owner", "")
+        self.scanner = SuspendedEventScanner(self.queue, self.client, owner_login)
         self.cursors_path = self.runtime_dir / "cursors.json"
 
     def poll(self) -> Dict[str, Any]:
@@ -63,6 +67,7 @@ class GitHubPMAgentApp:
 
     def cycle(self) -> Dict[str, Any]:
         poll_result = self.poll()
+        resume_result = self.scanner.scan_and_resume()
         processed: List[Dict[str, Any]] = []
         while True:
             event = self.queue.pop()
@@ -70,10 +75,20 @@ class GitHubPMAgentApp:
                 break
             try:
                 result = self.orchestrator.process(event)
-                self.queue.mark_done(event, result)
+                escalation_refs = result.get("escalation_refs", [])
+                if escalation_refs:
+                    for ref in escalation_refs:
+                        self.queue.mark_suspended(
+                            event,
+                            ref["issue_number"],
+                            ref["key"],
+                            ref["reason_class"],
+                        )
+                else:
+                    self.queue.mark_done(event, result)
                 processed.append({"event_id": event.event_id, "result": result})
             except Exception as exc:  # noqa: BLE001
                 self.queue.mark_failed(event, str(exc))
                 if not self.config.get("engine", {}).get("continue_on_error", True):
                     raise
-        return {"poll": poll_result, "processed": processed}
+        return {"poll": poll_result, "resume": resume_result, "processed": processed}

@@ -103,6 +103,7 @@ class WorkflowOrchestrator:
         context: Dict[str, Any] = {"cache": {}}
         participant_results = []
         vetoed = False
+        escalation_refs: List[Dict[str, Any]] = []
         veto_reason = ""
         for participant in participants:
             result = self._execute_participant(event, participant, context=context)
@@ -115,7 +116,14 @@ class WorkflowOrchestrator:
                 }
             )
             if participant.get("action_mode", "respond") == "veto" and result.get("vetoed"):
-                self._escalate(event, "veto", result.get("veto_reason", ""))
+                issue_number = self._escalate(event, "veto", result.get("veto_reason", ""))
+                escalation_refs.append(
+                    {
+                        "issue_number": issue_number,
+                        "key": f"{event.repo}#{event.target_number or 0}:{event.event_type}:veto",
+                        "reason_class": "veto",
+                    }
+                )
                 vetoed = True
                 veto_reason = result.get("veto_reason", "")
                 break
@@ -125,7 +133,15 @@ class WorkflowOrchestrator:
         if signals:
             failed_signals = self._check_signals(event, signals)
             for failure in failed_signals:
-                self._escalate(event, failure["type"], self._build_escalation_detail(event, failure))
+                detail = self._build_escalation_detail(event, failure)
+                issue_number = self._escalate(event, failure["type"], detail)
+                escalation_refs.append(
+                    {
+                        "issue_number": issue_number,
+                        "key": f"{event.repo}#{event.target_number or 0}:{event.event_type}:{failure['type']}",
+                        "reason_class": failure["type"],
+                    }
+                )
 
         combined: Dict[str, Any] = {}
         combined["workflow"] = {
@@ -136,6 +152,7 @@ class WorkflowOrchestrator:
         }
         combined["participants"] = participant_results
         combined["signal_failures"] = failed_signals
+        combined["escalation_refs"] = escalation_refs
         combined["escalated"] = vetoed or bool(failed_signals)
         combined["vetoed"] = vetoed
         if veto_reason:
@@ -338,7 +355,7 @@ class WorkflowOrchestrator:
             failures.append({"type": signal_type or "unknown", "reason": "unsupported workflow signal"})
         return failures
 
-    def _escalate(self, event: Any, reason_class: str, detail: str) -> None:
+    def _escalate(self, event: Any, reason_class: str, detail: str) -> Optional[int]:
         target_number = event.target_number or 0
         key = f"{event.repo}#{target_number}:{event.event_type}:{reason_class}"
         title = f"[Agent ESCALATE] {key}"
@@ -349,9 +366,16 @@ class WorkflowOrchestrator:
         if isinstance(open_issues, list):
             for issue in open_issues:
                 if key in issue.get("title", ""):
-                    return
+                    return issue.get("number")
 
-        self.actions.create_issue(title=title, body=detail, labels=["agent-escalate"])
+        owner = self.config.get("github", {}).get("owner", "")
+        full_body = f"@{owner}\n\n{detail}" if owner else detail
+        result = self.actions.create_issue(title=title, body=full_body, labels=["agent-escalate"])
+        if isinstance(result, dict):
+            if isinstance(result.get("result"), dict):
+                return result["result"].get("number")
+            return result.get("number")
+        return None
 
     def _enforce_permissions(self, result: Dict[str, Any], role: str) -> None:
         """Mark action as skipped if it was blocked by role permissions (already skipped by wrapper)."""
