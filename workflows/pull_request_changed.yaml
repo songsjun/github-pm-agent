@@ -1,0 +1,22 @@
+event_type: pull_request_changed
+
+participants:
+  - role: engineer
+    action_mode: respond
+    priority: 1
+
+  - role: pm
+    action_mode: observe
+    priority: 2
+
+  - role: security
+    action_mode: veto
+    priority: 3
+    condition:
+      files_match: "auth/**|security/**|**/credentials*|**/.env*"
+
+signals:
+  - type: ci_checks
+    require: all_pass
+  - type: pr_approvals
+    require: minimum_1

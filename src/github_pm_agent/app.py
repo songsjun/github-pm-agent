@@ -11,9 +11,11 @@ from github_pm_agent.github_client import GitHubClient
 from github_pm_agent.poller import GitHubPoller
 from github_pm_agent.prompt_library import PromptLibrary
 from github_pm_agent.queue_store import QueueStore
+from github_pm_agent.role_registry import RoleRegistry
 from github_pm_agent.session_store import SessionStore
 from github_pm_agent.status_probe import StatusProbe
 from github_pm_agent.utils import read_json, utc_now_iso, write_json
+from github_pm_agent.workflow_orchestrator import WorkflowOrchestrator
 
 
 class GitHubPMAgentApp:
@@ -32,6 +34,10 @@ class GitHubPMAgentApp:
             dry_run=config.get("engine", {}).get("dry_run", True),
         )
         self.engine = EventEngine(config, self.ai, self.actions, self.runtime_dir)
+        self.engine.role_registry = RoleRegistry(project_root)
+        self.orchestrator = WorkflowOrchestrator(
+            project_root, self.engine, self.actions, self.client, config
+        )
         self.cursors_path = self.runtime_dir / "cursors.json"
 
     def poll(self) -> Dict[str, Any]:
@@ -63,7 +69,7 @@ class GitHubPMAgentApp:
             if event is None:
                 break
             try:
-                result = self.engine.process(event)
+                result = self.orchestrator.process(event)
                 self.queue.mark_done(event, result)
                 processed.append({"event_id": event.event_id, "result": result})
             except Exception as exc:  # noqa: BLE001

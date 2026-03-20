@@ -1,0 +1,5 @@
+{
+  "role": "engineer",
+  "allowed": ["comment", "label", "review_request", "rerun_workflow", "none"],
+  "forbidden": ["merge", "create_release", "state"]
+}
