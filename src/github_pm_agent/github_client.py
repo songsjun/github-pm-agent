@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from typing import Any, Dict, Iterable, List, Optional
 
 
 class GitHubClient:
-    def __init__(self, gh_path: str, repo: str) -> None:
+    def __init__(self, gh_path: str, repo: str, token_env: Optional[str] = None) -> None:
         self.gh_path = gh_path
         self.repo = repo
+        self.token_env = token_env
 
     def _run(self, args: List[str]) -> str:
         command = [self.gh_path] + args
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        token = os.environ.get(self.token_env) if self.token_env else None
+        if token:
+            env = {**os.environ, "GITHUB_TOKEN": token}
+            result = subprocess.run(command, check=True, capture_output=True, text=True, env=env)
+        else:
+            result = subprocess.run(command, check=True, capture_output=True, text=True)
         return result.stdout.strip()
 
     def api(self, path: str, params: Optional[Dict[str, Any]] = None, method: str = "GET") -> Any:

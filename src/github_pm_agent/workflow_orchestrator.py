@@ -86,20 +86,28 @@ class _NoOpActions:
 
 
 class WorkflowOrchestrator:
-    def __init__(self, project_root: Path, engine: Any, actions: Any, client: Any, config: Dict[str, Any]) -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        engine: Any,
+        actions: Any,
+        client: Any,
+        config: Dict[str, Any],
+        agent_configs: Optional[List[Dict[str, Any]]] = None,
+        agent_toolkits: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self.project_root = Path(project_root)
         self.engine = engine
         self.actions = actions
         self.client = client
         self.config = config
+        self.agent_configs = agent_configs or []
+        self.agent_toolkits = agent_toolkits or {}
         self.workflows_dir = self.project_root / "workflows"
 
     def process(self, event: Any) -> Dict[str, Any]:
         workflow = self._load_workflow(event.event_type)
-        participants = sorted(
-            workflow.get("participants", []),
-            key=lambda participant: int(participant.get("priority", 0) or 0),
-        )
+        participants = self._build_participants(event.event_type, workflow)
         context: Dict[str, Any] = {"cache": {}}
         participant_results = []
         vetoed = False
@@ -171,6 +179,37 @@ class WorkflowOrchestrator:
             return payload
         raise FileNotFoundError(f"missing workflow config for event_type={event_type}")
 
+    def _build_participants(self, event_type: str, workflow: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Build participant list from config agents filtered by event_type.
+        Falls back to workflow YAML participants if no config agents defined.
+        Merges conditions_by_role from workflow YAML.
+        """
+        if not self.agent_configs:
+            return sorted(
+                workflow.get("participants", []),
+                key=lambda p: int(p.get("priority", 0) or 0),
+            )
+        conditions_by_role = workflow.get("conditions_by_role", {})
+        participants = []
+        for agent in self.agent_configs:
+            participates_in = agent.get("participates_in", {})
+            action_mode = participates_in.get(event_type)
+            if not action_mode:
+                continue
+            role = agent.get("role", agent.get("id", "pm"))
+            participant: Dict[str, Any] = {
+                "id": agent.get("id", role),
+                "role": role,
+                "action_mode": action_mode,
+                "priority": agent.get("priority", 99),
+            }
+            condition = conditions_by_role.get(role)
+            if condition:
+                participant["condition"] = condition
+            participants.append(participant)
+        return sorted(participants, key=lambda p: int(p.get("priority", 0) or 0))
+
     def _execute_participant(
         self,
         event: Any,
@@ -182,6 +221,8 @@ class WorkflowOrchestrator:
 
         role = participant.get("role", "pm")
         action_mode = participant.get("action_mode", "respond")
+        agent_id = participant.get("id", role)
+        agent_toolkit = self.agent_toolkits.get(agent_id)
         if action_mode == "veto":
             return self.engine.run_veto_handler(event, role=role)
 
@@ -196,12 +237,15 @@ class WorkflowOrchestrator:
         if action_mode == "observe":
             self.engine.actions = _NoOpActions()
         else:
+            base_actions = agent_toolkit if agent_toolkit else original_actions
             role_config = self.engine.role_registry.load(role) if self.engine.role_registry else {}
             permissions = role_config.get("permissions", {})
             allowed = permissions.get("allowed", [])
             forbidden = permissions.get("forbidden", [])
             if allowed or forbidden:
-                self.engine.actions = _PermissionBoundActions(original_actions, allowed, forbidden)
+                self.engine.actions = _PermissionBoundActions(base_actions, allowed, forbidden)
+            elif agent_toolkit:
+                self.engine.actions = agent_toolkit
 
         try:
             result = self.engine.process(event)

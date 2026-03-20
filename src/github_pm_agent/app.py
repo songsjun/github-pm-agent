@@ -35,8 +35,25 @@ class GitHubPMAgentApp:
         )
         self.engine = EventEngine(config, self.ai, self.actions, self.runtime_dir)
         self.engine.role_registry = RoleRegistry(project_root)
+        agent_configs = config.get("agents", [])
+        dry_run = config.get("engine", {}).get("dry_run", True)
+        _gh_path = gh_path(config)
+        _primary_repo = repo_name(config)
+        agent_toolkits: Dict[str, Any] = {}
+        for agent_cfg in agent_configs:
+            token_env = agent_cfg.get("token_env")
+            agent_client = GitHubClient(_gh_path, _primary_repo, token_env=token_env)
+            agent_toolkits[agent_cfg["id"]] = GitHubActionToolkit(
+                agent_client, self.runtime_dir, dry_run=dry_run
+            )
         self.orchestrator = WorkflowOrchestrator(
-            project_root, self.engine, self.actions, self.client, config
+            project_root,
+            self.engine,
+            self.actions,
+            self.client,
+            config,
+            agent_configs=agent_configs,
+            agent_toolkits=agent_toolkits,
         )
         from github_pm_agent.queue_store import SuspendedEventScanner
 
