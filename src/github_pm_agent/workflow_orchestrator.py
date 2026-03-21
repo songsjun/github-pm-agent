@@ -106,6 +106,8 @@ class WorkflowOrchestrator:
         self.workflows_dir = self.project_root / "workflows"
 
     def process(self, event: Any) -> Dict[str, Any]:
+        if event.event_type == "discussion_comment":
+            return self._record_discussion_comment(event)
         workflow = self._load_workflow(event.event_type)
         if "steps" in workflow:
             return self._process_phase_workflow(event, workflow)
@@ -239,6 +241,8 @@ class WorkflowOrchestrator:
                     variables[f"artifact_{phase_name}"] = artifact_text
             gate_comment = meta.get("gate_human_comment", "")
             variables["human_comment"] = f"Human feedback:\n{gate_comment}\n" if gate_comment else ""
+            pending = instance.get_pending_comments()
+            variables["pending_comments"] = "\n\n---\n\n".join(pending) if pending else ""
 
             roles = step.get("roles", ["pm"])
             last_content = ""
@@ -254,6 +258,9 @@ class WorkflowOrchestrator:
                 all_ai_outputs.append({"phase": current_phase, "role": role, "content": content})
 
             instance.set_artifact(current_phase, last_content)
+
+            if pending:
+                instance.clear_pending_comments()
 
             if step.get("gate"):
                 idx = next((i for i, s in enumerate(steps) if s.get("phase") == current_phase), -1)
@@ -280,10 +287,22 @@ class WorkflowOrchestrator:
             # Non-gate step: handle action and advance
             if step.get("action") == "create_issues":
                 created_issues, issue_creation_error = self._create_issues_from_artifact(last_content, event)
+                # Normalize and persist issue refs for completion summary
+                issue_refs = []
+                for item in created_issues:
+                    number = (item.get("result") or {}).get("number") or item.get("number")
+                    title = item.get("title", "")
+                    issue_refs.append({"number": number, "title": title})
+                if issue_refs:
+                    instance.set_created_issue_refs(issue_refs)
 
             idx = next((i for i, s in enumerate(steps) if s.get("phase") == current_phase), -1)
             next_step = steps[idx + 1] if 0 <= idx < len(steps) - 1 else None
             if not next_step:
+                # Post completion summary before marking done (allows retry if posting fails)
+                if not instance.is_completion_comment_posted():
+                    self._post_completion_summary(event, instance)
+                    instance.set_completion_comment_posted()
                 instance.set_completed()
                 break
             current_phase = next_step["phase"]
@@ -321,6 +340,35 @@ class WorkflowOrchestrator:
             )
             created.append(result)
         return created, ""
+
+    def _record_discussion_comment(self, event: Any) -> Dict[str, Any]:
+        from github_pm_agent.workflow_instance import WorkflowInstance
+
+        discussion_number = event.target_number
+        if not discussion_number:
+            return {"skipped": True, "reason": "no_discussion_number", "escalation_refs": []}
+        instance = WorkflowInstance.load(self.engine.runtime_dir, event.repo, discussion_number)
+        if not instance.get_phase() or instance.is_completed():
+            return {"skipped": True, "reason": "no_active_workflow", "escalation_refs": []}
+        if event.body:
+            instance.add_pending_comment(event.body)
+        return {"recorded": True, "discussion_number": discussion_number, "escalation_refs": []}
+
+    def _post_completion_summary(self, event: Any, instance: Any) -> None:
+        """Post a completion comment to the original Discussion."""
+        node_id = event.metadata.get("node_id") or (
+            instance.get_original_event() or {}
+        ).get("metadata", {}).get("node_id")
+        if not node_id:
+            return
+        refs = instance.get_created_issue_refs()
+        issue_lines = "\n".join(
+            f"- #{r['number']}: {r['title']}" if r.get("number") else f"- {r['title']}"
+            for r in refs
+        )
+        count = len(refs)
+        body = f"Workflow complete. Created {count} issue(s):\n\n{issue_lines}" if issue_lines else "Workflow complete."
+        self.actions.comment_on_discussion(node_id, event.target_number, body)
 
     def _load_workflow(self, event_type: str) -> Dict[str, Any]:
         candidates = [self.workflows_dir / f"{event_type}.yaml", self.workflows_dir / "default.yaml"]

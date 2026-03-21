@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 class WorkflowInstance:
@@ -67,6 +67,31 @@ class WorkflowInstance:
         self._state.pop("gate_issue_number", None)
         self._state.pop("gate_next_phase", None)
         self._save()
+
+    def add_pending_comment(self, comment: str) -> None:
+        self._state.setdefault("pending_comments", []).append(comment)
+        self._save()
+
+    def get_pending_comments(self) -> List[str]:
+        return list(self._state.get("pending_comments", []))
+
+    def clear_pending_comments(self) -> None:
+        self._state.pop("pending_comments", None)
+        self._save()
+
+    def set_created_issue_refs(self, refs: List[Dict[str, Any]]) -> None:
+        self._state["created_issue_refs"] = refs
+        self._save()
+
+    def get_created_issue_refs(self) -> List[Dict[str, Any]]:
+        return list(self._state.get("created_issue_refs", []))
+
+    def set_completion_comment_posted(self) -> None:
+        self._state["completion_comment_posted"] = True
+        self._save()
+
+    def is_completion_comment_posted(self) -> bool:
+        return bool(self._state.get("completion_comment_posted"))
 
     def is_completed(self) -> bool:
         return bool(self._state.get("completed"))

@@ -4,6 +4,7 @@ A new product idea has been submitted as a GitHub Discussion. Analyze it from a 
 
 $discussion_body
 
+$pending_comments
 ---
 
 Write a concise brainstorm document covering:

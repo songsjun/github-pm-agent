@@ -13,6 +13,7 @@ class RecordingActions:
     def __init__(self) -> None:
         self.dry_run = True
         self.comment_calls: List[Dict[str, Any]] = []
+        self.comment_on_discussion_calls: List[Dict[str, Any]] = []
         self.create_issue_calls: List[Dict[str, Any]] = []
 
     def comment(self, target_kind: str, target_number: Optional[int], message: str) -> Dict[str, Any]:
@@ -28,11 +29,12 @@ class RecordingActions:
     def comment_on_discussion(self, discussion_id: str, number: Optional[int], message: str) -> Dict[str, Any]:
         payload = {
             "discussion_id": discussion_id,
-            "target_number": number,
+            "number": number,
             "message": message,
             "dry_run": self.dry_run,
         }
         self.comment_calls.append(payload)
+        self.comment_on_discussion_calls.append({"discussion_id": discussion_id, "number": number, "message": message})
         return payload
 
     def add_labels(self, number: int, labels: List[str]) -> Dict[str, Any]:
@@ -330,3 +332,102 @@ def test_phase_workflow_skips_when_gate_already_open() -> None:
         assert result.get("gate_issue_number") == 42
         assert actions.create_issue_calls == [], "no new issue should be created when gate is already open"
         assert engine.run_raw_text_handler_calls == [], "AI handler must not be invoked when skipping"
+
+
+def _discussion_comment_event(**metadata: Any) -> Event:
+    return Event(
+        event_id="evt-disc-comment-1",
+        event_type="discussion_comment",
+        source="test",
+        occurred_at="2026-03-20T00:00:00Z",
+        repo="songsjun/example",
+        actor="alice",
+        url="https://example.test/discussions/5",
+        title="Feature idea",
+        body="Great idea!",
+        target_kind="discussion",
+        target_number=5,
+        metadata=dict(metadata),
+    )
+
+
+def test_record_discussion_comment_active_workflow() -> None:
+    """A discussion_comment on an active workflow must be recorded as a pending comment."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+
+        # Pre-create instance at brainstorm phase (active, not completed)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        instance.set_phase("brainstorm")
+
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        result = orchestrator.process(_discussion_comment_event())
+
+        assert result.get("recorded") is True
+
+        # Reload to confirm persistence
+        reloaded = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        assert reloaded.get_pending_comments() == ["Great idea!"]
+
+
+def test_record_discussion_comment_no_active_workflow() -> None:
+    """A discussion_comment with no active workflow must be skipped."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        # No WorkflowInstance created — fresh state
+
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        result = orchestrator.process(_discussion_comment_event())
+
+        assert result.get("skipped") is True
+        assert result.get("reason") == "no_active_workflow"
+
+
+def test_completion_summary_posted_to_discussion() -> None:
+    """After issue_breakdown completes, a completion summary must be posted to the original Discussion."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+
+        # Pre-create instance at issue_breakdown phase with requirements artifact
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        instance.set_phase("issue_breakdown")
+        instance.set_artifact("requirements", "some requirements text")
+
+        issue_json = '[{"title": "Task 1", "body": "desc", "labels": []}]'
+
+        class FakeEngineWithIssueBreakdown(FakeEngine):
+            def run_raw_text_handler(
+                self,
+                event: Any,
+                prompt_path: str,
+                role: str = "pm",
+                variables: Optional[Dict[str, Any]] = None,
+            ) -> Dict[str, Any]:
+                self.run_raw_text_handler_calls.append(
+                    {"event_id": event.event_id, "prompt_path": prompt_path, "role": role}
+                )
+                if "issue_breakdown" in prompt_path:
+                    return {"raw_text": issue_json}
+                return {"raw_text": f"output for {role}"}
+
+        actions = RecordingActions()
+        engine = FakeEngineWithIssueBreakdown(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        result = orchestrator.process(_discussion_event(node_id="D_abc123"))
+
+        # Verify completion summary was posted
+        assert len(actions.comment_on_discussion_calls) == 1
+        call = actions.comment_on_discussion_calls[0]
+        assert call["discussion_id"] == "D_abc123"
+
+        # Verify instance state
+        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        assert final_instance.is_completed() is True
+        assert final_instance.is_completion_comment_posted() is True

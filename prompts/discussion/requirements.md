@@ -9,6 +9,7 @@ $discussion_body
 $artifact_brainstorm
 
 $human_comment
+$pending_comments
 ---
 
 Write a PRD with:

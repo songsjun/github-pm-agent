@@ -5,6 +5,7 @@ Based on the product requirements below, extract a list of implementation tasks 
 **Requirements:**
 $artifact_requirements
 
+$pending_comments
 ---
 
 Output ONLY a JSON array. No prose, no markdown fences, no explanation. Each item must have:
