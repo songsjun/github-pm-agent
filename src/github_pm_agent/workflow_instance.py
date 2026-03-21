@@ -68,6 +68,13 @@ class WorkflowInstance:
         self._state.pop("gate_next_phase", None)
         self._save()
 
+    def is_completed(self) -> bool:
+        return bool(self._state.get("completed"))
+
+    def set_completed(self) -> None:
+        self._state["completed"] = True
+        self._save()
+
     def _save(self) -> None:
         self.state_path.write_text(
             json.dumps(self._state, indent=2, ensure_ascii=False),

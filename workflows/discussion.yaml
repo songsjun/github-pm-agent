@@ -10,3 +10,9 @@ steps:
     prompt_path: prompts/discussion/requirements.md
     output_mode: raw_text
     gate: false
+  - phase: issue_breakdown
+    roles: [pm]
+    prompt_path: prompts/discussion/issue_breakdown.md
+    output_mode: raw_text
+    gate: false
+    action: create_issues

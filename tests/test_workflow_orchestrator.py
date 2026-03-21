@@ -218,6 +218,97 @@ def _discussion_event(**metadata: Any) -> Event:
     )
 
 
+def test_phase_workflow_auto_chains_to_issue_breakdown() -> None:
+    """After requirements completes (no gate), orchestrator auto-chains to issue_breakdown and creates issues."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+
+        # Pre-create instance at requirements phase (gate already cleared by prior advance)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        instance.set_phase("requirements")
+
+        issue_json = '[{"title": "Task 1", "body": "desc", "labels": ["enhancement"]}]'
+
+        class FakeEngineWithIssueBreakdown(FakeEngine):
+            def run_raw_text_handler(self, event: Any, prompt_path: str, role: str = "pm", variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                self.run_raw_text_handler_calls.append({"event_id": event.event_id, "prompt_path": prompt_path, "role": role})
+                if "issue_breakdown" in prompt_path:
+                    return {"raw_text": issue_json}
+                return {"raw_text": f"output for {role}"}
+
+        actions = RecordingActions()
+        engine = FakeEngineWithIssueBreakdown(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        result = orchestrator.process(_discussion_event())
+
+        # Two AI calls: requirements + issue_breakdown
+        assert len(engine.run_raw_text_handler_calls) == 2
+        phases_called = [c["prompt_path"] for c in engine.run_raw_text_handler_calls]
+        assert any("requirements" in p for p in phases_called)
+        assert any("issue_breakdown" in p for p in phases_called)
+
+        # One create_issue call for the parsed issue (no gate issue created)
+        assert len(actions.create_issue_calls) == 1
+        assert actions.create_issue_calls[0]["title"] == "Task 1"
+
+        # Result should have created_issues with 1 item
+        assert len(result.get("created_issues", [])) == 1
+        assert result.get("issue_creation_error", "") == ""
+
+        # Instance should be marked completed
+        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        assert final_instance.is_completed() is True
+
+
+def test_phase_workflow_skips_when_completed() -> None:
+    """A fully completed workflow must skip all processing when triggered again."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+
+        # Pre-create instance already marked completed
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        instance.set_phase("issue_breakdown")
+        instance.set_completed()
+
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        result = orchestrator.process(_discussion_event())
+
+        assert result.get("skipped") is True
+        assert result.get("reason") == "workflow_completed"
+        assert engine.run_raw_text_handler_calls == [], "AI handler must not be invoked when workflow is complete"
+        assert actions.create_issue_calls == [], "no issues should be created when workflow is complete"
+
+
+def test_create_issues_from_artifact_fails_loudly_on_bad_json() -> None:
+    """When issue_breakdown returns non-JSON, issue_creation_error is set and no issues are created."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+
+        # Pre-create instance at issue_breakdown phase
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        instance.set_phase("issue_breakdown")
+        instance.set_artifact("requirements", "some requirements text")
+
+        class FakeEngineBadJson(FakeEngine):
+            def run_raw_text_handler(self, event: Any, prompt_path: str, role: str = "pm", variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                self.run_raw_text_handler_calls.append({"event_id": event.event_id, "prompt_path": prompt_path, "role": role})
+                return {"raw_text": "not valid json"}
+
+        actions = RecordingActions()
+        engine = FakeEngineBadJson(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        result = orchestrator.process(_discussion_event())
+
+        assert result.get("issue_creation_error", "") != "", "error should be set for bad JSON"
+        assert result.get("created_issues", []) == [], "no issues should be created"
+        assert actions.create_issue_calls == [], "create_issue must not be called"
+
+
 def test_phase_workflow_skips_when_gate_already_open() -> None:
     """Re-polling a discussion with an open gate must not re-run the phase or create a new gate issue."""
     with tempfile.TemporaryDirectory() as tmpdir:
