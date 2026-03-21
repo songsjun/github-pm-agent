@@ -8,6 +8,7 @@ $artifact_requirements
 **Final Technical Design:**
 $artifact_final_design
 
+$human_comment
 $pending_comments
 ---
 

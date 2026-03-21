@@ -5,6 +5,7 @@ You are a senior software engineer writing a technical design proposal.
 **Product Requirements:**
 $artifact_requirements
 
+$human_comment
 $pending_comments
 ---
 
