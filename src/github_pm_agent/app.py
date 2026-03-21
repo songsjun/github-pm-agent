@@ -15,6 +15,7 @@ from github_pm_agent.role_registry import RoleRegistry
 from github_pm_agent.session_store import SessionStore
 from github_pm_agent.status_probe import StatusProbe
 from github_pm_agent.utils import read_json, utc_now_iso, write_json
+from github_pm_agent.phase_gate_scanner import PhaseGateScanner
 from github_pm_agent.workflow_orchestrator import WorkflowOrchestrator
 
 
@@ -59,6 +60,7 @@ class GitHubPMAgentApp:
 
         owner_login = config.get("github", {}).get("owner", "")
         self.scanner = SuspendedEventScanner(self.queue, self.client, owner_login)
+        self.gate_scanner = PhaseGateScanner(self.queue, self.client, owner_login)
         self.cursors_path = self.runtime_dir / "cursors.json"
 
     def poll(self) -> Dict[str, Any]:
@@ -85,6 +87,7 @@ class GitHubPMAgentApp:
     def cycle(self) -> Dict[str, Any]:
         poll_result = self.poll()
         resume_result = self.scanner.scan_and_resume()
+        gate_advance_result = self.gate_scanner.scan_and_advance()
         processed: List[Dict[str, Any]] = []
         while True:
             event = self.queue.pop()
@@ -108,4 +111,4 @@ class GitHubPMAgentApp:
                 self.queue.mark_failed(event, str(exc))
                 if not self.config.get("engine", {}).get("continue_on_error", True):
                     raise
-        return {"poll": poll_result, "resume": resume_result, "processed": processed}
+        return {"poll": poll_result, "resume": resume_result, "gate_advance": gate_advance_result, "processed": processed}

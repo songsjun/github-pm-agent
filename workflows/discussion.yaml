@@ -1,0 +1,12 @@
+event_type: discussion
+steps:
+  - phase: brainstorm
+    roles: [pm]
+    prompt_path: prompts/discussion/brainstorm.md
+    output_mode: raw_text
+    gate: true
+  - phase: requirements
+    roles: [pm]
+    prompt_path: prompts/discussion/requirements.md
+    output_mode: raw_text
+    gate: false

@@ -48,6 +48,7 @@ class FakeWorkflowEngine:
         self.process_calls = 0
         self.veto_calls: List[str] = []
         self._veto_results = list(veto_results or [])
+        self.role_registry = None
 
     def process(self, event: Event) -> Dict[str, Any]:
         self.process_calls += 1

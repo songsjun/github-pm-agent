@@ -107,6 +107,8 @@ class WorkflowOrchestrator:
 
     def process(self, event: Any) -> Dict[str, Any]:
         workflow = self._load_workflow(event.event_type)
+        if "steps" in workflow:
+            return self._process_phase_workflow(event, workflow)
         participants = self._build_participants(event.event_type, workflow)
         context: Dict[str, Any] = {"cache": {}}
         participant_results = []
@@ -166,6 +168,96 @@ class WorkflowOrchestrator:
         if veto_reason:
             combined["veto_reason"] = veto_reason
         return combined
+
+    def _process_phase_workflow(self, event: Any, workflow: Dict[str, Any]) -> Dict[str, Any]:
+        from github_pm_agent.workflow_instance import WorkflowInstance
+
+        runtime_dir = self.engine.runtime_dir
+        discussion_number = event.target_number
+        if not discussion_number:
+            return {"error": "discussion event missing target_number", "escalation_refs": []}
+
+        instance = WorkflowInstance.load(runtime_dir, event.repo, discussion_number)
+
+        if not instance.get_original_event():
+            instance.set_original_event(event.to_dict())
+
+        steps = workflow.get("steps", [])
+        if not steps:
+            return {"error": "discussion workflow has no steps", "escalation_refs": []}
+
+        meta = event.metadata or {}
+        advance_to = meta.get("advance_to_phase")
+        if advance_to:
+            instance.set_phase(advance_to)
+            instance.clear_gate()
+
+        current_phase = instance.get_phase()
+        if current_phase is None:
+            current_phase = steps[0]["phase"]
+            instance.set_phase(current_phase)
+
+        step = next((s for s in steps if s.get("phase") == current_phase), None)
+        if step is None:
+            return {"error": f"no workflow step for phase={current_phase}", "escalation_refs": []}
+
+        artifacts = meta.get("artifacts") or instance.get_artifacts()
+        variables: Dict[str, Any] = {
+            "discussion_title": event.title,
+            "discussion_body": event.body,
+            "current_phase": current_phase,
+        }
+        for phase_name, artifact_text in artifacts.items():
+            if not phase_name.startswith("_"):
+                variables[f"artifact_{phase_name}"] = artifact_text
+        gate_comment = meta.get("gate_human_comment", "")
+        variables["human_comment"] = f"Human feedback:\n{gate_comment}\n" if gate_comment else ""
+
+        roles = step.get("roles", ["pm"])
+        ai_outputs: List[Dict[str, Any]] = []
+        last_content = ""
+        for role in roles:
+            result = self.engine.run_raw_text_handler(
+                event,
+                prompt_path=step["prompt_path"],
+                role=role,
+                variables=variables,
+            )
+            content = result.get("raw_text", "")
+            last_content = content
+            ai_outputs.append({"role": role, "content": content})
+
+        instance.set_artifact(current_phase, last_content)
+
+        gate_result: Dict[str, Any] = {}
+        if step.get("gate"):
+            idx = next((i for i, s in enumerate(steps) if s.get("phase") == current_phase), -1)
+            next_step = steps[idx + 1] if 0 <= idx < len(steps) - 1 else None
+            next_phase = next_step["phase"] if next_step else None
+
+            owner = self.config.get("github", {}).get("owner", "")
+            gate_title = f"[workflow-gate] {event.repo} Discussion #{discussion_number} phase={current_phase}"
+            gate_body = f"{'@' + owner + chr(10) + chr(10) if owner else ''}Phase **{current_phase}** complete.\n\n{last_content}"
+            if next_phase:
+                gate_body += f"\n\n---\nReply or close this issue to advance to: **{next_phase}**"
+
+            gate_issue = self.actions.create_issue(
+                title=gate_title, body=gate_body, labels=["workflow-gate"]
+            )
+            gate_number: Optional[int] = None
+            if isinstance(gate_issue, dict):
+                gate_number = gate_issue.get("number") or (gate_issue.get("result") or {}).get("number")
+            if gate_number and next_phase:
+                instance.set_gate(gate_number, next_phase)
+            gate_result = {"gate_issue_number": gate_number, "next_phase": next_phase}
+
+        return {
+            "phase": current_phase,
+            "ai_outputs": ai_outputs,
+            "gate": gate_result,
+            "artifacts": instance.get_artifacts(),
+            "escalation_refs": [],
+        }
 
     def _load_workflow(self, event_type: str) -> Dict[str, Any]:
         candidates = [self.workflows_dir / f"{event_type}.yaml", self.workflows_dir / "default.yaml"]

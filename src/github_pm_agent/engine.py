@@ -61,6 +61,38 @@ class EventEngine:
         self._attach_ai_metadata(result, response)
         return result
 
+    def run_raw_text_handler(
+        self,
+        event: Event,
+        prompt_path: str,
+        role: str = "pm",
+        variables: Optional[Dict[str, Any]] = None,
+        session_key_suffix: str = "",
+    ) -> Dict[str, Any]:
+        """Run AI and return raw text output without JSON parsing or action execution."""
+        request = self._build_ai_request(
+            event,
+            prompt_path=prompt_path,
+            role=role,
+            variables=variables,
+            output_template_path=None,
+            output_schema_path=None,
+            session_key_suffix=session_key_suffix,
+        )
+        response = self.ai_manager.generate(request)
+        result: Dict[str, Any] = {
+            "raw_text": response.content,
+            "action": {
+                "executed": False,
+                "action_type": "none",
+                "target": {"kind": event.target_kind, "number": event.target_number or 0},
+                "message": "",
+                "raw": {},
+            },
+        }
+        self._attach_ai_metadata(result, response)
+        return result
+
     def run_veto_handler(self, event: Event, role: str = "pm") -> Dict[str, Any]:
         prompt_path, extra_variables = self._resolve_veto_prompt(event)
         request = self._build_ai_request(

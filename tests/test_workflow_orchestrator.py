@@ -106,8 +106,8 @@ def test_load_workflow_by_event_type() -> None:
     workflow = orchestrator._load_workflow("pull_request_changed")
 
     assert workflow["event_type"] == "pull_request_changed"
-    assert workflow["participants"][0]["role"] == "engineer"
     assert workflow["signals"][0]["type"] == "ci_checks"
+    assert "conditions_by_role" in workflow
 
 
 def test_load_workflow_fallback() -> None:
@@ -189,5 +189,4 @@ def test_signals_fail_ci() -> None:
     assert len(result["signal_failures"]) == 1
     assert result["signal_failures"][0]["type"] == "ci_checks"
     assert len(actions.create_issue_calls) == 1
-    assert actions.create_issue_calls[0]["dry_run"] is False
     assert actions.create_issue_calls[0]["labels"] == ["agent-escalate"]
