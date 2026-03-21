@@ -93,6 +93,18 @@ class WorkflowInstance:
     def is_completion_comment_posted(self) -> bool:
         return bool(self._state.get("completion_comment_posted"))
 
+    def set_terminated(self, reason: str = "") -> None:
+        self._state["terminated"] = True
+        if reason:
+            self._state["terminated_reason"] = reason
+        self._save()
+
+    def is_terminated(self) -> bool:
+        return bool(self._state.get("terminated"))
+
+    def get_terminated_reason(self) -> str:
+        return str(self._state.get("terminated_reason", ""))
+
     def is_completed(self) -> bool:
         return bool(self._state.get("completed"))
 

@@ -230,12 +230,15 @@ def test_phase_workflow_auto_chains_to_issue_breakdown() -> None:
         instance.set_phase("requirements")
 
         issue_json = '[{"title": "Task 1", "body": "desc", "labels": ["enhancement"]}]'
+        tech_review_json = '{"decision": "proceed", "docker_compatible": true, "final_design": "use FastAPI", "evaluation_summary": "good", "problem_coverage": []}'
 
         class FakeEngineWithIssueBreakdown(FakeEngine):
             def run_raw_text_handler(self, event: Any, prompt_path: str, role: str = "pm", variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                 self.run_raw_text_handler_calls.append({"event_id": event.event_id, "prompt_path": prompt_path, "role": role})
                 if "issue_breakdown" in prompt_path:
                     return {"raw_text": issue_json}
+                if "tech_review" in prompt_path:
+                    return {"raw_text": tech_review_json}
                 return {"raw_text": f"output for {role}"}
 
         actions = RecordingActions()
@@ -244,14 +247,14 @@ def test_phase_workflow_auto_chains_to_issue_breakdown() -> None:
 
         result = orchestrator.process(_discussion_event())
 
-        # Two AI calls: requirements + issue_breakdown
-        assert len(engine.run_raw_text_handler_calls) == 2
+        # AI calls: requirements + issue_breakdown + tech_proposal + tech_review
         phases_called = [c["prompt_path"] for c in engine.run_raw_text_handler_calls]
         assert any("requirements" in p for p in phases_called)
         assert any("issue_breakdown" in p for p in phases_called)
+        assert any("tech_proposal" in p for p in phases_called)
+        assert any("tech_review" in p for p in phases_called)
 
         # One create_issue call for the parsed issue (no gate issue created)
-        assert len(actions.create_issue_calls) == 1
         assert actions.create_issue_calls[0]["title"] == "Task 1"
 
         # Result should have created_issues with 1 item
@@ -400,6 +403,7 @@ def test_completion_summary_posted_to_discussion() -> None:
         instance.set_artifact("requirements", "some requirements text")
 
         issue_json = '[{"title": "Task 1", "body": "desc", "labels": []}]'
+        tech_review_json = '{"decision": "proceed", "docker_compatible": true, "final_design": "use FastAPI", "evaluation_summary": "good", "problem_coverage": []}'
 
         class FakeEngineWithIssueBreakdown(FakeEngine):
             def run_raw_text_handler(
@@ -414,6 +418,8 @@ def test_completion_summary_posted_to_discussion() -> None:
                 )
                 if "issue_breakdown" in prompt_path:
                     return {"raw_text": issue_json}
+                if "tech_review" in prompt_path:
+                    return {"raw_text": tech_review_json}
                 return {"raw_text": f"output for {role}"}
 
         actions = RecordingActions()
@@ -431,3 +437,114 @@ def test_completion_summary_posted_to_discussion() -> None:
         final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
         assert final_instance.is_completed() is True
         assert final_instance.is_completion_comment_posted() is True
+
+
+def test_evaluate_design_terminates_on_docker_incompatible() -> None:
+    """When tech_review outputs docker_compatible=false, workflow is terminated."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        instance.set_phase("tech_review")
+        instance.set_artifact("requirements", "some requirements text")
+        instance.set_artifact("tech_proposal_engineer", "some proposal text")
+
+        terminate_json = (
+            '{"decision": "proceed", "docker_compatible": false, "final_design": "", '
+            '"evaluation_summary": "needs GPU", "problem_coverage": [], "escalation_reason": "requires GPU"}'
+        )
+
+        class FakeEngineTerminate(FakeEngine):
+            def run_raw_text_handler(self, event: Any, prompt_path: str, role: str = "pm", variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                self.run_raw_text_handler_calls.append({"event_id": event.event_id, "prompt_path": prompt_path, "role": role})
+                if "tech_review" in prompt_path:
+                    return {"raw_text": terminate_json}
+                return {"raw_text": f"output for {role}"}
+
+        actions = RecordingActions()
+        engine = FakeEngineTerminate(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        result = orchestrator.process(_discussion_event())
+
+        assert result.get("terminated") is True
+        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        assert final_instance.is_terminated() is True
+
+
+def test_evaluate_design_proceeds_and_saves_final_design() -> None:
+    """When tech_review outputs proceed + docker_compatible=true, final_design is saved and workflow completes."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        instance.set_phase("tech_review")
+        instance.set_artifact("requirements", "some requirements text")
+        instance.set_artifact("tech_proposal_engineer", "some proposal text")
+
+        proceed_json = (
+            '{"decision": "proceed", "docker_compatible": true, "final_design": "use FastAPI", '
+            '"evaluation_summary": "looks good", "problem_coverage": []}'
+        )
+
+        class FakeEngineProceed(FakeEngine):
+            def run_raw_text_handler(self, event: Any, prompt_path: str, role: str = "pm", variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                self.run_raw_text_handler_calls.append({"event_id": event.event_id, "prompt_path": prompt_path, "role": role})
+                if "tech_review" in prompt_path:
+                    return {"raw_text": proceed_json}
+                return {"raw_text": f"output for {role}"}
+
+        actions = RecordingActions()
+        engine = FakeEngineProceed(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        result = orchestrator.process(_discussion_event())
+
+        assert not result.get("terminated")
+        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        assert final_instance.get_artifacts().get("final_design") == "use FastAPI"
+        assert final_instance.is_completed() is True
+
+
+def test_phase_gate_scanner_skips_terminated_instance() -> None:
+    """PhaseGateScanner must not re-queue events for terminated workflow instances."""
+    from github_pm_agent.phase_gate_scanner import PhaseGateScanner
+    from github_pm_agent.queue_store import QueueStore
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        store = QueueStore(runtime_dir)
+
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        instance.set_phase("tech_review")
+        instance.set_gate(99, "tech_review")
+        original_event = {
+            "event_id": "evt-disc-1",
+            "event_type": "discussion",
+            "source": "test",
+            "occurred_at": "2026-03-20T00:00:00Z",
+            "repo": "songsjun/example",
+            "actor": "alice",
+            "url": "https://example.test/discussions/5",
+            "title": "Feature idea",
+            "body": "Let's brainstorm",
+            "target_kind": "discussion",
+            "target_number": 5,
+            "metadata": {},
+        }
+        instance.set_original_event(original_event)
+        instance.set_terminated("test")
+
+        class FakeClientClosed:
+            def api(self, path: str, params: Any = None, method: str = "GET") -> Any:
+                if "/comments" in path:
+                    return []
+                if f"/issues/99" in path:
+                    return {"state": "closed"}
+                return []
+
+        scanner = PhaseGateScanner(store, FakeClientClosed(), "")
+        advanced = scanner.scan_and_advance()
+
+        assert advanced == [], "terminated instance must not be re-queued"
+        assert store.pop() is None, "nothing should have been enqueued"

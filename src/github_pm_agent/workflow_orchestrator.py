@@ -186,6 +186,16 @@ class WorkflowOrchestrator:
 
         meta = event.metadata or {}
 
+        # Skip if workflow was terminated (capability exceeded)
+        if instance.is_terminated():
+            return {
+                "phase": instance.get_phase(),
+                "skipped": True,
+                "reason": "workflow_terminated",
+                "terminated_reason": instance.get_terminated_reason(),
+                "escalation_refs": [],
+            }
+
         # Skip if workflow is fully complete
         if instance.is_completed():
             return {
@@ -244,6 +254,16 @@ class WorkflowOrchestrator:
             pending = instance.get_pending_comments()
             variables["pending_comments"] = "\n\n---\n\n".join(pending) if pending else ""
 
+            # Build aggregated tech proposals variable for review steps
+            if current_phase == "tech_review":
+                all_artifacts = instance.get_artifacts()
+                proposals = {k: v for k, v in all_artifacts.items() if k.startswith("tech_proposal_")}
+                if proposals:
+                    parts = [f"### Proposal from {k.replace('tech_proposal_', '')}\n\n{v}" for k, v in proposals.items()]
+                    variables["all_tech_proposals"] = "\n\n---\n\n".join(parts)
+                else:
+                    variables["all_tech_proposals"] = variables.get("artifact_tech_proposal", "")
+
             roles = step.get("roles", ["pm"])
             last_content = ""
             for role in roles:
@@ -258,6 +278,9 @@ class WorkflowOrchestrator:
                 all_ai_outputs.append({"phase": current_phase, "role": role, "content": content})
 
             instance.set_artifact(current_phase, last_content)
+            if step.get("output_per_role"):
+                for ai_out in [o for o in all_ai_outputs if o["phase"] == current_phase]:
+                    instance.set_artifact(f"{current_phase}_{ai_out['role']}", ai_out["content"])
 
             if pending:
                 instance.clear_pending_comments()
@@ -284,10 +307,9 @@ class WorkflowOrchestrator:
                 gate_result = {"gate_issue_number": gate_number, "next_phase": next_phase}
                 break  # wait for human
 
-            # Non-gate step: handle action and advance
+            # Non-gate step: handle action
             if step.get("action") == "create_issues":
                 created_issues, issue_creation_error = self._create_issues_from_artifact(last_content, event)
-                # Normalize and persist issue refs for completion summary
                 issue_refs = []
                 for item in created_issues:
                     number = (item.get("result") or {}).get("number") or item.get("number")
@@ -295,11 +317,31 @@ class WorkflowOrchestrator:
                     issue_refs.append({"number": number, "title": title})
                 if issue_refs:
                     instance.set_created_issue_refs(issue_refs)
+            elif step.get("action") == "evaluate_design":
+                eval_result = self._evaluate_design(last_content, event, instance, steps, current_phase)
+                if eval_result.get("terminated"):
+                    return {
+                        "phase": current_phase,
+                        "ai_outputs": all_ai_outputs,
+                        "gate": {},
+                        "artifacts": instance.get_artifacts(),
+                        "created_issues": [],
+                        "issue_creation_error": "",
+                        "terminated": True,
+                        "terminated_reason": eval_result.get("reason", ""),
+                        "escalation_refs": [],
+                    }
+                if eval_result.get("escalated"):
+                    gate_result = eval_result.get("gate", {})
+                    break
+                if eval_result.get("error"):
+                    issue_creation_error = eval_result["error"]
+                    # Don't advance on error — break without set_completed to allow retry
+                    break
 
             idx = next((i for i, s in enumerate(steps) if s.get("phase") == current_phase), -1)
             next_step = steps[idx + 1] if 0 <= idx < len(steps) - 1 else None
             if not next_step:
-                # Post completion summary before marking done (allows retry if posting fails)
                 if not instance.is_completion_comment_posted():
                     self._post_completion_summary(event, instance)
                     instance.set_completion_comment_posted()
@@ -307,9 +349,8 @@ class WorkflowOrchestrator:
                 break
             current_phase = next_step["phase"]
             instance.set_phase(current_phase)
-            # After advancing, read fresh artifacts from instance (not metadata)
             meta = dict(meta)
-            meta.pop("artifacts", None)  # force re-read from instance on next iteration
+            meta.pop("artifacts", None)
 
         return {
             "phase": current_phase,
@@ -341,6 +382,55 @@ class WorkflowOrchestrator:
             created.append(result)
         return created, ""
 
+    def _evaluate_design(
+        self,
+        content: str,
+        event: Any,
+        instance: Any,
+        steps: List[Dict[str, Any]],
+        current_phase: str,
+    ) -> Dict[str, Any]:
+        """Parse PM's design evaluation JSON and act on the decision."""
+        from github_pm_agent.utils import extract_json_object
+        parsed = extract_json_object(content)
+        if not isinstance(parsed, dict):
+            return {"error": f"evaluate_design output was not a JSON object: {content[:200]}"}
+
+        docker_compatible = parsed.get("docker_compatible", True)
+        decision = str(parsed.get("decision", "proceed")).lower()
+
+        if not docker_compatible or decision == "terminate":
+            reason = parsed.get("escalation_reason") or "proposed solution exceeds Docker/Mac Mini capability constraints"
+            instance.set_terminated(reason)
+            return {"terminated": True, "reason": reason}
+
+        if decision == "escalate":
+            owner = self.config.get("github", {}).get("owner", "")
+            evaluation = parsed.get("evaluation_summary", content[:500])
+            gate_title = f"[workflow-gate] {event.repo} Discussion #{event.target_number} phase={current_phase}"
+            gate_body = (
+                f"{'@' + owner + chr(10) + chr(10) if owner else ''}"
+                f"Technical design review requires human input.\n\n"
+                f"**PM Evaluation:**\n{evaluation}\n\n"
+                f"Reply with guidance to re-run the design review."
+            )
+            gate_issue = self.actions.create_issue(
+                title=gate_title, body=gate_body, labels=["workflow-gate"]
+            )
+            gate_number: Optional[int] = None
+            if isinstance(gate_issue, dict):
+                gate_number = gate_issue.get("number") or (gate_issue.get("result") or {}).get("number")
+            # Self-loop: gate advances back to the same phase
+            if gate_number:
+                instance.set_gate(gate_number, current_phase)
+            return {"escalated": True, "gate": {"gate_issue_number": gate_number, "next_phase": current_phase}}
+
+        # proceed or merge: save final design
+        final_design = parsed.get("final_design", "")
+        if final_design:
+            instance.set_artifact("final_design", final_design)
+        return {"proceeded": True}
+
     def _record_discussion_comment(self, event: Any) -> Dict[str, Any]:
         from github_pm_agent.workflow_instance import WorkflowInstance
 
@@ -348,7 +438,7 @@ class WorkflowOrchestrator:
         if not discussion_number:
             return {"skipped": True, "reason": "no_discussion_number", "escalation_refs": []}
         instance = WorkflowInstance.load(self.engine.runtime_dir, event.repo, discussion_number)
-        if not instance.get_phase() or instance.is_completed():
+        if not instance.get_phase() or instance.is_completed() or instance.is_terminated():
             return {"skipped": True, "reason": "no_active_workflow", "escalation_refs": []}
         if event.body:
             instance.add_pending_comment(event.body)

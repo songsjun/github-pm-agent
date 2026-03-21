@@ -43,6 +43,8 @@ class PhaseGateScanner:
                 continue
 
             instance = WorkflowInstance(state_path)
+            if instance.is_terminated() or instance.is_completed():
+                continue
             gate_issue_number = instance.get_gate_issue_number()
             if gate_issue_number is None or gate_issue_number in already_advanced:
                 continue
@@ -95,10 +97,13 @@ class PhaseGateScanner:
         if self.owner_login:
             comments = self.client.api(f"repos/{repo}/issues/{issue_number}/comments", method="GET")
             if isinstance(comments, list):
+                last_owner_comment = None
                 for comment in comments:
                     login = (comment.get("user") or {}).get("login", "")
                     if login == self.owner_login:
-                        return comment.get("body") or ""
+                        last_owner_comment = comment
+                if last_owner_comment is not None:
+                    return last_owner_comment.get("body") or ""
 
         issue = self.client.api(f"repos/{repo}/issues/{issue_number}", method="GET")
         if isinstance(issue, dict) and issue.get("state") == "closed":

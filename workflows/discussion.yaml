@@ -16,3 +16,13 @@ steps:
     output_mode: raw_text
     gate: false
     action: create_issues
+  - phase: tech_proposal
+    roles: [engineer]
+    prompt_path: prompts/discussion/tech_proposal.md
+    output_per_role: true
+    gate: false
+  - phase: tech_review
+    roles: [pm]
+    prompt_path: prompts/discussion/tech_review.md
+    gate: false
+    action: evaluate_design
