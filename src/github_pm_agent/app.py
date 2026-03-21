@@ -24,7 +24,12 @@ class GitHubPMAgentApp:
         self.config = config
         self.project_root = project_root
         self.runtime_dir = runtime_dir(config)
-        self.client = GitHubClient(gh_path(config), repo_name(config))
+        # Use the lowest-priority (primary) agent's token for the shared client
+        _primary_token_env = next(
+            (a.get("token_env") for a in sorted(config.get("agents", []), key=lambda a: a.get("priority", 99)) if a.get("token_env")),
+            None,
+        )
+        self.client = GitHubClient(gh_path(config), repo_name(config), token_env=_primary_token_env)
         self.queue = QueueStore(self.runtime_dir)
         self.prompts = PromptLibrary(project_root)
         self.sessions = SessionStore(self.runtime_dir)
