@@ -1,4 +1,5 @@
 import unittest
+import subprocess
 
 from github_pm_agent.poller import GitHubPoller
 
@@ -109,6 +110,77 @@ class GitHubPollerTest(unittest.TestCase):
         self.assertEqual(mention_events[0].target_kind, "pull_request")
         self.assertEqual([event.event_type for event in project_events], ["project_changed"])
         self.assertEqual([event.event_type for event in milestone_events], ["milestone_changed"])
+
+    def test_poll_ignores_project_scope_errors(self) -> None:
+        since = "2026-03-19T10:00:00Z"
+
+        class ProjectScopeErrorClient(FakeClient):
+            def iter_graphql_nodes(
+                self,
+                query,
+                variables=None,
+                *,
+                connection_path,
+                cursor_variable,
+                page_size_variable,
+                page_size,
+                reverse=False,
+            ):
+                if tuple(connection_path) == ("data", "repository", "projectsV2"):
+                    raise subprocess.CalledProcessError(
+                        1,
+                        ["gh", "api", "graphql"],
+                        stderr="GraphQL: INSUFFICIENT_SCOPES: requires read:project",
+                    )
+                return super().iter_graphql_nodes(
+                    query,
+                    variables,
+                    connection_path=connection_path,
+                    cursor_variable=cursor_variable,
+                    page_size_variable=page_size_variable,
+                    page_size=page_size,
+                    reverse=reverse,
+                )
+
+        poller = GitHubPoller(ProjectScopeErrorClient(), "acme/widgets", "main", [])
+
+        self.assertEqual(poller.poll(since), [])
+
+    def test_poll_reraises_non_scope_project_errors(self) -> None:
+        since = "2026-03-19T10:00:00Z"
+
+        class ProjectFailureClient(FakeClient):
+            def iter_graphql_nodes(
+                self,
+                query,
+                variables=None,
+                *,
+                connection_path,
+                cursor_variable,
+                page_size_variable,
+                page_size,
+                reverse=False,
+            ):
+                if tuple(connection_path) == ("data", "repository", "projectsV2"):
+                    raise subprocess.CalledProcessError(
+                        1,
+                        ["gh", "api", "graphql"],
+                        stderr="GraphQL: something else went wrong",
+                    )
+                return super().iter_graphql_nodes(
+                    query,
+                    variables,
+                    connection_path=connection_path,
+                    cursor_variable=cursor_variable,
+                    page_size_variable=page_size_variable,
+                    page_size=page_size,
+                    reverse=reverse,
+                )
+
+        poller = GitHubPoller(ProjectFailureClient(), "acme/widgets", "main", [])
+
+        with self.assertRaises(subprocess.CalledProcessError):
+            poller.poll(since)
 
     def test_repo_events_capture_push_branch_and_release_signals(self) -> None:
         since = "2026-03-19T10:00:00Z"

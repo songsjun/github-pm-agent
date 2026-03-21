@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from github_pm_agent.utils import append_jsonl, read_jsonl, utc_now_iso
 from github_pm_agent.workflow_instance import WorkflowInstance
@@ -15,11 +15,11 @@ class PhaseGateScanner:
         self.owner_login = owner_login
         self.advanced_path = queue.runtime_dir / "gate_advanced.jsonl"
 
-    def _already_advanced(self) -> set:
+    def _already_advanced(self) -> Set[Tuple[str, int]]:
         return {
-            item["gate_issue_number"]
+            (item["repo"], item["gate_issue_number"])
             for item in read_jsonl(self.advanced_path)
-            if item.get("gate_issue_number") is not None
+            if item.get("repo") and item.get("gate_issue_number") is not None
         }
 
     def scan_and_advance(self) -> List[Dict[str, Any]]:
@@ -46,7 +46,7 @@ class PhaseGateScanner:
             if instance.is_terminated() or instance.is_completed():
                 continue
             gate_issue_number = instance.get_gate_issue_number()
-            if gate_issue_number is None or gate_issue_number in already_advanced:
+            if gate_issue_number is None or (repo, gate_issue_number) in already_advanced:
                 continue
 
             human_comment = self._check_gate_resolved(gate_issue_number, repo)

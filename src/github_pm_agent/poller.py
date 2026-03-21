@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import subprocess
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -80,8 +81,9 @@ class GitHubPoller:
         events.extend(self._poll_repo_events(since_iso))
         try:
             events.extend(self._poll_projects(since_iso))
-        except Exception:  # noqa: BLE001
-            pass  # read:project scope may not be available
+        except subprocess.CalledProcessError as exc:
+            if not self._is_project_scope_error(exc):
+                raise
         events.extend(self._poll_milestones(since_iso))
         events.extend(self._poll_issues(since_iso))
         events.extend(self._poll_issue_events(since_iso))
@@ -102,6 +104,22 @@ class GitHubPoller:
             unique_events.values(),
             key=lambda item: (parse_iso8601(item.occurred_at), item.event_id),
         )
+
+    @staticmethod
+    def _is_project_scope_error(exc: subprocess.CalledProcessError) -> bool:
+        stderr = " ".join(
+            part.strip()
+            for part in (exc.stderr, exc.output)
+            if isinstance(part, str) and part.strip()
+        ).lower()
+        if not stderr:
+            return False
+        if any(
+            token in stderr
+            for token in ("insufficient_scopes", "insufficient scopes", "missing required scope", "read:project")
+        ):
+            return True
+        return "scope" in stderr and "project" in stderr
 
     def _poll_notifications(self, since_iso: str) -> List[Event]:
         since_dt = parse_iso8601(since_iso)

@@ -249,8 +249,8 @@ class WorkflowOrchestrator:
             for phase_name, artifact_text in artifacts.items():
                 if not phase_name.startswith("_"):
                     variables[f"artifact_{phase_name}"] = artifact_text
-            gate_comment = meta.get("gate_human_comment", "")
-            variables["human_comment"] = f"Human feedback:\n{gate_comment}\n" if gate_comment else ""
+            human_comment = meta.get("gate_human_comment", "")
+            variables["human_comment"] = f"Human feedback:\n{human_comment}\n" if human_comment else ""
             pending = instance.get_pending_comments()
             variables["pending_comments"] = "\n\n---\n\n".join(pending) if pending else ""
 
@@ -282,8 +282,47 @@ class WorkflowOrchestrator:
                 for ai_out in [o for o in all_ai_outputs if o["phase"] == current_phase]:
                     instance.set_artifact(f"{current_phase}_{ai_out['role']}", ai_out["content"])
 
-            if pending:
-                instance.clear_pending_comments()
+            step_succeeded = False
+
+            # Actions must run before gate creation so gates can reflect the action result.
+            if step.get("action") == "create_issues":
+                created_issues, issue_creation_error = self._create_issues_from_artifact(last_content, event)
+                issue_refs = []
+                for item in created_issues:
+                    number = (item.get("result") or {}).get("number") or item.get("number")
+                    title = item.get("title", "")
+                    issue_refs.append({"number": number, "title": title})
+                if issue_refs:
+                    instance.set_created_issue_refs(issue_refs)
+                if issue_creation_error:
+                    break
+                step_succeeded = True
+            elif step.get("action") == "evaluate_design":
+                eval_result = self._evaluate_design(last_content, event, instance, steps, current_phase)
+                if eval_result.get("terminated"):
+                    return {
+                        "phase": current_phase,
+                        "ai_outputs": all_ai_outputs,
+                        "gate": {},
+                        "artifacts": instance.get_artifacts(),
+                        "created_issues": [],
+                        "issue_creation_error": "",
+                        "terminated": True,
+                        "terminated_reason": eval_result.get("reason", ""),
+                        "escalation_refs": [],
+                    }
+                if eval_result.get("escalated"):
+                    gate_result = eval_result.get("gate", {})
+                    if pending:
+                        instance.clear_pending_comments()
+                    break
+                if eval_result.get("error"):
+                    issue_creation_error = eval_result["error"]
+                    # Don't advance on error — break without set_completed to allow retry
+                    break
+                step_succeeded = True
+            else:
+                step_succeeded = True
 
             if step.get("gate"):
                 idx = next((i for i, s in enumerate(steps) if s.get("phase") == current_phase), -1)
@@ -305,39 +344,12 @@ class WorkflowOrchestrator:
                 if gate_number and next_phase:
                     instance.set_gate(gate_number, next_phase)
                 gate_result = {"gate_issue_number": gate_number, "next_phase": next_phase}
+                if pending:
+                    instance.clear_pending_comments()
                 break  # wait for human
 
-            # Non-gate step: handle action
-            if step.get("action") == "create_issues":
-                created_issues, issue_creation_error = self._create_issues_from_artifact(last_content, event)
-                issue_refs = []
-                for item in created_issues:
-                    number = (item.get("result") or {}).get("number") or item.get("number")
-                    title = item.get("title", "")
-                    issue_refs.append({"number": number, "title": title})
-                if issue_refs:
-                    instance.set_created_issue_refs(issue_refs)
-            elif step.get("action") == "evaluate_design":
-                eval_result = self._evaluate_design(last_content, event, instance, steps, current_phase)
-                if eval_result.get("terminated"):
-                    return {
-                        "phase": current_phase,
-                        "ai_outputs": all_ai_outputs,
-                        "gate": {},
-                        "artifacts": instance.get_artifacts(),
-                        "created_issues": [],
-                        "issue_creation_error": "",
-                        "terminated": True,
-                        "terminated_reason": eval_result.get("reason", ""),
-                        "escalation_refs": [],
-                    }
-                if eval_result.get("escalated"):
-                    gate_result = eval_result.get("gate", {})
-                    break
-                if eval_result.get("error"):
-                    issue_creation_error = eval_result["error"]
-                    # Don't advance on error — break without set_completed to allow retry
-                    break
+            if pending and step_succeeded:
+                instance.clear_pending_comments()
 
             idx = next((i for i, s in enumerate(steps) if s.get("phase") == current_phase), -1)
             next_step = steps[idx + 1] if 0 <= idx < len(steps) - 1 else None
