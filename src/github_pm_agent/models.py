@@ -63,6 +63,7 @@ class AiRequest:
     file_refs: List[str] = field(default_factory=list)
     memory_refs: List[str] = field(default_factory=list)
     skill_refs: List[str] = field(default_factory=list)
+    artifact_refs: List[str] = field(default_factory=list)
     output_template_path: Optional[str] = None
     output_schema_path: Optional[str] = None
     session_key: Optional[str] = None

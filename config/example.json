@@ -1,7 +1,10 @@
 {
   "github": {
     "repo": "songsjun/StudyBuddy",
-    "gh_path": "/opt/homebrew/bin/gh",
+    "repos": [
+      "songsjun/StudyBuddy"
+    ],
+    "gh_path": "gh",
     "default_branch": "main",
     "mentions": [
       "@songsjun",
@@ -19,7 +22,12 @@
     "supervisor_enabled": true,
     "continue_on_error": true,
     "stale_pr_review_hours": 48,
-    "blocked_issue_stale_hours": 48
+    "blocked_issue_stale_hours": 48,
+    "second_opinion": {
+      "enabled": false,
+      "provider": "gemini_cli",
+      "model": "gemini-2.5-flash"
+    }
   },
   "ai": {
     "default_provider": "codex_cli",
@@ -30,7 +38,7 @@
         "provider_name": "codex",
         "script": "scripts/run_ai_cli.py",
         "python_path": "python3",
-        "codex_path": "/opt/homebrew/bin/codex",
+        "codex_path": "codex",
         "default_model": "gpt-5.4"
       },
       "gemini_cli": {
@@ -38,7 +46,7 @@
         "provider_name": "gemini",
         "script": "scripts/run_ai_cli.py",
         "python_path": "python3",
-        "gemini_path": "/opt/homebrew/bin/gemini",
+        "gemini_path": "gemini",
         "default_model": "gemini-2.5-flash"
       },
       "openai": {

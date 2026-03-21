@@ -33,6 +33,7 @@ class PromptLibrary:
         file_refs: Iterable[str] = (),
         memory_refs: Iterable[str] = (),
         skill_refs: Iterable[str] = (),
+        artifact_refs: Iterable[str] = (),
         transcript: str = "",
     ) -> str:
         base = self.load_template(prompt_path)
@@ -42,11 +43,13 @@ class PromptLibrary:
             "output_template": output_template,
             "memory": self._render_refs(memory_refs),
             "skills": self._render_refs(skill_refs),
+            "artifacts": self._render_refs(artifact_refs),
             **{key: str(value) for key, value in variables.items()},
         }
         rendered = Template(base).safe_substitute(payload)
 
         files_block = self._render_refs(file_refs)
+        artifacts_block = self._render_refs(artifact_refs)
         sections = [
             "# System",
             system_prompt,
@@ -56,7 +59,8 @@ class PromptLibrary:
         ]
         if transcript:
             sections.extend(["", "# Session Transcript", transcript])
+        if artifacts_block:
+            sections.extend(["", "# Attached Artifacts", artifacts_block])
         if files_block:
             sections.extend(["", "# Attached Files", files_block])
         return "\n".join(sections).strip() + "\n"
-
