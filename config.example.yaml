@@ -1,0 +1,51 @@
+# config.example.yaml
+# GitHub PM Agent — 多账户多角色配置示例
+
+github:
+  repos:
+    - your-org/your-repo          # 监控的仓库（支持列表）
+  default_branch: main
+  owner: your-github-username     # 需要升级时 @mention 的决策人
+
+# 每个 agent 是一个独立身份（对应一个 GitHub 账户）
+# token_env: 环境变量名，持有该账户的 GITHUB_TOKEN
+# participates_in: 指定参与哪些事件类型，以及以何种模式（respond/observe/veto）
+agents:
+  - id: engineer
+    role: engineer
+    token_env: GITHUB_TOKEN_ENGINEER   # export GITHUB_TOKEN_ENGINEER=ghp_xxx
+    priority: 1
+    participates_in:
+      pull_request_changed: respond
+      issue_changed: respond
+
+  - id: pm
+    role: pm
+    token_env: GITHUB_TOKEN_PM         # export GITHUB_TOKEN_PM=ghp_xxx
+    priority: 2
+    participates_in:
+      pull_request_changed: observe
+      issue_changed: respond
+
+  - id: security
+    role: security
+    token_env: GITHUB_TOKEN_SECURITY   # export GITHUB_TOKEN_SECURITY=ghp_xxx
+    priority: 3
+    participates_in:
+      pull_request_changed: veto
+      # security 不参与 issue_changed
+
+engine:
+  dry_run: true                        # 先 true 观察，确认后改 false
+  continue_on_error: true
+
+ai:
+  default_provider: codex
+  providers:
+    codex:
+      type: cli_script
+      script: scripts/ai_provider.py
+      provider_name: codex
+      default_model: codex-1
+
+runtime_dir: .runtime

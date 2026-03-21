@@ -65,6 +65,10 @@ class GitHubPMAgentAppTest(unittest.TestCase):
             patch("github_pm_agent.app.AIAdapterManager", return_value=ai),
             patch("github_pm_agent.app.GitHubActionToolkit", return_value=actions),
             patch("github_pm_agent.app.EventEngine", return_value=engine),
+            patch("github_pm_agent.app.WorkflowOrchestrator", return_value=Mock()),
+            patch("github_pm_agent.app.SuspendedEventScanner", return_value=Mock()),
+            patch("github_pm_agent.app.PhaseGateScanner", return_value=Mock()),
+            patch("github_pm_agent.app.RoleRegistry", return_value=Mock()),
         ):
             return GitHubPMAgentApp(self.config, self.project_root)
 
@@ -99,16 +103,17 @@ class GitHubPMAgentAppTest(unittest.TestCase):
 
     def test_cycle_marks_done_and_failed_when_continue_on_error(self) -> None:
         queue = Mock()
-        engine = Mock()
         event_one = make_event("event-1", 1)
         event_two = make_event("event-2", 2)
         queue.pop.side_effect = [event_one, event_two, None]
-        engine.process.side_effect = [
-            {"plan": {"should_act": True}},
+        app = self._build_app(queue=queue)
+        app.orchestrator.process.side_effect = [
+            {"plan": {"should_act": True}, "escalation_refs": []},
             RuntimeError("boom"),
         ]
-        app = self._build_app(queue=queue, engine=engine)
         app.poll = Mock(return_value={"events_enqueued": 2})
+        app.scanner.scan_and_resume = Mock(return_value=[])
+        app.gate_scanner.scan_and_advance = Mock(return_value=[])
 
         result = app.cycle()
 
@@ -120,12 +125,13 @@ class GitHubPMAgentAppTest(unittest.TestCase):
     def test_cycle_raises_when_continue_on_error_disabled(self) -> None:
         self.config["engine"]["continue_on_error"] = False
         queue = Mock()
-        engine = Mock()
         event = make_event("event-1", 1)
         queue.pop.side_effect = [event]
-        engine.process.side_effect = RuntimeError("boom")
-        app = self._build_app(queue=queue, engine=engine)
+        app = self._build_app(queue=queue)
+        app.orchestrator.process.side_effect = RuntimeError("boom")
         app.poll = Mock(return_value={"events_enqueued": 1})
+        app.scanner.scan_and_resume = Mock(return_value=[])
+        app.gate_scanner.scan_and_advance = Mock(return_value=[])
 
         with self.assertRaisesRegex(RuntimeError, "boom"):
             app.cycle()
@@ -169,6 +175,10 @@ class GitHubPMAgentAppTest(unittest.TestCase):
             patch("github_pm_agent.app.EventEngine", side_effect=[engine_one, engine_two]),
             patch("github_pm_agent.app.GitHubPoller", side_effect=[poller_one, poller_two]),
             patch("github_pm_agent.app.StatusProbe", side_effect=[probe_one, probe_two]),
+            patch("github_pm_agent.app.WorkflowOrchestrator", return_value=Mock()),
+            patch("github_pm_agent.app.SuspendedEventScanner", return_value=Mock()),
+            patch("github_pm_agent.app.PhaseGateScanner", return_value=Mock()),
+            patch("github_pm_agent.app.RoleRegistry", return_value=Mock()),
             patch("github_pm_agent.app.utc_now_iso", return_value="2026-03-19T12:00:00Z"),
         ):
             app = GitHubPMAgentApp(config, self.project_root)

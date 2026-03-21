@@ -1,0 +1,48 @@
+github:
+  repos:
+    - songsjun/github-pm-agent
+  default_branch: main
+  owner: songsjun
+  gh_path: gh
+
+agents:
+  - id: pm
+    role: pm
+    token_env: GITHUB_TOKEN_PM         # songsjun
+    priority: 1
+    participates_in:
+      pull_request_changed: respond
+      issue_changed: respond
+
+  - id: engineer
+    role: engineer
+    token_env: GITHUB_TOKEN_ENGINEER   # otter9527
+    priority: 2
+    participates_in:
+      pull_request_changed: respond
+      issue_changed: observe
+
+  - id: security
+    role: security
+    token_env: GITHUB_TOKEN_SECURITY   # kapy9250
+    priority: 3
+    participates_in:
+      pull_request_changed: veto
+
+engine:
+  dry_run: false
+  continue_on_error: true
+  supervisor_enabled: false
+
+ai:
+  default_provider: codex
+  providers:
+    codex:
+      type: cli_script
+      script: scripts/run_ai_cli.py
+      provider_name: codex
+      default_model: gpt-5.4
+      codex_path: /opt/homebrew/bin/codex
+      reasoning_effort: low
+
+runtime_dir: .runtime-test

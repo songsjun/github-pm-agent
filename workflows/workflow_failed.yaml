@@ -1,0 +1,14 @@
+event_type: workflow_failed
+
+participants:
+  - role: engineer
+    action_mode: respond
+    priority: 1
+
+  - role: pm
+    action_mode: observe
+    priority: 2
+
+signals:
+  - type: ci_checks
+    require: all_pass

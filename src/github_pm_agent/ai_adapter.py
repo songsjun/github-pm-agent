@@ -39,7 +39,8 @@ class AIAdapterManager:
         else:
             raise RuntimeError(f"unsupported provider type: {provider_type}")
         if request.session_key:
-            self.session_store.append_turn(request.session_key, rendered, response.content)
+            user_turn = json.dumps(request.variables, ensure_ascii=False)
+            self.session_store.append_turn(request.session_key, user_turn, response.content)
         return response
 
     def _provider_config(self, provider_name: str) -> Dict[str, Any]:
@@ -144,6 +145,8 @@ class AIAdapterManager:
             command.extend(["--codex-path", provider_config["codex_path"]])
         if provider_config.get("gemini_path"):
             command.extend(["--gemini-path", provider_config["gemini_path"]])
+        if provider_config.get("reasoning_effort"):
+            command.extend(["--reasoning-effort", provider_config["reasoning_effort"]])
 
         result = subprocess.run(command, check=True, capture_output=True, text=True)
         raw = json.loads(result.stdout.strip()) if result.stdout.strip() else {}

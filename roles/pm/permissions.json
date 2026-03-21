@@ -1,0 +1,5 @@
+{
+  "role": "pm",
+  "allowed": ["comment", "label", "issue", "assign", "unassign", "review_request", "milestone", "draft", "ready_for_review", "review_decision", "rerun_workflow", "create_discussion", "update_discussion", "project", "state", "none"],
+  "forbidden": ["merge", "create_release"]
+}

@@ -1,0 +1,11 @@
+event_type: pull_request_changed
+
+conditions_by_role:
+  security:
+    files_match: "auth/**|security/**|**/credentials*|**/.env*"
+
+signals:
+  - type: ci_checks
+    require: all_pass
+  - type: pr_approvals
+    require: minimum_1

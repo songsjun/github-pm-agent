@@ -1,0 +1,8 @@
+event_type: default
+
+participants:
+  - role: pm
+    action_mode: respond
+    priority: 1
+
+signals: []

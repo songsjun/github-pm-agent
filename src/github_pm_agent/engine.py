@@ -43,6 +43,7 @@ class EventEngine:
         self.memory_loop = MemoryLoop(runtime_dir, config)
         self._attach_memory_loop_compatibility()
         self.artifacts = ArtifactStore(self.runtime_dir, project_root=self.project_root)
+        self.role_registry = None
 
     def process(self, event: Event) -> Dict[str, Any]:
         handler_name, handler = resolve_handler(self, event)
@@ -111,6 +112,108 @@ class EventEngine:
             "model": response.model,
             "session_key": response.session_key,
         }
+        return result
+
+    def run_raw_text_handler(
+        self,
+        event: Event,
+        prompt_path: str,
+        role: str = "pm",
+        variables: Optional[Dict[str, Any]] = None,
+        session_key_suffix: str = "",
+    ) -> Dict[str, Any]:
+        """Run an AI prompt and return the raw text response without JSON parsing or action execution."""
+        provider = self.ai_manager.default_provider()
+        model = self.ai_manager.default_model(provider)
+        base_variables: Dict[str, Any] = {
+            "repo": event.repo,
+            "event_type": event.event_type,
+            "event_payload": json.dumps(event.to_dict(), indent=2, ensure_ascii=False),
+        }
+        if variables:
+            base_variables.update(variables)
+        session_key = f"{role}::{event.repo.replace('/', '__')}__{event.target_kind}__{event.target_number or event.event_id}"
+        if session_key_suffix:
+            session_key += f"__{session_key_suffix}"
+        request = AiRequest(
+            provider=provider,
+            model=model,
+            system_prompt_path=f"prompts/system/{role}.md",
+            prompt_path=prompt_path,
+            variables=base_variables,
+            memory_refs=[],
+            skill_refs=[],
+            artifact_refs=[],
+            output_template_path=None,
+            output_schema_path=None,
+            session_key=session_key,
+        )
+        response = self.ai_manager.generate(request)
+        if request.session_key:
+            self.ai_manager.session_store.append_turn(
+                request.session_key,
+                json.dumps(base_variables, ensure_ascii=False),
+                response.content,
+            )
+        return {
+            "raw_text": response.content,
+            "action": {"executed": False, "action_type": "none"},
+            "ai": {
+                "provider": response.provider,
+                "model": response.model,
+                "session_key": response.session_key,
+            },
+        }
+
+    def run_veto_handler(self, event: Event, role: str = "pm") -> Dict[str, Any]:
+        """Run a veto check and return the result."""
+        provider = self.ai_manager.default_provider()
+        model = self.ai_manager.default_model(provider)
+        request = AiRequest(
+            provider=provider,
+            model=model,
+            system_prompt_path=f"prompts/system/{role}.md",
+            prompt_path="prompts/actions/veto_check.md",
+            variables={
+                "repo": event.repo,
+                "event_type": event.event_type,
+                "event_payload": json.dumps(event.to_dict(), indent=2, ensure_ascii=False),
+            },
+            memory_refs=[],
+            skill_refs=[],
+            artifact_refs=[],
+            output_template_path=None,
+            output_schema_path=None,
+            session_key=f"{role}::{event.repo.replace('/', '__')}__{event.target_kind}__{event.target_number or event.event_id}__veto",
+        )
+        response = self.ai_manager.generate(request)
+        parsed = extract_json_object(response.content)
+        vetoed = False
+        veto_reason = ""
+        plan_reason = "veto check completed"
+        if isinstance(parsed, dict):
+            raw = parsed.get("should_block")
+            if isinstance(raw, bool):
+                vetoed = raw
+            elif isinstance(raw, str):
+                vetoed = raw.strip().lower() == "true"
+            veto_reason = str(parsed.get("reason") or "").strip()
+        else:
+            plan_reason = "model output was not valid JSON; veto check failed open"
+        plan = self.make_plan(
+            should_act=False,
+            reason=plan_reason,
+            action_type="none",
+            target_kind=event.target_kind,
+            target_number=event.target_number,
+            message=veto_reason,
+        )
+        result = self.finish_plan(event, plan)
+        result["handler"] = "veto"
+        result["vetoed"] = vetoed
+        result["veto_reason"] = veto_reason
+        result["veto"] = {"should_block": vetoed, "reason": veto_reason}
+        result["ai"] = {"provider": response.provider, "model": response.model, "session_key": response.session_key}
         return result
 
     def parse_action_plan(self, content: str) -> Dict[str, Any]:

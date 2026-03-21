@@ -18,8 +18,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cwd", required=True)
     parser.add_argument("--session-key", default="")
     parser.add_argument("--schema-file", default="")
-    parser.add_argument("--codex-path", default="codex")
-    parser.add_argument("--gemini-path", default="gemini")
+    parser.add_argument("--codex-path", default="/opt/homebrew/bin/codex")
+    parser.add_argument("--gemini-path", default="/opt/homebrew/bin/gemini")
+    parser.add_argument("--reasoning-effort", default="", help="low/medium/high/xhigh")
     return parser
 
 
@@ -39,6 +40,8 @@ def run_codex(args: argparse.Namespace, prompt: str) -> Dict[str, Any]:
     ]
     if args.model:
         command.extend(["--model", args.model])
+    if getattr(args, "reasoning_effort", ""):
+        command.extend(["-c", f'model_reasoning_effort="{args.reasoning_effort}"'])
     if args.schema_file:
         command.extend(["--output-schema", args.schema_file])
     command.append("-")

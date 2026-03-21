@@ -1,0 +1,119 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
+class WorkflowInstance:
+    """Persistent state for a single discussion's workflow progression."""
+
+    def __init__(self, state_path: Path) -> None:
+        self.state_path = state_path
+        self._state: Dict[str, Any] = {}
+        if state_path.exists():
+            try:
+                self._state = json.loads(state_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                self._state = {}
+
+    @classmethod
+    def load(cls, runtime_dir: Path, repo: str, number: int) -> "WorkflowInstance":
+        safe_repo = repo.replace("/", "__")
+        path = runtime_dir / "workflows" / safe_repo / str(number) / "state.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return cls(path)
+
+    def get_phase(self) -> Optional[str]:
+        return self._state.get("phase")
+
+    def set_phase(self, phase: str) -> None:
+        self._state["phase"] = phase
+        self._save()
+
+    def get_artifacts(self) -> Dict[str, str]:
+        return dict(self._state.get("artifacts", {}))
+
+    def set_artifact(self, phase: str, text: str) -> None:
+        self._state.setdefault("artifacts", {})[phase] = text
+        self._save()
+
+    def get_original_event(self) -> Optional[Dict[str, Any]]:
+        raw = self._state.get("original_event")
+        if isinstance(raw, str):
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return None
+        return raw if isinstance(raw, dict) else None
+
+    def set_original_event(self, event_dict: Dict[str, Any]) -> None:
+        self._state["original_event"] = event_dict
+        self._save()
+
+    def get_gate_issue_number(self) -> Optional[int]:
+        return self._state.get("gate_issue_number")
+
+    def get_gate_next_phase(self) -> Optional[str]:
+        return self._state.get("gate_next_phase")
+
+    def set_gate(self, issue_number: int, next_phase: str = "") -> None:
+        self._state["gate_issue_number"] = issue_number
+        if next_phase:
+            self._state["gate_next_phase"] = next_phase
+        self._save()
+
+    def clear_gate(self) -> None:
+        self._state.pop("gate_issue_number", None)
+        self._state.pop("gate_next_phase", None)
+        self._save()
+
+    def add_pending_comment(self, comment: str) -> None:
+        self._state.setdefault("pending_comments", []).append(comment)
+        self._save()
+
+    def get_pending_comments(self) -> List[str]:
+        return list(self._state.get("pending_comments", []))
+
+    def clear_pending_comments(self) -> None:
+        self._state.pop("pending_comments", None)
+        self._save()
+
+    def set_created_issue_refs(self, refs: List[Dict[str, Any]]) -> None:
+        self._state["created_issue_refs"] = refs
+        self._save()
+
+    def get_created_issue_refs(self) -> List[Dict[str, Any]]:
+        return list(self._state.get("created_issue_refs", []))
+
+    def set_completion_comment_posted(self) -> None:
+        self._state["completion_comment_posted"] = True
+        self._save()
+
+    def is_completion_comment_posted(self) -> bool:
+        return bool(self._state.get("completion_comment_posted"))
+
+    def set_terminated(self, reason: str = "") -> None:
+        self._state["terminated"] = True
+        if reason:
+            self._state["terminated_reason"] = reason
+        self._save()
+
+    def is_terminated(self) -> bool:
+        return bool(self._state.get("terminated"))
+
+    def get_terminated_reason(self) -> str:
+        return str(self._state.get("terminated_reason", ""))
+
+    def is_completed(self) -> bool:
+        return bool(self._state.get("completed"))
+
+    def set_completed(self) -> None:
+        self._state["completed"] = True
+        self._save()
+
+    def _save(self) -> None:
+        self.state_path.write_text(
+            json.dumps(self._state, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )

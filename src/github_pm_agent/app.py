@@ -13,11 +13,14 @@ from github_pm_agent.engine import EventEngine
 from github_pm_agent.github_client import GitHubClient
 from github_pm_agent.poller import GitHubPoller
 from github_pm_agent.prompt_library import PromptLibrary
-from github_pm_agent.queue_store import QueueStore
+from github_pm_agent.queue_store import QueueStore, SuspendedEventScanner
+from github_pm_agent.role_registry import RoleRegistry
 from github_pm_agent.session_store import SessionStore
 from github_pm_agent.status_probe import StatusProbe
 from github_pm_agent.models import Event
 from github_pm_agent.utils import read_json, read_jsonl, utc_now_iso, write_json
+from github_pm_agent.phase_gate_scanner import PhaseGateScanner
+from github_pm_agent.workflow_orchestrator import WorkflowOrchestrator
 
 
 @dataclass
@@ -44,6 +47,28 @@ class GitHubPMAgentApp:
         self.client = self.repo_runtimes[0].client
         self.actions = self.repo_runtimes[0].actions
         self.engine = self.repo_runtimes[0].engine
+        self.engine.role_registry = RoleRegistry(project_root)
+        agent_configs = config.get("agents", [])
+        dry_run = config.get("engine", {}).get("dry_run", True)
+        agent_toolkits: Dict[str, Any] = {}
+        for agent_cfg in agent_configs:
+            token_env = agent_cfg.get("token_env")
+            agent_client = GitHubClient(gh_path(config), self.repo_names[0], token_env=token_env)
+            agent_toolkits[agent_cfg["id"]] = GitHubActionToolkit(
+                agent_client, self.runtime_dir, dry_run=dry_run
+            )
+        self.orchestrator = WorkflowOrchestrator(
+            project_root,
+            self.engine,
+            self.actions,
+            self.client,
+            config,
+            agent_configs=agent_configs,
+            agent_toolkits=agent_toolkits,
+        )
+        owner_login = config.get("github", {}).get("owner", "")
+        self.scanner = SuspendedEventScanner(self.queue, self.client, owner_login)
+        self.gate_scanner = PhaseGateScanner(self.queue, self.client, owner_login)
         self.cursors_path = self.runtime_dir / "cursors.json"
 
     def poll(self) -> Dict[str, Any]:
@@ -84,8 +109,10 @@ class GitHubPMAgentApp:
 
     def cycle(self) -> Dict[str, Any]:
         poll_result = self.poll()
+        resume_result = self.scanner.scan_and_resume()
+        gate_advance_result = self.gate_scanner.scan_and_advance()
         processed = self.drain_queue()
-        return {"poll": poll_result, "processed": processed}
+        return {"poll": poll_result, "resume": resume_result, "gate_advance": gate_advance_result, "processed": processed}
 
     def reconcile(self) -> Dict[str, Any]:
         followup_events = self._followup_events(now_iso=utc_now_iso())
@@ -147,10 +174,19 @@ class GitHubPMAgentApp:
             event = self.queue.pop()
             if event is None:
                 break
-            engine = self._engine_for_repo(event.repo)
             try:
-                result = engine.process(event)
-                self.queue.mark_done(event, result)
+                result = self.orchestrator.process(event)
+                escalation_refs = result.get("escalation_refs", [])
+                if escalation_refs:
+                    for ref in escalation_refs:
+                        self.queue.mark_suspended(
+                            event,
+                            ref["issue_number"],
+                            ref["key"],
+                            ref["reason_class"],
+                        )
+                else:
+                    self.queue.mark_done(event, result)
                 processed.append({"event_id": event.event_id, "repo": event.repo, "result": result})
             except Exception as exc:  # noqa: BLE001
                 self.queue.mark_failed(event, str(exc))
@@ -176,7 +212,12 @@ class GitHubPMAgentApp:
         return [event] if event is not None else []
 
     def _build_repo_runtime(self, repo: str) -> RepoRuntime:
-        client = GitHubClient(gh_path(self.config), repo)
+        # Use the lowest-priority (primary) agent's token for write access
+        _primary_token_env = next(
+            (a.get("token_env") for a in sorted(self.config.get("agents", []), key=lambda a: a.get("priority", 99)) if a.get("token_env")),
+            None,
+        )
+        client = GitHubClient(gh_path(self.config), repo, token_env=_primary_token_env)
         poller = GitHubPoller(
             client,
             repo,
