@@ -9,13 +9,7 @@ steps:
     roles: [pm]
     prompt_path: prompts/discussion/requirements.md
     output_mode: raw_text
-    gate: false
-  - phase: issue_breakdown
-    roles: [pm]
-    prompt_path: prompts/discussion/issue_breakdown.md
-    output_mode: raw_text
-    gate: false
-    action: create_issues
+    gate: true
   - phase: tech_proposal
     roles: [engineer]
     prompt_path: prompts/discussion/tech_proposal.md
@@ -24,5 +18,11 @@ steps:
   - phase: tech_review
     roles: [pm]
     prompt_path: prompts/discussion/tech_review.md
-    gate: false
+    gate: true
     action: evaluate_design
+  - phase: issue_breakdown
+    roles: [pm]
+    prompt_path: prompts/discussion/issue_breakdown.md
+    output_mode: raw_text
+    gate: false
+    action: create_issues
