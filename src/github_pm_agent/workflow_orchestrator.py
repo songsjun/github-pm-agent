@@ -182,11 +182,22 @@ class WorkflowOrchestrator:
         if not instance.get_original_event():
             instance.set_original_event(event.to_dict())
 
+        meta = event.metadata or {}
+
+        # Skip if already waiting on a gate (not a resume event)
+        if instance.get_gate_issue_number() and not meta.get("advance_to_phase"):
+            return {
+                "phase": instance.get_phase(),
+                "skipped": True,
+                "reason": "gate_already_open",
+                "gate_issue_number": instance.get_gate_issue_number(),
+                "escalation_refs": [],
+            }
+
         steps = workflow.get("steps", [])
         if not steps:
             return {"error": "discussion workflow has no steps", "escalation_refs": []}
 
-        meta = event.metadata or {}
         advance_to = meta.get("advance_to_phase")
         if advance_to:
             instance.set_phase(advance_to)

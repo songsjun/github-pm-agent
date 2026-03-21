@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from github_pm_agent.models import Event
+from github_pm_agent.workflow_instance import WorkflowInstance
 from github_pm_agent.workflow_orchestrator import WorkflowOrchestrator
 
 
@@ -46,10 +48,13 @@ class RecordingActions:
 
 
 class FakeEngine:
-    def __init__(self, actions: Any) -> None:
+    def __init__(self, actions: Any, runtime_dir: Optional[Path] = None) -> None:
         self.actions = actions
+        self.runtime_dir: Path = runtime_dir or Path(tempfile.mkdtemp())
         self.process_calls = 0
         self.run_ai_handler_calls: List[Dict[str, Any]] = []
+        self.run_raw_text_handler_calls: List[Dict[str, Any]] = []
+        self.role_registry: Any = None
 
     def process(self, event: Event) -> Dict[str, Any]:
         self.process_calls += 1
@@ -66,6 +71,10 @@ class FakeEngine:
     def run_ai_handler(self, event: Event, prompt_path: str, role: str = "pm") -> Dict[str, Any]:
         self.run_ai_handler_calls.append({"event_id": event.event_id, "prompt_path": prompt_path, "role": role})
         return {"role": role}
+
+    def run_raw_text_handler(self, event: Event, prompt_path: str, role: str = "pm", variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        self.run_raw_text_handler_calls.append({"event_id": event.event_id, "prompt_path": prompt_path, "role": role})
+        return {"raw_text": f"output for {role}"}
 
 
 class FakeClient:
@@ -190,3 +199,43 @@ def test_signals_fail_ci() -> None:
     assert result["signal_failures"][0]["type"] == "ci_checks"
     assert len(actions.create_issue_calls) == 1
     assert actions.create_issue_calls[0]["labels"] == ["agent-escalate"]
+
+
+def _discussion_event(**metadata: Any) -> Event:
+    return Event(
+        event_id="evt-disc-1",
+        event_type="discussion",
+        source="test",
+        occurred_at="2026-03-20T00:00:00Z",
+        repo="songsjun/example",
+        actor="alice",
+        url="https://example.test/discussions/5",
+        title="Feature idea",
+        body="Let's brainstorm",
+        target_kind="discussion",
+        target_number=5,
+        metadata=dict(metadata),
+    )
+
+
+def test_phase_workflow_skips_when_gate_already_open() -> None:
+    """Re-polling a discussion with an open gate must not re-run the phase or create a new gate issue."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+
+        # Pre-create the workflow instance with gate_issue_number=42 already set
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        instance.set_phase("brainstorm")
+        instance.set_gate(42, "requirements")
+
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        result = orchestrator.process(_discussion_event())
+
+        assert result.get("skipped") is True
+        assert result.get("reason") == "gate_already_open"
+        assert result.get("gate_issue_number") == 42
+        assert actions.create_issue_calls == [], "no new issue should be created when gate is already open"
+        assert engine.run_raw_text_handler_calls == [], "AI handler must not be invoked when skipping"
