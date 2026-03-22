@@ -261,25 +261,88 @@ def test_phase_workflow_stops_at_tech_review_gate_after_design_evaluation() -> N
         engine = FakeEngineWithIssueBreakdown(actions, runtime_dir=runtime_dir)
         orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
 
-        result = orchestrator.process(_discussion_event())
+        result = orchestrator.process(_discussion_event(node_id="D_tech_review_gate"))
 
         phases_called = [c["prompt_path"] for c in engine.run_raw_text_handler_calls]
         assert any("tech_proposal" in p for p in phases_called)
         assert any("tech_review" in p for p in phases_called)
         assert not any("issue_breakdown" in p for p in phases_called)
 
-        assert len(actions.create_issue_calls) == 1
-        assert actions.create_issue_calls[0]["title"] == "[workflow-gate] songsjun/example Discussion #5 phase=tech_review"
-        assert result.get("gate") == {"gate_issue_number": 100, "next_phase": "issue_breakdown"}
+        assert actions.create_issue_calls == []
+        gate_comments = [
+            call for call in actions.comment_on_discussion_calls if "**Phase `tech_review` complete.**" in call["message"]
+        ]
+        assert len(gate_comments) == 1
+        gate_comment = gate_comments[0]
+        assert gate_comment["discussion_id"] == "D_tech_review_gate"
+        assert gate_comment["number"] == 5
+        assert "**Phase `tech_review` complete.**" in gate_comment["message"]
+        assert "use FastAPI" in gate_comment["message"]
+        gate = result.get("gate")
+        assert gate is not None
+        assert gate["gate_discussion_node_id"] == "D_tech_review_gate"
+        assert gate["next_phase"] == "issue_breakdown"
+        assert gate["gate_posted_at"]
         assert result.get("created_issues", []) == []
         assert result.get("issue_creation_error", "") == ""
 
         final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
         assert final_instance.get_artifacts().get("final_design") == "use FastAPI"
-        assert final_instance.get_gate_issue_number() == 100
+        assert final_instance.get_gate_issue_number() is None
+        assert final_instance.get_discussion_gate_node_id() == "D_tech_review_gate"
+        assert final_instance.get_gate_posted_at() == gate["gate_posted_at"]
         assert final_instance.get_gate_next_phase() == "issue_breakdown"
         assert final_instance.get_pending_comments() == []
         assert final_instance.is_completed() is False
+
+
+def test_phase_workflow_output_per_role_uses_first_matching_agent_toolkit_by_role() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        default_actions = RecordingActions()
+        first_engineer_actions = RecordingActions()
+        second_engineer_actions = RecordingActions()
+        engine = FakeEngine(default_actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(
+            _project_root(),
+            engine,
+            default_actions,
+            FakeClient({}),
+            {
+                "agents": [
+                    {"id": "engineer-1", "role": "engineer"},
+                    {"id": "engineer-2", "role": "engineer"},
+                ]
+            },
+            agent_toolkits={
+                "engineer-1": first_engineer_actions,
+                "engineer-2": second_engineer_actions,
+            },
+        )
+
+        result = orchestrator._process_phase_workflow(
+            _discussion_event(node_id="D_role_output"),
+            {
+                "event_type": "discussion",
+                "steps": [
+                    {
+                        "phase": "brainstorm_perspectives",
+                        "roles": ["engineer"],
+                        "prompt_path": "prompts/discussion/brainstorm_perspectives.md",
+                        "output_per_role": True,
+                        "gate": False,
+                    }
+                ],
+            },
+        )
+
+        assert len(first_engineer_actions.comment_on_discussion_calls) == 1
+        assert len(second_engineer_actions.comment_on_discussion_calls) == 0
+        assert len(default_actions.comment_on_discussion_calls) == 1
+        assert first_engineer_actions.comment_on_discussion_calls[0]["discussion_id"] == "D_role_output"
+        assert first_engineer_actions.comment_on_discussion_calls[0]["message"].startswith("**[engineer]**")
+        assert default_actions.comment_on_discussion_calls[0]["message"] == "Workflow complete."
+        assert result["phase"] == "brainstorm_perspectives"
 
 
 def test_phase_workflow_skips_when_completed() -> None:
@@ -519,13 +582,27 @@ def test_evaluate_design_proceeds_and_opens_gate_to_issue_breakdown() -> None:
         engine = FakeEngineProceed(actions, runtime_dir=runtime_dir)
         orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
 
-        result = orchestrator.process(_discussion_event())
+        result = orchestrator.process(_discussion_event(node_id="D_issue_breakdown_gate"))
 
         assert not result.get("terminated")
-        assert result.get("gate") == {"gate_issue_number": 100, "next_phase": "issue_breakdown"}
+        assert actions.create_issue_calls == []
+        gate_comments = [
+            call for call in actions.comment_on_discussion_calls if "**Phase `tech_review` complete.**" in call["message"]
+        ]
+        assert len(gate_comments) == 1
+        gate_comment = gate_comments[0]
+        assert gate_comment["discussion_id"] == "D_issue_breakdown_gate"
+        assert gate_comment["number"] == 5
+        gate = result.get("gate")
+        assert gate is not None
+        assert gate["gate_discussion_node_id"] == "D_issue_breakdown_gate"
+        assert gate["next_phase"] == "issue_breakdown"
+        assert gate["gate_posted_at"]
         final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
         assert final_instance.get_artifacts().get("final_design") == "use FastAPI"
-        assert final_instance.get_gate_issue_number() == 100
+        assert final_instance.get_gate_issue_number() is None
+        assert final_instance.get_discussion_gate_node_id() == "D_issue_breakdown_gate"
+        assert final_instance.get_gate_posted_at() == gate["gate_posted_at"]
         assert final_instance.is_completed() is False
 
 

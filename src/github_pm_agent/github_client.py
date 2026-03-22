@@ -247,11 +247,18 @@ class GitHubClient:
         query($owner: String!, $name: String!, $number: Int!) {
           repository(owner: $owner, name: $name) {
             discussion(number: $number) {
-              comments(last: 50) {
+              comments(last: 100) {
                 nodes {
                   body
                   createdAt
                   author { login }
+                  replies(last: 10) {
+                    nodes {
+                      body
+                      createdAt
+                      author { login }
+                    }
+                  }
                 }
               }
             }
@@ -268,7 +275,36 @@ class GitHubClient:
             .get("comments", {})
             .get("nodes", [])
         )
-        return nodes if isinstance(nodes, list) else []
+        if not isinstance(nodes, list):
+            return []
+
+        flat_comments: List[Dict[str, Any]] = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            flat_comments.append(
+                {
+                    "body": node.get("body"),
+                    "createdAt": node.get("createdAt"),
+                    "author": node.get("author"),
+                }
+            )
+            reply_nodes = (node.get("replies") or {}).get("nodes", [])
+            if not isinstance(reply_nodes, list):
+                continue
+            for reply in reply_nodes:
+                if not isinstance(reply, dict):
+                    continue
+                flat_comments.append(
+                    {
+                        "body": reply.get("body"),
+                        "createdAt": reply.get("createdAt"),
+                        "author": reply.get("author"),
+                    }
+                )
+
+        flat_comments.sort(key=lambda comment: comment.get("createdAt", ""))
+        return flat_comments
 
     def add_discussion_comment(self, discussion_id: str, body: str) -> Dict[str, Any]:
         mutation = """

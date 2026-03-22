@@ -206,14 +206,19 @@ class WorkflowOrchestrator:
             }
 
         # Skip if already waiting on a gate (not a resume event)
-        if instance.get_gate_issue_number() and not meta.get("advance_to_phase"):
-            return {
+        gate_issue_number = instance.get_gate_issue_number()
+        gate_discussion_node_id = instance.get_discussion_gate_node_id()
+        if (gate_issue_number or gate_discussion_node_id) and not meta.get("advance_to_phase"):
+            result = {
                 "phase": instance.get_phase(),
                 "skipped": True,
                 "reason": "gate_already_open",
-                "gate_issue_number": instance.get_gate_issue_number(),
+                "gate_issue_number": gate_issue_number,
                 "escalation_refs": [],
             }
+            if gate_discussion_node_id:
+                result["gate_discussion_node_id"] = gate_discussion_node_id
+            return result
 
         steps = workflow.get("steps", [])
         if not steps:
@@ -282,7 +287,15 @@ class WorkflowOrchestrator:
 
                 # Post each role's output to the Discussion using that role's own account
                 if step.get("output_per_role") and node_id and content:
-                    role_toolkit = self.agent_toolkits.get(role, self.actions)
+                    role_agent_id = next(
+                        (
+                            agent.get("id")
+                            for agent in self.config.get("agents", [])
+                            if isinstance(agent, dict) and agent.get("role", agent.get("id", "pm")) == role
+                        ),
+                        None,
+                    )
+                    role_toolkit = self.agent_toolkits.get(role_agent_id, self.actions) if role_agent_id else self.actions
                     role_header = f"**[{role}]** — `{current_phase}`\n\n"
                     role_toolkit.comment_on_discussion(node_id, discussion_number, role_header + content)
 
@@ -352,7 +365,7 @@ class WorkflowOrchestrator:
 
                 gate_body = f"{'@' + owner + chr(10) + chr(10) if owner else ''}**Phase `{current_phase}` complete.**\n\n{display_content}"
                 if next_phase:
-                    gate_body += f"\n\n---\n_Reply here to confirm and advance to **{next_phase}**._"
+                    gate_body += f"\n\n---\n_Comment in this discussion to confirm and advance to **{next_phase}**._"
 
                 posted_at = utc_now_iso()
                 self.actions.comment_on_discussion(node_id, discussion_number, gate_body)
@@ -467,7 +480,19 @@ class WorkflowOrchestrator:
         instance = WorkflowInstance.load(self.engine.runtime_dir, event.repo, discussion_number)
         if not instance.get_phase() or instance.is_completed() or instance.is_terminated():
             return {"skipped": True, "reason": "no_active_workflow", "escalation_refs": []}
-        if event.body:
+        owner_login = str(self.config.get("github", {}).get("owner", "") or "").strip()
+        bot_logins = {
+            str(agent.get("login", "") or "").strip()
+            for agent in self.config.get("agents", [])
+            if isinstance(agent, dict) and str(agent.get("login", "") or "").strip()
+        }
+        actor_login = str(getattr(event, "actor", "") or "").strip()
+        should_record_comment = bool(event.body)
+        if actor_login in bot_logins:
+            should_record_comment = False
+        elif owner_login:
+            should_record_comment = actor_login == owner_login
+        if should_record_comment:
             instance.add_pending_comment(event.body)
         return {"recorded": True, "discussion_number": discussion_number, "escalation_refs": []}
 
