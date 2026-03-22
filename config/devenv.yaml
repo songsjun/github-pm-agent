@@ -1,0 +1,59 @@
+# config/devenv.yaml
+# GitHub PM Agent — DevEnv 容器部署配置
+#
+# 使用方式：
+#   devenv build . --tag pm-agent:latest
+#   devenv run pm-agent:latest \
+#     --env GITHUB_TOKEN_PM=ghp_xxx \
+#     --env GITHUB_TOKEN_ENGINEER=ghp_yyy \
+#     --env GITHUB_TOKEN_SECURITY=ghp_zzz \
+#     --env CONFIG_PATH=/app/config/devenv.yaml
+#
+# DEVENV_CAPS_URL 由 DevEnv 自动注入，无需手动设置。
+
+github:
+  repos:
+    - your-org/your-repo
+  default_branch: main
+  owner: your-github-username
+
+agents:
+  - id: pm
+    role: pm
+    token_env: GITHUB_TOKEN_PM
+    priority: 1
+    participates_in:
+      pull_request_changed: observe
+      issue_changed: respond
+
+  - id: engineer
+    role: engineer
+    token_env: GITHUB_TOKEN_ENGINEER
+    priority: 2
+    participates_in:
+      pull_request_changed: respond
+      issue_changed: respond
+
+  - id: security
+    role: security
+    token_env: GITHUB_TOKEN_SECURITY
+    priority: 3
+    participates_in:
+      pull_request_changed: veto
+
+engine:
+  dry_run: false
+  continue_on_error: true
+
+ai:
+  default_provider: devenv
+  providers:
+    devenv:
+      type: devenv_caps           # 调用 DevEnv Capability Bridge
+      capability: codex           # 使用宿主机的 codex CLI
+      caps_url_env: DEVENV_CAPS_URL  # DevEnv 自动注入
+      default_model: gpt-5.4
+      model_arg: "-c model=$model"   # 传给 codex 的参数模板
+      timeout: 300
+
+runtime_dir: /tmp/pm-agent-runtime

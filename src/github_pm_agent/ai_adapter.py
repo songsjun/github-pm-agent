@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import tempfile
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict
@@ -36,6 +37,8 @@ class AIAdapterManager:
             response = self._run_cli_script(provider_config, request, rendered)
         elif provider_type == "openai_compatible":
             response = self._run_openai_compatible(provider_config, request, rendered)
+        elif provider_type == "devenv_caps":
+            response = self._run_devenv_caps(provider_config, request, rendered)
         else:
             raise RuntimeError(f"unsupported provider type: {provider_type}")
         if request.session_key:
@@ -156,6 +159,45 @@ class AIAdapterManager:
             content=raw.get("output", ""),
             raw=raw,
             session_key=raw.get("session_key") or request.session_key,
+        )
+
+    def _run_devenv_caps(self, provider_config: Dict[str, Any], request: AiRequest, rendered: str) -> AiResponse:
+        """Call a DevEnv Capability Bridge endpoint (http_proxy or exec type wrapping codex/ollama/etc.)."""
+        caps_url_env = provider_config.get("caps_url_env", "DEVENV_CAPS_URL")
+        caps_url = os.environ.get(caps_url_env, "").rstrip("/")
+        if not caps_url:
+            raise RuntimeError(
+                f"DevEnv caps URL not set — set env var {caps_url_env} "
+                f"(container should have DEVENV_CAPS_URL injected automatically)"
+            )
+        capability = provider_config.get("capability", "codex")
+        url = f"{caps_url}/{capability}"
+
+        # Pass model selection via ?args= if model_arg template is configured
+        # e.g. model_arg: "-c model=$model"
+        model_arg_template = provider_config.get("model_arg", "")
+        if model_arg_template and request.model:
+            args_value = model_arg_template.replace("$model", request.model)
+            url = f"{url}?{urllib.parse.urlencode({'args': args_value})}"
+
+        body = rendered.encode("utf-8")
+        req = urllib.request.Request(url, data=body, method="POST")
+        timeout = provider_config.get("timeout", 300)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            content = resp.read().decode("utf-8")
+            exit_code = int(resp.headers.get("X-Exit-Code", "0"))
+
+        if exit_code != 0:
+            raise RuntimeError(
+                f"devenv caps '{capability}' failed (exit {exit_code}): {content[:300]}"
+            )
+
+        return AiResponse(
+            provider=request.provider,
+            model=request.model,
+            content=content.strip(),
+            raw={"output": content.strip(), "exit_code": exit_code},
+            session_key=request.session_key,
         )
 
     def _run_openai_compatible(self, provider_config: Dict[str, Any], request: AiRequest, rendered: str) -> AiResponse:
