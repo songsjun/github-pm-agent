@@ -44,7 +44,12 @@ class GitHubClient:
     def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Any:
         args = ["api", "graphql", "-f", f"query={query}"]
         for key, value in (variables or {}).items():
-            args.extend(["-F", f"{key}={value}"])
+            # Use -f (string literal) for str values to avoid gh treating @-prefixed
+            # values as file paths. Use -F (typed) for int/bool.
+            if isinstance(value, (int, bool)):
+                args.extend(["-F", f"{key}={value}"])
+            else:
+                args.extend(["-f", f"{key}={value}"])
         output = self._run(args)
         if not output:
             return {}
@@ -236,6 +241,34 @@ class GitHubClient:
             if value is not None:
                 params[key] = value
         return self.api(f"repos/{self.repo}/releases", params, method="POST")
+
+    def get_discussion_comments(self, owner: str, name: str, number: int) -> List[Dict[str, Any]]:
+        query = """
+        query($owner: String!, $name: String!, $number: Int!) {
+          repository(owner: $owner, name: $name) {
+            discussion(number: $number) {
+              comments(last: 50) {
+                nodes {
+                  body
+                  createdAt
+                  author { login }
+                }
+              }
+            }
+          }
+        }
+        """
+        result = self.graphql(query, {"owner": owner, "name": name, "number": number})
+        if not isinstance(result, dict):
+            return []
+        nodes = (
+            result.get("data", {})
+            .get("repository", {})
+            .get("discussion", {})
+            .get("comments", {})
+            .get("nodes", [])
+        )
+        return nodes if isinstance(nodes, list) else []
 
     def add_discussion_comment(self, discussion_id: str, body: str) -> Dict[str, Any]:
         mutation = """

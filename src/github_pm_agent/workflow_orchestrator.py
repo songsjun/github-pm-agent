@@ -266,6 +266,9 @@ class WorkflowOrchestrator:
 
             roles = step.get("roles", ["pm"])
             last_content = ""
+            node_id = meta.get("node_id") or (
+                instance.get_original_event() or {}
+            ).get("metadata", {}).get("node_id", "")
             for role in roles:
                 result = self.engine.run_raw_text_handler(
                     event,
@@ -276,6 +279,12 @@ class WorkflowOrchestrator:
                 content = result.get("raw_text", "")
                 last_content = content
                 all_ai_outputs.append({"phase": current_phase, "role": role, "content": content})
+
+                # Post each role's output to the Discussion using that role's own account
+                if step.get("output_per_role") and node_id and content:
+                    role_toolkit = self.agent_toolkits.get(role, self.actions)
+                    role_header = f"**[{role}]** — `{current_phase}`\n\n"
+                    role_toolkit.comment_on_discussion(node_id, discussion_number, role_header + content)
 
             instance.set_artifact(current_phase, last_content)
             if step.get("output_per_role"):
@@ -325,25 +334,31 @@ class WorkflowOrchestrator:
                 step_succeeded = True
 
             if step.get("gate"):
+                from github_pm_agent.utils import utc_now_iso
                 idx = next((i for i, s in enumerate(steps) if s.get("phase") == current_phase), -1)
                 next_step = steps[idx + 1] if 0 <= idx < len(steps) - 1 else None
                 next_phase = next_step["phase"] if next_step else None
 
                 owner = self.config.get("github", {}).get("owner", "")
-                gate_title = f"[workflow-gate] {event.repo} Discussion #{discussion_number} phase={current_phase}"
-                gate_body = f"{'@' + owner + chr(10) + chr(10) if owner else ''}Phase **{current_phase}** complete.\n\n{last_content}"
-                if next_phase:
-                    gate_body += f"\n\n---\nReply or close this issue to advance to: **{next_phase}**"
+                node_id = meta.get("node_id") or (
+                    instance.get_original_event() or {}
+                ).get("metadata", {}).get("node_id", "")
 
-                gate_issue = self.actions.create_issue(
-                    title=gate_title, body=gate_body, labels=["workflow-gate"]
-                )
-                gate_number: Optional[int] = None
-                if isinstance(gate_issue, dict):
-                    gate_number = gate_issue.get("number") or (gate_issue.get("result") or {}).get("number")
-                if gate_number and next_phase:
-                    instance.set_gate(gate_number, next_phase)
-                gate_result = {"gate_issue_number": gate_number, "next_phase": next_phase}
+                # For evaluate_design phases, post the human-readable final_design
+                # instead of the raw JSON that the AI produced.
+                display_content = last_content
+                if step.get("action") == "evaluate_design":
+                    display_content = instance.get_artifacts().get("final_design") or last_content
+
+                gate_body = f"{'@' + owner + chr(10) + chr(10) if owner else ''}**Phase `{current_phase}` complete.**\n\n{display_content}"
+                if next_phase:
+                    gate_body += f"\n\n---\n_Reply here to confirm and advance to **{next_phase}**._"
+
+                posted_at = utc_now_iso()
+                self.actions.comment_on_discussion(node_id, discussion_number, gate_body)
+                if next_phase:
+                    instance.set_discussion_gate(node_id, posted_at, next_phase)
+                gate_result = {"gate_discussion_node_id": node_id, "gate_posted_at": posted_at, "next_phase": next_phase}
                 if pending:
                     instance.clear_pending_comments()
                 break  # wait for human

@@ -63,9 +63,24 @@ class WorkflowInstance:
             self._state["gate_next_phase"] = next_phase
         self._save()
 
+    def set_discussion_gate(self, node_id: str, posted_at: str, next_phase: str) -> None:
+        """Gate tracked via Discussion comment (no issue created)."""
+        self._state["gate_discussion_node_id"] = node_id
+        self._state["gate_posted_at"] = posted_at
+        self._state["gate_next_phase"] = next_phase
+        self._save()
+
+    def get_discussion_gate_node_id(self) -> Optional[str]:
+        return self._state.get("gate_discussion_node_id")
+
+    def get_gate_posted_at(self) -> Optional[str]:
+        return self._state.get("gate_posted_at")
+
     def clear_gate(self) -> None:
         self._state.pop("gate_issue_number", None)
         self._state.pop("gate_next_phase", None)
+        self._state.pop("gate_discussion_node_id", None)
+        self._state.pop("gate_posted_at", None)
         self._save()
 
     def add_pending_comment(self, comment: str) -> None:
