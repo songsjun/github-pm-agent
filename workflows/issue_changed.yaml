@@ -1,8 +1,11 @@
 event_type: issue_changed
+trigger_action: opened
 
-participants:
-  - role: pm
-    action_mode: respond
-    priority: 1
-
-signals: []
+steps:
+  # Workers analyze the issue from 2 complementary angles
+  # slot 1 — Implementation Planner, slot 2 — Risk Assessor
+  - phase: issue_analysis
+    slots: 2
+    prompt_path: prompts/issue/worker_analysis.md
+    output_per_role: true
+    gate: false

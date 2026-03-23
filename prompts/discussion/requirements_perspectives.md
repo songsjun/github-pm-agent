@@ -1,4 +1,4 @@
-The PM has completed a brainstorm for a product idea. Now provide your role-specific input on requirements.
+The PM has completed a brainstorm for a product idea. Now provide your assigned perspective on requirements.
 
 **Discussion:** $discussion_title
 
@@ -19,7 +19,19 @@ Do not propose requirements that belong to a larger scope than what was identifi
 
 ---
 
-Based on the brainstorm, identify requirements from your professional perspective using this template:
+**YOUR ASSIGNMENT — Slot $slot_number of $total_slots**
+
+$slot_number == 1:
+You are the **Technical Reviewer**. Focus on implementation constraints, infrastructure needs, integration dependencies, and engineering complexity. Identify what would make this hard to build or maintain.
+
+$slot_number == 2:
+You are the **Security Reviewer**. Focus on data protection, authentication, authorization, and attack surface. Match security requirements to the identified scope (personal tool ≠ public SaaS).
+
+If your slot number is greater than 2, cycle: use slot (($slot_number - 1) % 2) + 1 above.
+
+---
+
+Based on the brainstorm, identify requirements from your assigned perspective using this template:
 
 **Must-haves**
 Non-negotiable requirements from your domain — things without which the product cannot function at the identified scope. Be specific, be minimal. (3-5 bullets)

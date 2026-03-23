@@ -66,14 +66,16 @@ class EventEngine:
         skill_refs: Optional[Iterable[str]] = None,
         risk_level: str = "normal",
         requires_human: bool = False,
+        role: str = "pm",
     ) -> Dict[str, Any]:
         provider = self.ai_manager.default_provider()
         model = self.ai_manager.default_model(provider)
         artifact_refs = self.artifacts.latest_refs(self._artifact_kinds_for_prompt(prompt_path))
+        system_prompt_path = f"prompts/system/{role}.md"
         request = AiRequest(
             provider=provider,
             model=model,
-            system_prompt_path="prompts/system/pm.md",
+            system_prompt_path=system_prompt_path,
             prompt_path=prompt_path,
             variables={
                 "repo": event.repo,

@@ -105,7 +105,7 @@ class GitHubPMAgentAppTest(unittest.TestCase):
         queue = Mock()
         event_one = make_event("event-1", 1)
         event_two = make_event("event-2", 2)
-        queue.pop.side_effect = [event_one, event_two, None]
+        queue.pop.side_effect = [event_one, event_two, None, None]  # two drains per cycle
         app = self._build_app(queue=queue)
         app.orchestrator.process.side_effect = [
             {"plan": {"should_act": True}, "escalation_refs": []},
@@ -121,6 +121,9 @@ class GitHubPMAgentAppTest(unittest.TestCase):
         self.assertEqual(len(result["processed"]), 1)
         queue.mark_done.assert_called_once()
         queue.mark_failed.assert_called_once_with(event_two, "boom")
+        # Verify both drain_queue() calls ran (cycle design: poll → drain → gate_scan → drain).
+        # First drain: event_one, event_two, None (3 pops). Second drain: None (1 pop).
+        self.assertEqual(queue.pop.call_count, 4)
 
     def test_cycle_raises_when_continue_on_error_disabled(self) -> None:
         self.config["engine"]["continue_on_error"] = False

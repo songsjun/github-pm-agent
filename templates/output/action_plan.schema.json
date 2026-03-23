@@ -93,15 +93,7 @@
     },
     "options": {
       "type": "array",
-      "items": {
-        "oneOf": [
-          { "type": "string" },
-          {
-            "type": "object",
-            "additionalProperties": true
-          }
-        ]
-      }
+      "items": { "type": "string" }
     },
     "labels_to_add": {
       "type": "array",

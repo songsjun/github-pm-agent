@@ -1,19 +1,23 @@
-Write a product requirements document (PRD) based on the brainstorm and team input below.
+Write a product requirements document (PRD) based on the problem definition, brainstorm, and requirements challenge analysis below.
 
 **Discussion:** $discussion_title
 
 **Original idea:**
 $discussion_body
 
+**Problem Definition (Phase 0):**
+$artifact_problem_synthesis
+
 **Brainstorm:**
 $artifact_brainstorm
 
-**Engineer's requirements input:**
-$artifact_requirements_perspectives_engineer
+**Requirements Challenge (Kano / MoSCoW / Assumptions):**
+$artifact_requirements_challenge_combined
 
-**Security's requirements input:**
-$artifact_requirements_perspectives_security
+**Technical and Security Requirements Input:**
+$artifact_requirements_perspectives_combined
 
+$user_supplements
 $human_comment
 $pending_comments
 
@@ -54,6 +58,25 @@ Security needs matched to scope. Personal tool: protect local data, avoid data l
 
 **Success metrics**
 How the owner will know this is working. For personal tools, qualitative metrics are fine (e.g., "I use it daily", "my score improved over 4 weeks"). Do not require analytics infrastructure. (2-3 metrics)
+
+**Feature priority (MoSCoW)**
+Copied directly from the MoSCoW arbiter output above. Must list capped at 3 items.
+| Priority | Feature | Rationale |
+|---|---|---|
+| Must | ... | ... |
+| Should | ... | ... |
+| Could | ... | ... |
+| Won't | ... | ... |
+
+**Kano classification**
+Copied from the Kano classifier output. Flag any misclassifications corrected.
+| Feature | Category | Note |
+|---|---|---|
+| ... | Basic / Performance / Delighter | ... |
+
+**Key assumptions**
+Top 3 high-risk assumptions from the Assumption Recorder. These will be revisited after technical design.
+- **Assumption**: ... | **Risk if wrong**: ... | **Risk level**: High/Medium/Low
 
 **Open questions**
 Unresolved decisions that need answers before building. (2-4 questions)

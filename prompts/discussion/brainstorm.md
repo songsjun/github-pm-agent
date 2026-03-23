@@ -4,11 +4,8 @@ A new product idea has been submitted as a GitHub Discussion. You are the PM. Sy
 
 $discussion_body
 
-**Engineer's perspective:**
-$artifact_brainstorm_perspectives_engineer
-
-**Security's perspective:**
-$artifact_brainstorm_perspectives_security
+**Team Perspectives (all slots):**
+$artifact_brainstorm_perspectives_combined
 
 $pending_comments
 
