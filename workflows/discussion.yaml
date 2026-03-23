@@ -1,25 +1,85 @@
 event_type: discussion
 steps:
+  # Phase 0a: Workers examine the raw idea from 4 structured perspectives
+  #   slot 1 — JTBD Analyst, slot 2 — 5 Whys, slot 3 — User Proxy, slot 4 — Assumption Challenger
+  - phase: problem_framing
+    slots: 4
+    prompt_path: prompts/discussion/problem_framing.md
+    output_per_role: true
+    gate: false
+
+  # Phase 0b: PM synthesizes into a problem definition → owner confirms before ideation
+  - phase: problem_synthesis
+    roles: [pm]
+    prompt_path: prompts/discussion/problem_synthesis.md
+    output_mode: raw_text
+    gate: true
+
+  # Phase 1a: Workers explore opportunities from 6 perspectives (six thinking hats)
+  - phase: brainstorm_perspectives
+    slots: 6
+    prompt_path: prompts/discussion/opportunity_explore.md
+    output_per_role: true
+    gate: false
+
+  # Phase 1b: PM synthesizes all perspectives into a brainstorm doc → owner confirms
   - phase: brainstorm
     roles: [pm]
     prompt_path: prompts/discussion/brainstorm.md
     output_mode: raw_text
     gate: true
+
+  # Phase 2a: Workers challenge requirements (Kano + MoSCoW + assumption recording)
+  - phase: requirements_challenge
+    slots: 3
+    prompt_path: prompts/discussion/requirements_challenge.md
+    output_per_role: true
+    gate: false
+
+  # Phase 2b: Workers flag technical (slot 1) and security (slot 2) requirements
+  - phase: requirements_perspectives
+    slots: 2
+    prompt_path: prompts/discussion/requirements_perspectives.md
+    output_per_role: true
+    gate: false
+
+  # Phase 2c: PM writes full PRD incorporating all input → owner confirms
   - phase: requirements
     roles: [pm]
     prompt_path: prompts/discussion/requirements.md
     output_mode: raw_text
     gate: true
+
+  # Phase 3a: Engineer writes technical design proposal
   - phase: tech_proposal
     roles: [engineer]
     prompt_path: prompts/discussion/tech_proposal.md
     output_per_role: true
     gate: false
+
+  # Phase 3b: Security does security analysis of the tech proposal
+  # Named tech_proposal_security so it's included in all_tech_proposals aggregation
+  - phase: tech_proposal_security
+    roles: [security]
+    prompt_path: prompts/discussion/tech_security_analysis.md
+    output_per_role: true
+    gate: false
+
+  # Phase 4: PM evaluates all proposals, writes final design doc → owner confirms
   - phase: tech_review
     roles: [pm]
     prompt_path: prompts/discussion/tech_review.md
     gate: true
     action: evaluate_design
+
+  # Phase 4b: Workers validate assumptions and define MVP boundary
+  - phase: assumption_check
+    slots: 2
+    prompt_path: prompts/discussion/assumption_check.md
+    output_per_role: true
+    gate: false
+
+  # Phase 5: PM breaks down into GitHub Issues (dev + test tasks)
   - phase: issue_breakdown
     roles: [pm]
     prompt_path: prompts/discussion/issue_breakdown.md

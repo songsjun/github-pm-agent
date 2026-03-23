@@ -1,0 +1,5 @@
+{
+  "role": "worker",
+  "allowed": ["comment", "label", "review_request", "none"],
+  "forbidden": ["merge", "create_release", "state", "assign"]
+}

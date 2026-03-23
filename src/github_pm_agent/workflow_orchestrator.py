@@ -108,6 +108,8 @@ class WorkflowOrchestrator:
     def process(self, event: Any) -> Dict[str, Any]:
         if event.event_type == "discussion_comment":
             return self._record_discussion_comment(event)
+        if event.event_type == "issue_comment":
+            return self._record_issue_comment(event)
         workflow = self._load_workflow(event.event_type)
         if "steps" in workflow:
             return self._process_phase_workflow(event, workflow)
@@ -171,15 +173,33 @@ class WorkflowOrchestrator:
             combined["veto_reason"] = veto_reason
         return combined
 
+    def _post_output_comment(self, event: Any, toolkit: Any, message: str, node_id: str = "") -> None:
+        """Post a comment to the event's target (discussion, issue, or PR)."""
+        if event.target_kind == "discussion" and node_id:
+            toolkit.comment_on_discussion(node_id, event.target_number, message)
+        elif event.target_kind in ("issue", "pull_request"):
+            toolkit.comment(event.target_kind, event.target_number, message)
+
     def _process_phase_workflow(self, event: Any, workflow: Dict[str, Any]) -> Dict[str, Any]:
         from github_pm_agent.workflow_instance import WorkflowInstance
 
-        runtime_dir = self.engine.runtime_dir
-        discussion_number = event.target_number
-        if not discussion_number:
-            return {"error": "discussion event missing target_number", "escalation_refs": []}
+        # Check trigger_action filter (e.g., only run on "opened" actions)
+        trigger_action = workflow.get("trigger_action")
+        if trigger_action:
+            event_action = (event.metadata or {}).get("action", "")
+            if event_action != trigger_action:
+                return {
+                    "skipped": True,
+                    "reason": f"action={event_action!r} does not match trigger_action={trigger_action!r}",
+                    "escalation_refs": [],
+                }
 
-        instance = WorkflowInstance.load(runtime_dir, event.repo, discussion_number)
+        runtime_dir = self.engine.runtime_dir
+        target_number = event.target_number
+        if not target_number:
+            return {"error": "event missing target_number", "escalation_refs": []}
+
+        instance = WorkflowInstance.load(runtime_dir, event.repo, target_number)
 
         if not instance.get_original_event():
             instance.set_original_event(event.to_dict())
@@ -206,18 +226,32 @@ class WorkflowOrchestrator:
             }
 
         # Skip if already waiting on a gate (not a resume event)
-        if instance.get_gate_issue_number() and not meta.get("advance_to_phase"):
-            return {
+        gate_issue_number = instance.get_gate_issue_number()
+        gate_discussion_node_id = instance.get_discussion_gate_node_id()
+        if (gate_issue_number or gate_discussion_node_id) and not meta.get("advance_to_phase"):
+            result = {
                 "phase": instance.get_phase(),
                 "skipped": True,
                 "reason": "gate_already_open",
-                "gate_issue_number": instance.get_gate_issue_number(),
+                "gate_issue_number": gate_issue_number,
+                "escalation_refs": [],
+            }
+            if gate_discussion_node_id:
+                result["gate_discussion_node_id"] = gate_discussion_node_id
+            return result
+
+        # Skip if awaiting clarification answer (not a resume event)
+        if instance.is_awaiting_clarification() and not meta.get("advance_to_phase"):
+            return {
+                "phase": instance.get_phase(),
+                "skipped": True,
+                "reason": "awaiting_clarification",
                 "escalation_refs": [],
             }
 
         steps = workflow.get("steps", [])
         if not steps:
-            return {"error": "discussion workflow has no steps", "escalation_refs": []}
+            return {"error": "workflow has no steps", "escalation_refs": []}
 
         advance_to = meta.get("advance_to_phase")
         if advance_to:
@@ -244,6 +278,11 @@ class WorkflowOrchestrator:
             variables: Dict[str, Any] = {
                 "discussion_title": event.title,
                 "discussion_body": event.body,
+                # Aliases for non-discussion event types
+                "issue_title": event.title,
+                "issue_body": event.body,
+                "pr_title": event.title,
+                "pr_body": event.body,
                 "current_phase": current_phase,
             }
             for phase_name, artifact_text in artifacts.items():
@@ -253,6 +292,12 @@ class WorkflowOrchestrator:
             variables["human_comment"] = f"Human feedback:\n{human_comment}\n" if human_comment else ""
             pending = instance.get_pending_comments()
             variables["pending_comments"] = "\n\n---\n\n".join(pending) if pending else ""
+            supplements = instance.get_user_supplements()
+            if supplements:
+                lines = [f"- [{s['phase']}] {s['content']}" for s in supplements]
+                variables["user_supplements"] = "**Owner supplements (accumulated across gates):**\n" + "\n".join(lines) + "\n"
+            else:
+                variables["user_supplements"] = ""
 
             # Build aggregated tech proposals variable for review steps
             if current_phase == "tech_review":
@@ -264,23 +309,72 @@ class WorkflowOrchestrator:
                 else:
                     variables["all_tech_proposals"] = variables.get("artifact_tech_proposal", "")
 
-            roles = step.get("roles", ["pm"])
+            executors = self._resolve_step_executors(step)
             last_content = ""
-            for role in roles:
+            node_id = meta.get("node_id") or (
+                instance.get_original_event() or {}
+            ).get("metadata", {}).get("node_id", "")
+
+            # Idempotency guard: if this phase already produced an artifact (a previous
+            # event triggered the same workflow), skip re-running executors to prevent
+            # duplicate comments.  Happens when discussion updated_at changes after a
+            # comment is posted, generating a new event_id for the same discussion.
+            # Exception: advance_to_phase events are intentional re-runs (resuming after
+            # clarification or gate confirmation), so always execute them fresh so that
+            # worker outputs incorporate the owner's answers and synthesis is regenerated.
+            existing_artifact = instance.get_artifacts().get(current_phase)
+            if existing_artifact is not None and not meta.get("rerun_phase") and not meta.get("advance_to_phase"):
+                last_content = existing_artifact
+                executors = []
+
+            for executor in executors:
+                exec_vars = {**variables, **executor["extra_vars"]}
                 result = self.engine.run_raw_text_handler(
                     event,
                     prompt_path=step["prompt_path"],
-                    role=role,
-                    variables=variables,
+                    role=executor["role"],
+                    variables=exec_vars,
                 )
                 content = result.get("raw_text", "")
                 last_content = content
-                all_ai_outputs.append({"phase": current_phase, "role": role, "content": content})
+                all_ai_outputs.append({"phase": current_phase, "role": executor["label"], "content": content})
+
+                # Post each executor's output to the target (discussion, issue, or PR)
+                if step.get("output_per_role") and content and (node_id or event.target_kind in ("issue", "pull_request")):
+                    agent_id = executor["agent_id"]
+                    if agent_id:
+                        role_toolkit = self.agent_toolkits.get(agent_id, self.actions)
+                    else:
+                        matched_id = next(
+                            (
+                                a.get("id")
+                                for a in self.config.get("agents", [])
+                                if isinstance(a, dict) and a.get("role", a.get("id", "pm")) == executor["role"]
+                            ),
+                            None,
+                        )
+                        role_toolkit = self.agent_toolkits.get(matched_id, self.actions) if matched_id else self.actions
+                    role_header = f"**[{executor['label']}]** — `{current_phase}`\n\n"
+                    self._post_output_comment(event, role_toolkit, role_header + content, node_id)
 
             instance.set_artifact(current_phase, last_content)
             if step.get("output_per_role"):
-                for ai_out in [o for o in all_ai_outputs if o["phase"] == current_phase]:
+                phase_outputs = [o for o in all_ai_outputs if o["phase"] == current_phase]
+                for ai_out in phase_outputs:
                     instance.set_artifact(f"{current_phase}_{ai_out['role']}", ai_out["content"])
+                # Save a single combined artifact so PM synthesis prompts can reference one variable
+                if len(phase_outputs) > 1:
+                    combined_parts = [
+                        f"### {o['role']}\n\n{o['content']}" for o in phase_outputs
+                    ]
+                    instance.set_artifact(f"{current_phase}_combined", "\n\n---\n\n".join(combined_parts))
+
+            # After slot-based phases: check for blocking_unknowns and post clarification
+            if step.get("slots"):
+                questions = self._collect_blocking_unknowns(all_ai_outputs, current_phase)
+                if questions:
+                    self._post_clarification(questions, event, instance, node_id, current_phase)
+                    break  # suspend — wait for owner reply before continuing
 
             step_succeeded = False
 
@@ -313,7 +407,9 @@ class WorkflowOrchestrator:
                     }
                 if eval_result.get("escalated"):
                     gate_result = eval_result.get("gate", {})
-                    if pending:
+                    # Re-fetch pending rather than using the snapshot captured at loop start
+                    # to avoid a TOCTOU race where a comment arriving after the snapshot is lost.
+                    if instance.get_pending_comments():
                         instance.clear_pending_comments()
                     break
                 if eval_result.get("error"):
@@ -325,30 +421,40 @@ class WorkflowOrchestrator:
                 step_succeeded = True
 
             if step.get("gate"):
+                from github_pm_agent.utils import utc_now_iso
                 idx = next((i for i, s in enumerate(steps) if s.get("phase") == current_phase), -1)
                 next_step = steps[idx + 1] if 0 <= idx < len(steps) - 1 else None
                 next_phase = next_step["phase"] if next_step else None
 
                 owner = self.config.get("github", {}).get("owner", "")
-                gate_title = f"[workflow-gate] {event.repo} Discussion #{discussion_number} phase={current_phase}"
-                gate_body = f"{'@' + owner + chr(10) + chr(10) if owner else ''}Phase **{current_phase}** complete.\n\n{last_content}"
-                if next_phase:
-                    gate_body += f"\n\n---\nReply or close this issue to advance to: **{next_phase}**"
+                node_id = meta.get("node_id") or (
+                    instance.get_original_event() or {}
+                ).get("metadata", {}).get("node_id", "")
 
-                gate_issue = self.actions.create_issue(
-                    title=gate_title, body=gate_body, labels=["workflow-gate"]
-                )
-                gate_number: Optional[int] = None
-                if isinstance(gate_issue, dict):
-                    gate_number = gate_issue.get("number") or (gate_issue.get("result") or {}).get("number")
-                if gate_number and next_phase:
-                    instance.set_gate(gate_number, next_phase)
-                gate_result = {"gate_issue_number": gate_number, "next_phase": next_phase}
+                # For evaluate_design phases, post the human-readable final_design
+                # instead of the raw JSON that the AI produced.
+                display_content = last_content
+                if step.get("action") == "evaluate_design":
+                    display_content = instance.get_artifacts().get("final_design") or last_content
+
+                gate_body = f"{'@' + owner + chr(10) + chr(10) if owner else ''}**Phase `{current_phase}` complete.**\n\n{display_content}"
+                if next_phase:
+                    gate_body += f"\n\n---\n_Comment in this discussion to confirm and advance to **{next_phase}**._"
+
+                posted_at = utc_now_iso()
+                self.actions.comment_on_discussion(node_id, target_number, gate_body)
+                if next_phase:
+                    instance.set_discussion_gate(node_id, posted_at, next_phase)
+                gate_result = {"gate_discussion_node_id": node_id, "gate_posted_at": posted_at, "next_phase": next_phase}
                 if pending:
                     instance.clear_pending_comments()
                 break  # wait for human
 
-            if pending and step_succeeded:
+            # Only clear pending_comments for non-slot phases (PM/synthesis steps).
+            # Slot-based phases (workers) pass pending_comments downstream so the
+            # next synthesis step can incorporate the user's clarification answers.
+            # Gate phases already clear pending_comments at line 444-445 before break.
+            if pending and step_succeeded and not step.get("slots"):
                 instance.clear_pending_comments()
 
             idx = next((i for i, s in enumerate(steps) if s.get("phase") == current_phase), -1)
@@ -452,9 +558,43 @@ class WorkflowOrchestrator:
         instance = WorkflowInstance.load(self.engine.runtime_dir, event.repo, discussion_number)
         if not instance.get_phase() or instance.is_completed() or instance.is_terminated():
             return {"skipped": True, "reason": "no_active_workflow", "escalation_refs": []}
-        if event.body:
+        owner_login = str(self.config.get("github", {}).get("owner", "") or "").strip()
+        bot_logins = {
+            str(agent.get("login", "") or "").strip()
+            for agent in self.config.get("agents", [])
+            if isinstance(agent, dict) and str(agent.get("login", "") or "").strip()
+        }
+        actor_login = str(getattr(event, "actor", "") or "").strip()
+        should_record_comment = bool(event.body)
+        if actor_login in bot_logins:
+            should_record_comment = False
+        elif owner_login:
+            should_record_comment = actor_login == owner_login
+        if should_record_comment:
             instance.add_pending_comment(event.body)
         return {"recorded": True, "discussion_number": discussion_number, "escalation_refs": []}
+
+    def _record_issue_comment(self, event: Any) -> Dict[str, Any]:
+        """Handle issue_comment events.
+
+        Gate advancement for issues is handled by PhaseGateScanner polling the
+        GitHub API directly, not via this event path.  Worker/agent comments
+        must never re-trigger the PM workflow (feedback loop).  Therefore this
+        handler always short-circuits without calling the AI.
+        """
+        issue_number = event.target_number
+        if not issue_number:
+            return {"skipped": True, "reason": "no_issue_number", "escalation_refs": []}
+        from github_pm_agent.workflow_instance import WorkflowInstance
+        instance = WorkflowInstance.load(self.engine.runtime_dir, event.repo, issue_number)
+        if not instance.get_phase() or instance.is_completed() or instance.is_terminated():
+            return {"skipped": True, "reason": "no_active_workflow", "escalation_refs": []}
+        # Record owner comments as pending (for future gate support on issues)
+        owner_login = str(self.config.get("github", {}).get("owner", "") or "").strip()
+        actor_login = str(getattr(event, "actor", "") or "").strip()
+        if owner_login and actor_login == owner_login and event.body:
+            instance.add_pending_comment(event.body)
+        return {"recorded": True, "issue_number": issue_number, "escalation_refs": []}
 
     def _post_completion_summary(self, event: Any, instance: Any) -> None:
         """Post a completion comment to the original Discussion."""
@@ -470,7 +610,114 @@ class WorkflowOrchestrator:
         )
         count = len(refs)
         body = f"Workflow complete. Created {count} issue(s):\n\n{issue_lines}" if issue_lines else "Workflow complete."
-        self.actions.comment_on_discussion(node_id, event.target_number, body)
+        self._post_output_comment(event, self.actions, body, node_id or "")
+
+    def _resolve_step_executors(self, step: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Return execution units for a step.
+
+        Each unit has:
+          role      - role string passed to the AI engine
+          agent_id  - config agent id to look up the toolkit (None = use default)
+          label     - display label for comments and artifact keys
+          extra_vars- additional template variables injected into the prompt
+
+        When a step declares ``slots: N`` the system finds all agents with
+        ``role: worker`` (sorted by ``worker_index``), distributes them across
+        the N slots (cycling if fewer workers than slots), and injects slot
+        context variables.  Steps without ``slots`` fall back to the existing
+        ``roles`` list behaviour.
+        """
+        if step.get("slots"):
+            slot_count = int(step["slots"])
+            worker_agents = sorted(
+                [a for a in self.agent_configs if isinstance(a, dict) and a.get("role") == "worker"],
+                key=lambda a: a.get("worker_index", 999),
+            )
+            total_workers = len(worker_agents)
+            if not total_workers:
+                # No workers configured — fall back to pm for every slot
+                return [
+                    {
+                        "role": "pm",
+                        "agent_id": None,
+                        "label": f"pm_slot{s}",
+                        "extra_vars": {"slot_number": s, "total_slots": slot_count, "worker_index": 1, "total_workers": 1},
+                    }
+                    for s in range(1, slot_count + 1)
+                ]
+            units = []
+            for slot_num in range(1, slot_count + 1):
+                agent = worker_agents[(slot_num - 1) % total_workers]
+                w_idx = agent.get("worker_index", (slot_num - 1) % total_workers + 1)
+                units.append(
+                    {
+                        "role": "worker",
+                        "agent_id": agent.get("id"),
+                        "label": f"worker{w_idx}_slot{slot_num}",
+                        "extra_vars": {
+                            "slot_number": slot_num,
+                            "total_slots": slot_count,
+                            "worker_index": w_idx,
+                            "total_workers": total_workers,
+                        },
+                    }
+                )
+            return units
+
+        # Legacy roles-based dispatch
+        roles = step.get("roles", ["pm"])
+        return [{"role": role, "agent_id": None, "label": role, "extra_vars": {}} for role in roles]
+
+    def _collect_blocking_unknowns(self, ai_outputs: List[Dict[str, Any]], phase: str) -> List[str]:
+        """Extract blocking_unknowns from worker outputs in the given phase.
+
+        Workers output this in structured form:
+            blocking_unknowns: ["question 1", "question 2"]
+        or
+            blocking_unknowns: []
+        """
+        import re as _re
+        questions: List[str] = []
+        for out in ai_outputs:
+            if out.get("phase") != phase:
+                continue
+            content = out.get("content", "")
+            match = _re.search(r"blocking_unknowns\s*:\s*\[([^\]]*)\]", content, _re.DOTALL)
+            if not match:
+                continue
+            raw = match.group(1).strip()
+            if not raw:
+                continue
+            # Extract double-quoted strings first
+            items = _re.findall(r'"([^"]+)"', raw)
+            if not items:
+                # Fallback: split on commas, strip quotes/whitespace
+                items = [i.strip().strip("'\"") for i in raw.split(",") if i.strip().strip("'\"")]
+            questions.extend(q for q in items if q)
+        return questions
+
+    def _post_clarification(
+        self,
+        questions: List[str],
+        event: Any,
+        instance: Any,
+        node_id: str,
+        phase: str,
+    ) -> None:
+        """Post a structured clarification comment to the Discussion and suspend the phase."""
+        from github_pm_agent.utils import utc_now_iso
+
+        numbered = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
+        body = (
+            f"## 需要一些澄清\n\n"
+            f"在继续分析之前，以下问题需要你的回答：\n\n"
+            f"{numbered}\n\n"
+            f"---\n"
+            f"_直接回复这条评论即可继续，无需特别格式。_"
+        )
+        posted_at = utc_now_iso()
+        self._post_output_comment(event, self.actions, body, node_id)
+        instance.set_clarification(phase=phase, posted_at=posted_at, node_id=node_id)
 
     def _load_workflow(self, event_type: str) -> Dict[str, Any]:
         candidates = [self.workflows_dir / f"{event_type}.yaml", self.workflows_dir / "default.yaml"]

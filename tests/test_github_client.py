@@ -101,3 +101,70 @@ class GitHubClientMethodTest(unittest.TestCase):
                 ("graphql", "mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $fieldValue: String!) {", {"projectId": "proj-id", "itemId": "item-id", "fieldId": "field-id", "fieldValue": "done"}),
             ],
         )
+
+    def test_get_discussion_comments_flattens_replies_and_sorts_by_created_at(self) -> None:
+        client = GitHubClient("gh", "acme/widgets")
+        graphql_calls = []
+
+        def fake_graphql(query, variables=None):
+            graphql_calls.append((query, dict(variables or {})))
+            return {
+                "data": {
+                    "repository": {
+                        "discussion": {
+                            "comments": {
+                                "nodes": [
+                                    {
+                                        "body": "top-level later",
+                                        "createdAt": "2026-03-20T12:00:00Z",
+                                        "author": {"login": "alice"},
+                                        "replies": {
+                                            "nodes": [
+                                                {
+                                                    "body": "nested approval",
+                                                    "createdAt": "2026-03-20T12:30:00Z",
+                                                    "author": {"login": "owner"},
+                                                }
+                                            ]
+                                        },
+                                    },
+                                    {
+                                        "body": "top-level earlier",
+                                        "createdAt": "2026-03-20T11:00:00Z",
+                                        "author": {"login": "bob"},
+                                        "replies": {"nodes": []},
+                                    },
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+
+        client.graphql = fake_graphql  # type: ignore[method-assign]
+
+        comments = client.get_discussion_comments("acme", "widgets", 7)
+
+        self.assertEqual(graphql_calls[0][1], {"owner": "acme", "name": "widgets", "number": 7})
+        self.assertIn("comments(last: 100)", graphql_calls[0][0])
+        self.assertIn("replies(last: 10)", graphql_calls[0][0])
+        self.assertEqual(
+            comments,
+            [
+                {
+                    "body": "top-level earlier",
+                    "createdAt": "2026-03-20T11:00:00Z",
+                    "author": {"login": "bob"},
+                },
+                {
+                    "body": "top-level later",
+                    "createdAt": "2026-03-20T12:00:00Z",
+                    "author": {"login": "alice"},
+                },
+                {
+                    "body": "nested approval",
+                    "createdAt": "2026-03-20T12:30:00Z",
+                    "author": {"login": "owner"},
+                },
+            ],
+        )

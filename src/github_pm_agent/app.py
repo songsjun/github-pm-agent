@@ -53,7 +53,8 @@ class GitHubPMAgentApp:
         agent_toolkits: Dict[str, Any] = {}
         for agent_cfg in agent_configs:
             token_env = agent_cfg.get("token_env")
-            agent_client = GitHubClient(gh_path(config), self.repo_names[0], token_env=token_env)
+            gh_user = agent_cfg.get("gh_user")
+            agent_client = GitHubClient(gh_path(config), self.repo_names[0], token_env=token_env, gh_user=gh_user)
             agent_toolkits[agent_cfg["id"]] = GitHubActionToolkit(
                 agent_client, self.runtime_dir, dry_run=dry_run
             )
@@ -110,8 +111,14 @@ class GitHubPMAgentApp:
     def cycle(self) -> Dict[str, Any]:
         poll_result = self.poll()
         resume_result = self.scanner.scan_and_resume()
-        gate_advance_result = self.gate_scanner.scan_and_advance()
+        # Drain regular poll events first while gate/clarification state is still intact.
+        # gate_scanner runs afterward and clears gate/clarification only after poll events
+        # have already been blocked, preventing the race where a poll event bypasses the
+        # gate/clarification check because the scanner cleared it in the same cycle.
         processed = self.drain_queue()
+        gate_advance_result = self.gate_scanner.scan_and_advance()
+        # Drain the advance events produced by the gate scanner.
+        processed = processed + self.drain_queue()
         return {"poll": poll_result, "resume": resume_result, "gate_advance": gate_advance_result, "processed": processed}
 
     def reconcile(self) -> Dict[str, Any]:
@@ -212,12 +219,17 @@ class GitHubPMAgentApp:
         return [event] if event is not None else []
 
     def _build_repo_runtime(self, repo: str) -> RepoRuntime:
-        # Use the lowest-priority (primary) agent's token for write access
-        _primary_token_env = next(
-            (a.get("token_env") for a in sorted(self.config.get("agents", []), key=lambda a: a.get("priority", 99)) if a.get("token_env")),
-            None,
+        # Use the highest-priority agent's token for write access (gate comments, etc.)
+        _primary_agent = next(
+            (a for a in sorted(self.config.get("agents", []), key=lambda a: a.get("priority", 99)) if a.get("token_env") or a.get("gh_user")),
+            {},
         )
-        client = GitHubClient(gh_path(self.config), repo, token_env=_primary_token_env)
+        client = GitHubClient(
+            gh_path(self.config),
+            repo,
+            token_env=_primary_agent.get("token_env"),
+            gh_user=_primary_agent.get("gh_user"),
+        )
         poller = GitHubPoller(
             client,
             repo,

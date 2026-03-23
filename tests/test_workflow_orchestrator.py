@@ -261,25 +261,88 @@ def test_phase_workflow_stops_at_tech_review_gate_after_design_evaluation() -> N
         engine = FakeEngineWithIssueBreakdown(actions, runtime_dir=runtime_dir)
         orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
 
-        result = orchestrator.process(_discussion_event())
+        result = orchestrator.process(_discussion_event(node_id="D_tech_review_gate"))
 
         phases_called = [c["prompt_path"] for c in engine.run_raw_text_handler_calls]
         assert any("tech_proposal" in p for p in phases_called)
         assert any("tech_review" in p for p in phases_called)
         assert not any("issue_breakdown" in p for p in phases_called)
 
-        assert len(actions.create_issue_calls) == 1
-        assert actions.create_issue_calls[0]["title"] == "[workflow-gate] songsjun/example Discussion #5 phase=tech_review"
-        assert result.get("gate") == {"gate_issue_number": 100, "next_phase": "issue_breakdown"}
+        assert actions.create_issue_calls == []
+        gate_comments = [
+            call for call in actions.comment_on_discussion_calls if "**Phase `tech_review` complete.**" in call["message"]
+        ]
+        assert len(gate_comments) == 1
+        gate_comment = gate_comments[0]
+        assert gate_comment["discussion_id"] == "D_tech_review_gate"
+        assert gate_comment["number"] == 5
+        assert "**Phase `tech_review` complete.**" in gate_comment["message"]
+        assert "use FastAPI" in gate_comment["message"]
+        gate = result.get("gate")
+        assert gate is not None
+        assert gate["gate_discussion_node_id"] == "D_tech_review_gate"
+        assert gate["next_phase"] == "assumption_check"
+        assert gate["gate_posted_at"]
         assert result.get("created_issues", []) == []
         assert result.get("issue_creation_error", "") == ""
 
         final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
         assert final_instance.get_artifacts().get("final_design") == "use FastAPI"
-        assert final_instance.get_gate_issue_number() == 100
-        assert final_instance.get_gate_next_phase() == "issue_breakdown"
+        assert final_instance.get_gate_issue_number() is None
+        assert final_instance.get_discussion_gate_node_id() == "D_tech_review_gate"
+        assert final_instance.get_gate_posted_at() == gate["gate_posted_at"]
+        assert final_instance.get_gate_next_phase() == "assumption_check"
         assert final_instance.get_pending_comments() == []
         assert final_instance.is_completed() is False
+
+
+def test_phase_workflow_output_per_role_uses_first_matching_agent_toolkit_by_role() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        default_actions = RecordingActions()
+        first_engineer_actions = RecordingActions()
+        second_engineer_actions = RecordingActions()
+        engine = FakeEngine(default_actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(
+            _project_root(),
+            engine,
+            default_actions,
+            FakeClient({}),
+            {
+                "agents": [
+                    {"id": "engineer-1", "role": "engineer"},
+                    {"id": "engineer-2", "role": "engineer"},
+                ]
+            },
+            agent_toolkits={
+                "engineer-1": first_engineer_actions,
+                "engineer-2": second_engineer_actions,
+            },
+        )
+
+        result = orchestrator._process_phase_workflow(
+            _discussion_event(node_id="D_role_output"),
+            {
+                "event_type": "discussion",
+                "steps": [
+                    {
+                        "phase": "brainstorm_perspectives",
+                        "roles": ["engineer"],
+                        "prompt_path": "prompts/discussion/brainstorm_perspectives.md",
+                        "output_per_role": True,
+                        "gate": False,
+                    }
+                ],
+            },
+        )
+
+        assert len(first_engineer_actions.comment_on_discussion_calls) == 1
+        assert len(second_engineer_actions.comment_on_discussion_calls) == 0
+        assert len(default_actions.comment_on_discussion_calls) == 1
+        assert first_engineer_actions.comment_on_discussion_calls[0]["discussion_id"] == "D_role_output"
+        assert first_engineer_actions.comment_on_discussion_calls[0]["message"].startswith("**[engineer]**")
+        assert default_actions.comment_on_discussion_calls[0]["message"] == "Workflow complete."
+        assert result["phase"] == "brainstorm_perspectives"
 
 
 def test_phase_workflow_skips_when_completed() -> None:
@@ -519,13 +582,27 @@ def test_evaluate_design_proceeds_and_opens_gate_to_issue_breakdown() -> None:
         engine = FakeEngineProceed(actions, runtime_dir=runtime_dir)
         orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
 
-        result = orchestrator.process(_discussion_event())
+        result = orchestrator.process(_discussion_event(node_id="D_issue_breakdown_gate"))
 
         assert not result.get("terminated")
-        assert result.get("gate") == {"gate_issue_number": 100, "next_phase": "issue_breakdown"}
+        assert actions.create_issue_calls == []
+        gate_comments = [
+            call for call in actions.comment_on_discussion_calls if "**Phase `tech_review` complete.**" in call["message"]
+        ]
+        assert len(gate_comments) == 1
+        gate_comment = gate_comments[0]
+        assert gate_comment["discussion_id"] == "D_issue_breakdown_gate"
+        assert gate_comment["number"] == 5
+        gate = result.get("gate")
+        assert gate is not None
+        assert gate["gate_discussion_node_id"] == "D_issue_breakdown_gate"
+        assert gate["next_phase"] == "assumption_check"
+        assert gate["gate_posted_at"]
         final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
         assert final_instance.get_artifacts().get("final_design") == "use FastAPI"
-        assert final_instance.get_gate_issue_number() == 100
+        assert final_instance.get_gate_issue_number() is None
+        assert final_instance.get_discussion_gate_node_id() == "D_issue_breakdown_gate"
+        assert final_instance.get_gate_posted_at() == gate["gate_posted_at"]
         assert final_instance.is_completed() is False
 
 
@@ -691,9 +768,232 @@ def test_phase_gate_scanner_deduplicates_by_repo_and_issue_number() -> None:
                 "discussion_number": 5,
                 "from_phase": "tech_review",
                 "to_phase": "issue_breakdown",
+                "response_type": "unclear",
             }
         ]
         resumed = store.pop()
         assert resumed is not None
         assert resumed.metadata["advance_to_phase"] == "issue_breakdown"
         assert resumed.metadata["gate_human_comment"] == ""
+
+
+def _issue_event(action: str = "opened", **metadata: Any) -> Event:
+    return Event(
+        event_id="evt-issue-1",
+        event_type="issue_changed",
+        source="test",
+        occurred_at="2026-03-20T00:00:00Z",
+        repo="songsjun/example",
+        actor="alice",
+        url="https://example.test/issues/42",
+        title="Implement login page",
+        body="Users need to log in with email and password.",
+        target_kind="issue",
+        target_number=42,
+        metadata={"action": action, **metadata},
+    )
+
+
+def test_issue_changed_workflow_runs_on_opened() -> None:
+    """issue_changed workflow runs worker analysis when action=opened."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        result = orchestrator.process(_issue_event(action="opened"))
+
+        assert result.get("skipped") is not True
+        # Worker analysis phase should have run
+        phases = [c["prompt_path"] for c in engine.run_raw_text_handler_calls]
+        assert any("issue/worker_analysis" in p for p in phases)
+        assert result.get("phase") == "issue_analysis"
+
+
+def test_issue_changed_workflow_skips_on_edited() -> None:
+    """issue_changed workflow skips when action != opened (e.g. edited)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        result = orchestrator.process(_issue_event(action="edited"))
+
+        assert result.get("skipped") is True
+        assert "trigger_action" in result.get("reason", "")
+        assert engine.run_raw_text_handler_calls == []
+
+
+def test_issue_changed_workflow_posts_comments_on_issue() -> None:
+    """Workers post comments to the issue (not discussion) when output_per_role is true."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        orchestrator.process(_issue_event(action="opened"))
+
+        # Should have posted worker output comments to the issue
+        issue_comments = [c for c in actions.comment_calls if c.get("target_kind") == "issue"]
+        assert len(issue_comments) >= 1
+        # No discussion comments should have been posted
+        discussion_comments = actions.comment_on_discussion_calls
+        assert len(discussion_comments) == 0
+
+
+def test_issue_changed_workflow_skips_when_already_completed() -> None:
+    """Second trigger for the same issue is skipped (idempotent)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_phase("issue_analysis")
+        instance.set_completed()
+
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        result = orchestrator.process(_issue_event(action="opened"))
+
+        assert result.get("skipped") is True
+        assert result.get("reason") == "workflow_completed"
+        assert engine.run_raw_text_handler_calls == []
+
+
+def test_issue_changed_workflow_completes_after_single_pass() -> None:
+    """After running worker analysis, workflow is marked complete with no gate."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        orchestrator.process(_issue_event(action="opened"))
+
+        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert final_instance.is_completed() is True
+        assert final_instance.get_gate_next_phase() is None
+
+
+# ---------------------------------------------------------------------------
+# classify_gate_response
+# ---------------------------------------------------------------------------
+
+from github_pm_agent.phase_gate_scanner import classify_gate_response
+
+
+def test_classify_confirm_keywords() -> None:
+    for text in ["ok", "确认", "LGTM", "yes proceed", "好的"]:
+        assert classify_gate_response(text) == "confirm", f"expected confirm for {text!r}"
+
+
+def test_classify_reject_keywords() -> None:
+    for text in ["no", "不对", "reject", "redo", "start over", "nope"]:
+        assert classify_gate_response(text) == "reject", f"expected reject for {text!r}"
+
+
+def test_classify_confirm_revise_requires_explicit_confirm() -> None:
+    """confirm_revise needs a confirm keyword plus a revise signal."""
+    assert classify_gate_response("ok but also add dark mode") == "confirm_revise"
+    assert classify_gate_response("确认，另外加上登录功能") == "confirm_revise"
+    assert classify_gate_response("yes, but change the approach") == "confirm_revise"
+
+
+def test_classify_long_reply_without_confirm_is_unclear() -> None:
+    """Long replies with no confirm keyword must be 'unclear', not auto-confirm_revise."""
+    long_rejection = "我觉得这个方向完全错了，需要从头重新考虑，整个设计都有问题，请重新来过"
+    result = classify_gate_response(long_rejection)
+    # Should NOT be confirm_revise — no explicit confirm keyword
+    assert result in ("unclear", "reject"), f"got {result!r} for ambiguous long reply"
+
+    vague_long = "I think we should probably reconsider the overall direction here completely"
+    result2 = classify_gate_response(vague_long)
+    assert result2 == "unclear", f"got {result2!r} for vague long reply with no confirm"
+
+
+def test_classify_empty_is_unclear() -> None:
+    assert classify_gate_response("") == "unclear"
+    assert classify_gate_response("   ") == "unclear"
+
+
+# ---------------------------------------------------------------------------
+# combined artifact injection
+# ---------------------------------------------------------------------------
+
+
+def test_slot_phase_saves_combined_artifact() -> None:
+    """After a slot-based output_per_role phase, {phase}_combined artifact is saved."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        actions = RecordingActions()
+
+        call_index = [0]
+
+        class FakeEngineSlots(FakeEngine):
+            def run_raw_text_handler(self, event: Any, prompt_path: str, role: str = "pm", variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                call_index[0] += 1
+                return {"raw_text": f"output from slot {call_index[0]}"}
+
+        engine = FakeEngineSlots(actions, runtime_dir=runtime_dir)
+        agent_configs = [
+            {"id": "w1", "role": "worker", "worker_index": 1},
+            {"id": "w2", "role": "worker", "worker_index": 2},
+        ]
+        orchestrator = WorkflowOrchestrator(
+            _project_root(), engine, actions, FakeClient({}), {}, agent_configs=agent_configs
+        )
+
+        orchestrator._process_phase_workflow(
+            _discussion_event(node_id="D_combined"),
+            {
+                "event_type": "discussion",
+                "steps": [
+                    {
+                        "phase": "problem_framing",
+                        "slots": 2,
+                        "prompt_path": "prompts/discussion/problem_framing.md",
+                        "output_per_role": True,
+                        "gate": False,
+                    }
+                ],
+            },
+        )
+
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        combined = instance.get_artifacts().get("problem_framing_combined")
+        assert combined is not None, "combined artifact must be saved"
+        assert "output from slot 1" in combined
+        assert "output from slot 2" in combined
+        assert "---" in combined  # separator between slots
+
+
+def test_single_executor_phase_does_not_save_combined_artifact() -> None:
+    """A single-role phase (no slots) should NOT save a _combined artifact."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        orchestrator._process_phase_workflow(
+            _discussion_event(node_id="D_single"),
+            {
+                "event_type": "discussion",
+                "steps": [
+                    {
+                        "phase": "brainstorm",
+                        "roles": ["pm"],
+                        "prompt_path": "prompts/discussion/brainstorm.md",
+                        "output_per_role": True,
+                        "gate": False,
+                    }
+                ],
+            },
+        )
+
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        artifacts = instance.get_artifacts()
+        assert "brainstorm_combined" not in artifacts

@@ -1,0 +1,46 @@
+github:
+  repos:
+    - songsjun/StudyBuddy
+  default_branch: main
+  owner: sjunsong           # 收到 @mention，在 gate 节点做确认
+  gh_path: gh
+
+agents:
+  - id: pm
+    role: pm
+    token_env: GITHUB_TOKEN_PM         # takes priority when set
+    gh_user: songsjun                  # fallback: gh auth token --user songsjun
+    priority: 1
+    participates_in:
+      pull_request_changed: observe
+      issue_changed: respond
+
+  - id: otter
+    role: worker
+    worker_index: 1
+    token_env: GITHUB_TOKEN_OTTER
+    gh_user: otter9527
+
+  - id: kapy
+    role: worker
+    worker_index: 2
+    token_env: GITHUB_TOKEN_KAPY
+    gh_user: kapy9250
+
+engine:
+  dry_run: false
+  continue_on_error: true
+  supervisor_enabled: false
+
+ai:
+  default_provider: codex
+  providers:
+    codex:
+      type: cli_script
+      script: scripts/run_ai_cli.py
+      provider_name: codex
+      default_model: gpt-5.4
+      codex_path: /opt/homebrew/bin/codex
+      reasoning_effort: low
+
+runtime_dir: .runtime-studybuddy

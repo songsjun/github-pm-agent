@@ -9,31 +9,42 @@ github:
 
 # 每个 agent 是一个独立身份（对应一个 GitHub 账户）
 # token_env: 环境变量名，持有该账户的 GITHUB_TOKEN
-# participates_in: 指定参与哪些事件类型，以及以何种模式（respond/observe/veto）
+#
+# --- Worker 模型（推荐用于新项目）---
+# role: worker + worker_index: N
+# Worker 在 discussion workflow 中按 slot 自动认领任务
+# PM 在 prompt 里定义每个 slot 的角色，worker 按序号计算自己负责哪些 slot
+# 更多 worker = 并行更快；更少 worker = 每人承担多个 slot
+#
+# --- 经典角色模型（向后兼容）---
+# role: engineer / security + participates_in 事件订阅
 agents:
-  - id: engineer
-    role: engineer
-    token_env: GITHUB_TOKEN_ENGINEER   # export GITHUB_TOKEN_ENGINEER=ghp_xxx
-    priority: 1
-    participates_in:
-      pull_request_changed: respond
-      issue_changed: respond
-
   - id: pm
     role: pm
     token_env: GITHUB_TOKEN_PM         # export GITHUB_TOKEN_PM=ghp_xxx
-    priority: 2
+    priority: 1
     participates_in:
       pull_request_changed: observe
       issue_changed: respond
 
+  # Worker 模型：每个 worker 只需 worker_index，不需要 participates_in
+  - id: kapy
+    role: worker
+    worker_index: 1
+    token_env: GITHUB_TOKEN_KAPY       # export GITHUB_TOKEN_KAPY=ghp_xxx
+
+  - id: otter
+    role: worker
+    worker_index: 2
+    token_env: GITHUB_TOKEN_OTTER      # export GITHUB_TOKEN_OTTER=ghp_xxx
+
+  # 可选：继续保留经典角色用于 PR/issue 事件
   - id: security
     role: security
     token_env: GITHUB_TOKEN_SECURITY   # export GITHUB_TOKEN_SECURITY=ghp_xxx
     priority: 3
     participates_in:
       pull_request_changed: veto
-      # security 不参与 issue_changed
 
 engine:
   dry_run: true                        # 先 true 观察，确认后改 false

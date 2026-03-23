@@ -63,10 +63,61 @@ class WorkflowInstance:
             self._state["gate_next_phase"] = next_phase
         self._save()
 
+    def set_discussion_gate(self, node_id: str, posted_at: str, next_phase: str) -> None:
+        """Gate tracked via Discussion comment (no issue created)."""
+        self._state["gate_discussion_node_id"] = node_id
+        self._state["gate_posted_at"] = posted_at
+        self._state["gate_next_phase"] = next_phase
+        self._save()
+
+    def get_discussion_gate_node_id(self) -> Optional[str]:
+        return self._state.get("gate_discussion_node_id")
+
+    def get_gate_posted_at(self) -> Optional[str]:
+        return self._state.get("gate_posted_at")
+
     def clear_gate(self) -> None:
         self._state.pop("gate_issue_number", None)
         self._state.pop("gate_next_phase", None)
+        self._state.pop("gate_discussion_node_id", None)
+        self._state.pop("gate_posted_at", None)
         self._save()
+
+    # --- Clarification (intra-phase suspension) ---
+
+    def set_clarification(self, phase: str, posted_at: str, node_id: str = "") -> None:
+        """Record that we've posted clarification questions and are waiting for owner reply."""
+        self._state["clarification_phase"] = phase
+        self._state["clarification_posted_at"] = posted_at
+        if node_id:
+            self._state["clarification_node_id"] = node_id
+        self._save()
+
+    def get_clarification(self) -> Optional[Dict[str, Any]]:
+        if "clarification_phase" not in self._state:
+            return None
+        return {
+            "phase": self._state["clarification_phase"],
+            "posted_at": self._state["clarification_posted_at"],
+            "node_id": self._state.get("clarification_node_id", ""),
+        }
+
+    def clear_clarification(self) -> None:
+        self._state.pop("clarification_phase", None)
+        self._state.pop("clarification_posted_at", None)
+        self._state.pop("clarification_node_id", None)
+        self._save()
+
+    def is_awaiting_clarification(self) -> bool:
+        return "clarification_phase" in self._state
+
+    def add_user_supplement(self, phase: str, content: str) -> None:
+        """Accumulate owner additions/changes across gate confirmations."""
+        self._state.setdefault("user_supplements", []).append({"phase": phase, "content": content})
+        self._save()
+
+    def get_user_supplements(self) -> list:
+        return list(self._state.get("user_supplements", []))
 
     def add_pending_comment(self, comment: str) -> None:
         self._state.setdefault("pending_comments", []).append(comment)

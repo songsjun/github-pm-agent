@@ -1,20 +1,57 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 
+logger = logging.getLogger(__name__)
+
 
 class GitHubClient:
-    def __init__(self, gh_path: str, repo: str, token_env: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        gh_path: str,
+        repo: str,
+        token_env: Optional[str] = None,
+        gh_user: Optional[str] = None,
+    ) -> None:
         self.gh_path = gh_path
         self.repo = repo
         self.token_env = token_env
+        self.gh_user = gh_user
+
+    def _resolve_token(self) -> Optional[str]:
+        """Return an auth token: env var takes priority, then `gh auth token --user`."""
+        if self.token_env:
+            token = os.environ.get(self.token_env)
+            if token:
+                return token
+            logger.warning(
+                "token_env %r is configured but the environment variable is not set; "
+                "falling back to gh_user %r — verify the secret is injected correctly.",
+                self.token_env,
+                self.gh_user,
+            )
+        if self.gh_user:
+            try:
+                result = subprocess.run(
+                    [self.gh_path, "auth", "token", "--user", self.gh_user],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                token = result.stdout.strip()
+                if token:
+                    return token
+            except subprocess.CalledProcessError:
+                pass
+        return None
 
     def _run(self, args: List[str]) -> str:
         command = [self.gh_path] + args
-        token = os.environ.get(self.token_env) if self.token_env else None
+        token = self._resolve_token()
         if token:
             env = {**os.environ, "GITHUB_TOKEN": token}
             result = subprocess.run(command, check=True, capture_output=True, text=True, env=env)
@@ -44,7 +81,12 @@ class GitHubClient:
     def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Any:
         args = ["api", "graphql", "-f", f"query={query}"]
         for key, value in (variables or {}).items():
-            args.extend(["-F", f"{key}={value}"])
+            # Use -f (string literal) for str values to avoid gh treating @-prefixed
+            # values as file paths. Use -F (typed) for int/bool.
+            if isinstance(value, (int, bool)):
+                args.extend(["-F", f"{key}={value}"])
+            else:
+                args.extend(["-f", f"{key}={value}"])
         output = self._run(args)
         if not output:
             return {}
@@ -236,6 +278,70 @@ class GitHubClient:
             if value is not None:
                 params[key] = value
         return self.api(f"repos/{self.repo}/releases", params, method="POST")
+
+    def get_discussion_comments(self, owner: str, name: str, number: int) -> List[Dict[str, Any]]:
+        query = """
+        query($owner: String!, $name: String!, $number: Int!) {
+          repository(owner: $owner, name: $name) {
+            discussion(number: $number) {
+              comments(last: 100) {
+                nodes {
+                  body
+                  createdAt
+                  author { login }
+                  replies(last: 10) {
+                    nodes {
+                      body
+                      createdAt
+                      author { login }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+        result = self.graphql(query, {"owner": owner, "name": name, "number": number})
+        if not isinstance(result, dict):
+            return []
+        nodes = (
+            result.get("data", {})
+            .get("repository", {})
+            .get("discussion", {})
+            .get("comments", {})
+            .get("nodes", [])
+        )
+        if not isinstance(nodes, list):
+            return []
+
+        flat_comments: List[Dict[str, Any]] = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            flat_comments.append(
+                {
+                    "body": node.get("body"),
+                    "createdAt": node.get("createdAt"),
+                    "author": node.get("author"),
+                }
+            )
+            reply_nodes = (node.get("replies") or {}).get("nodes", [])
+            if not isinstance(reply_nodes, list):
+                continue
+            for reply in reply_nodes:
+                if not isinstance(reply, dict):
+                    continue
+                flat_comments.append(
+                    {
+                        "body": reply.get("body"),
+                        "createdAt": reply.get("createdAt"),
+                        "author": reply.get("author"),
+                    }
+                )
+
+        flat_comments.sort(key=lambda comment: comment.get("createdAt", ""))
+        return flat_comments
 
     def add_discussion_comment(self, discussion_id: str, body: str) -> Dict[str, Any]:
         mutation = """

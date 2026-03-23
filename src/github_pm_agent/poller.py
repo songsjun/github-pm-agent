@@ -207,6 +207,8 @@ class GitHubPoller:
                 if not self._is_newer_than(occurred_at, since_dt):
                     continue
                 target_kind = "pull_request" if item.get("pull_request") else "issue"
+                created_at = _first_timestamp(item.get("created_at"))
+                action = "opened" if self._is_newer_than(created_at, since_dt) else "edited"
                 event = Event(
                     event_id=_event_id(event_type, item["id"], occurred_at),
                     event_type=event_type,
@@ -220,6 +222,7 @@ class GitHubPoller:
                     target_kind=target_kind,
                     target_number=item.get("number"),
                     metadata={
+                        "action": action,
                         "state": item.get("state"),
                         "state_reason": item.get("state_reason"),
                         "labels": [(label or {}).get("name") for label in item.get("labels", [])],
