@@ -60,3 +60,10 @@ ai:
       default_model: codex-1
 
 runtime_dir: .runtime
+
+# DevEnv — Docker 容器执行环境（用于编码工作流的测试验证）
+# server_url: DevEnv 服务地址（也可通过 DEVENV_SERVER 环境变量覆盖）
+# base_image: 容器基础镜像，默认 python:3.12-slim
+devenv:
+  server_url: http://192.168.26.153:7070   # export DEVENV_SERVER=http://...
+  base_image: python:3.12-slim             # 可换成 node:20-slim、golang:1.22 等

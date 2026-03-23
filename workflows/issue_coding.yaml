@@ -1,0 +1,34 @@
+event_type: issue_changed
+trigger_action: labeled
+trigger_label: ready-to-code
+
+steps:
+  # Phase 1: Workers implement the code from the issue description
+  # Slot 1 generates the coding plan (files + test_command + branch_name etc.)
+  - phase: implement
+    slots: 1
+    prompt_path: prompts/coding/implement.md
+    action: coding_session
+    gate: false
+
+  # Phase 2: Workers review the PR from two angles
+  # slot 1 — Correctness & Edge Cases, slot 2 — Design & Maintainability
+  - phase: code_review
+    slots: 2
+    prompt_path: prompts/coding/code_review.md
+    output_per_role: true
+    gate: false
+
+  # Phase 3: Worker runs tests and reports result
+  - phase: test_verify
+    slots: 1
+    prompt_path: prompts/coding/test_verify.md
+    action: run_tests
+    gate: false
+
+  # Phase 4: PM decides to merge or reopen
+  - phase: pm_decision
+    roles: [pm]
+    prompt_path: prompts/coding/pm_decision.md
+    action: merge_or_reopen
+    gate: true
