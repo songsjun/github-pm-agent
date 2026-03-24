@@ -237,17 +237,44 @@ class CodingSession:
             self._run_command(["git", "commit", "-m", plan.commit_message], cwd=self.work_dir)
 
         self._branch_name = branch_name
-        self._run_command(["git", "push", "origin", branch_name], cwd=self.work_dir)
+
+        # Rebase on the latest main so the PR stays conflict-free for merge.
+        logger.info("Rebasing fix branch %s on origin/main for %s#%s", branch_name, self.repo, self.issue_number)
+        self._run_command(["git", "fetch", "origin", "main"], cwd=self.work_dir)
+        rebase_result = self._run_command(
+            ["git", "rebase", "origin/main"], cwd=self.work_dir, check=False
+        )
+        if rebase_result.returncode != 0:
+            logger.warning("Rebase failed for fix branch %s — aborting and pushing as-is", branch_name)
+            self._run_command(["git", "rebase", "--abort"], cwd=self.work_dir, check=False)
+            self._run_command(["git", "push", "origin", branch_name], cwd=self.work_dir)
+        else:
+            self._run_command(
+                ["git", "push", "origin", branch_name, "--force-with-lease"], cwd=self.work_dir
+            )
 
     def push_branch(self) -> str:
         """
-        git push origin {branch_name}
+        Rebase the branch on the latest origin/main, then push.
+        Rebasing keeps the PR conflict-free so the PM can merge cleanly.
         Returns the branch name.
         """
 
         branch_name = self._current_branch_name()
-        logger.info("Pushing branch %s for %s#%s", branch_name, self.repo, self.issue_number)
-        self._run_command(["git", "push", "origin", branch_name], cwd=self.work_dir)
+        logger.info("Rebasing branch %s on origin/main for %s#%s", branch_name, self.repo, self.issue_number)
+        self._run_command(["git", "fetch", "origin", "main"], cwd=self.work_dir)
+        rebase_result = self._run_command(
+            ["git", "rebase", "origin/main"], cwd=self.work_dir, check=False
+        )
+        if rebase_result.returncode != 0:
+            logger.warning("Rebase failed for %s — aborting rebase and pushing as-is", branch_name)
+            self._run_command(["git", "rebase", "--abort"], cwd=self.work_dir, check=False)
+            self._run_command(["git", "push", "origin", branch_name], cwd=self.work_dir)
+        else:
+            # Force push after rebase to update the remote branch.
+            self._run_command(
+                ["git", "push", "origin", branch_name, "--force-with-lease"], cwd=self.work_dir
+            )
         return branch_name
 
     def create_pr(self, title: str, body: str, base_branch: str = "main") -> dict[str, Any]:

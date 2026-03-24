@@ -478,7 +478,9 @@ class WorkflowOrchestrator:
                     devenv_cfg = self.config.get("devenv", {})
                     server_url = devenv_cfg.get("server_url", "")
                     base_image = devenv_cfg.get("base_image", "python:3.12-slim")
-                    github_token = (event.metadata or {}).get("github_token") or self.config.get("github", {}).get("token", "")
+                    # Use worker's token for git push so the PM (different token) can
+                    # approve the PR without hitting "last pusher cannot self-approve".
+                    github_token = (event.metadata or {}).get("github_token") or self._get_worker_github_token(executors)
                     base_branch = self.config.get("github", {}).get("default_branch", "main")
 
                     previous_iteration = instance.get_artifacts().get("coding_iteration", 0)
@@ -716,7 +718,8 @@ class WorkflowOrchestrator:
                     devenv_cfg = self.config.get("devenv", {})
                     server_url = devenv_cfg.get("server_url", "")
                     base_image = devenv_cfg.get("base_image", "python:3.12-slim")
-                    github_token = (event.metadata or {}).get("github_token") or self.config.get("github", {}).get("token", "")
+                    # Use worker's token so PM (different account) can approve the PR.
+                    github_token = (event.metadata or {}).get("github_token") or self._get_worker_github_token(executors)
 
                     session = CodingSession(
                         DevEnvClient(server_url=server_url),
@@ -1068,6 +1071,35 @@ class WorkflowOrchestrator:
         # Legacy roles-based dispatch
         roles = step.get("roles", ["pm"])
         return [{"role": role, "agent_id": None, "label": role, "extra_vars": {}} for role in roles]
+
+    def _get_worker_github_token(self, executors: List[Dict[str, Any]]) -> str:
+        """Resolve the GitHub token for the first worker executor in the step.
+
+        Worker agents push code to GitHub. Using the worker's own token (separate
+        from the PM's token) ensures the PR reviewer (PM) is a different GitHub user
+        than the last pusher (worker), satisfying the "require approval from someone
+        other than last pusher" branch protection rule.
+
+        Falls back to the config ``github.token`` or empty string if no worker token
+        is configured.
+        """
+        import os
+        for executor in executors:
+            agent_id = executor.get("agent_id")
+            if not agent_id:
+                continue
+            agent_cfg = next(
+                (a for a in self.agent_configs if isinstance(a, dict) and a.get("id") == agent_id),
+                None,
+            )
+            if agent_cfg is None:
+                continue
+            token_env = agent_cfg.get("token_env")
+            if token_env:
+                token = os.environ.get(token_env, "")
+                if token:
+                    return token
+        return self.config.get("github", {}).get("token", "")
 
     def _collect_blocking_unknowns(self, ai_outputs: List[Dict[str, Any]], phase: str) -> List[str]:
         """Extract blocking_unknowns from worker outputs in the given phase.
