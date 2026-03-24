@@ -417,6 +417,203 @@ class WorkflowOrchestrator:
                     # Don't advance on error — break without set_completed to allow retry
                     break
                 step_succeeded = True
+            elif step.get("action") == "coding_session":
+                try:
+                    from github_pm_agent.coding_session import CodingSession
+                    from github_pm_agent.devenv_client import DevEnvClient
+                    from github_pm_agent.utils import append_jsonl
+
+                    plan = CodingSession.parse_plan(last_content)
+                    if plan is None:
+                        self.actions.comment("issue", event.target_number, "Failed to parse coding plan from AI output")
+                        break
+
+                    devenv_cfg = self.config.get("devenv", {})
+                    server_url = devenv_cfg.get("server_url", "")
+                    base_image = devenv_cfg.get("base_image", "python:3.12-slim")
+                    github_token = (event.metadata or {}).get("github_token") or self.config.get("github", {}).get("token", "")
+                    base_branch = self.config.get("github", {}).get("default_branch", "main")
+
+                    previous_iteration = instance.get_artifacts().get("coding_iteration", 0)
+                    if not isinstance(previous_iteration, int):
+                        previous_iteration = int(previous_iteration) if str(previous_iteration).isdigit() else 0
+
+                    session = CodingSession(
+                        DevEnvClient(server_url=server_url),
+                        repo=event.repo,
+                        issue_number=event.target_number,
+                        github_token=github_token,
+                        base_image=base_image,
+                    )
+                    session.iteration = max(previous_iteration + 1, 1)
+
+                    coding_result: Dict[str, Any] = {}
+                    should_break = False
+                    failure_comment = ""
+                    error_message = ""
+
+                    try:
+                        session.setup()
+                        session.apply_plan(plan)
+                        test_result = session.run_tests(plan)
+                        test_result_data = {
+                            "passed": test_result.passed,
+                            "summary": test_result.summary,
+                            "stdout": test_result.stdout,
+                            "stderr": test_result.stderr,
+                        }
+                        instance.set_artifact("test_result", test_result_data)
+                        instance.set_artifact("coding_iteration", session.iteration)
+
+                        pr_body = (
+                            f"Closes #{event.target_number}\n\n"
+                            f"## Summary\n\n"
+                            f"AI-generated implementation for issue #{event.target_number}.\n\n"
+                            f"**Branch:** `{plan.branch_name}`\n"
+                            f"**Iterations:** {session.iteration}"
+                        )
+                        coding_result = {
+                            "pr_number": None,
+                            "pr_url": "",
+                            "branch_name": plan.branch_name,
+                            "test_passed": test_result.passed,
+                            "iteration": session.iteration,
+                        }
+
+                        if test_result.passed:
+                            branch_name = session.push_branch()
+                            pr = session.create_pr(plan.commit_message, pr_body, base_branch)
+                            instance.set_artifact("pr_number", pr.get("number"))
+                            instance.set_artifact("pr_url", pr.get("url"))
+                            instance.set_artifact("branch_name", branch_name)
+                            instance.set_artifact("test_failure_context", "")
+                            coding_result.update(
+                                {
+                                    "pr_number": pr.get("number"),
+                                    "pr_url": pr.get("url"),
+                                    "branch_name": branch_name,
+                                }
+                            )
+                        elif session.iteration < session.MAX_ITERATIONS:
+                            failure_context = (
+                                f"Iteration: {session.iteration}\n"
+                                f"Summary: {test_result.summary}\n\n"
+                                f"stdout:\n```\n{test_result.stdout[-3000:] if test_result.stdout else ''}\n```\n\n"
+                                f"stderr:\n```\n{test_result.stderr[-3000:] if test_result.stderr else ''}\n```"
+                            )
+                            instance.set_artifact("test_failure_context", failure_context)
+                            original_event = instance.get_original_event() or event.to_dict()
+                            resumed_metadata = dict(original_event.get("metadata", {}))
+                            resumed_metadata["advance_to_phase"] = "implement"
+                            resumed_metadata["artifacts"] = instance.get_artifacts()
+                            append_jsonl(
+                                self.engine.runtime_dir / "queue_pending.jsonl",
+                                {**original_event, "metadata": resumed_metadata},
+                            )
+                            should_break = True
+                        else:
+                            failure_comment = (
+                                f"Tests failed after {session.iteration} iteration(s).\n\n"
+                                f"{test_result.summary}"
+                            )
+                            should_break = True
+                    except Exception as exc:  # noqa: BLE001
+                        error_message = str(exc)
+                    finally:
+                        cleanup_error = ""
+                        try:
+                            session.cleanup()
+                        except Exception as exc:  # noqa: BLE001
+                            cleanup_error = str(exc)
+                        if cleanup_error:
+                            if error_message:
+                                error_message = f"{error_message}; cleanup failed: {cleanup_error}"
+                            else:
+                                error_message = f"cleanup failed: {cleanup_error}"
+
+                    if error_message:
+                        self.actions.comment("issue", event.target_number, f"Coding session failed: {error_message}")
+                        break
+
+                    if failure_comment:
+                        self.actions.comment("issue", event.target_number, failure_comment)
+
+                    self.actions.coding_session(
+                        issue_number=event.target_number,
+                        repo=event.repo,
+                        branch_name=plan.branch_name,
+                        pr_title=plan.commit_message,
+                        pr_body=pr_body,
+                        base_branch=base_branch,
+                        coding_result=coding_result,
+                    )
+                    if should_break:
+                        break
+                    step_succeeded = True
+                except Exception as exc:  # noqa: BLE001
+                    self.actions.comment("issue", event.target_number, f"Coding session failed: {exc}")
+                    break
+            elif step.get("action") == "run_tests":
+                artifacts = instance.get_artifacts()
+                pr_number = artifacts.get("pr_number")
+                if not isinstance(pr_number, int):
+                    pr_number = int(pr_number) if str(pr_number).isdigit() else None
+                if pr_number is None:
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "Skipping run_tests action for %s#%s: missing pr_number artifact",
+                        event.repo,
+                        event.target_number,
+                    )
+                    step_succeeded = True
+                else:
+                    test_result_data = artifacts.get("test_result", {})
+                    if not isinstance(test_result_data, dict):
+                        test_result_data = {}
+                    self.actions.run_tests(
+                        pr_number=pr_number,
+                        test_passed=test_result_data.get("passed", False),
+                        test_summary=test_result_data.get("summary", ""),
+                        stdout=test_result_data.get("stdout", ""),
+                        stderr=test_result_data.get("stderr", ""),
+                    )
+                    step_succeeded = True
+            elif step.get("action") == "merge_or_reopen":
+                from github_pm_agent.utils import extract_json_object
+
+                parsed = extract_json_object(last_content)
+                decision = "reopen"
+                reason = last_content.strip()
+                reopen_comment = ""
+                if isinstance(parsed, dict):
+                    decision = str(parsed.get("decision", "reopen")).strip().lower() or "reopen"
+                    reason = str(parsed.get("reason", reason)).strip()
+                    reopen_comment = str(parsed.get("reopen_comment", "")).strip()
+
+                artifacts = instance.get_artifacts()
+                pr_number = artifacts.get("pr_number")
+                if not isinstance(pr_number, int):
+                    pr_number = int(pr_number) if str(pr_number).isdigit() else None
+                issue_number = event.target_number
+                if pr_number is None:
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "Skipping merge_or_reopen action for %s#%s: missing pr_number artifact",
+                        event.repo,
+                        event.target_number,
+                    )
+                    step_succeeded = True
+                else:
+                    self.actions.merge_or_reopen(
+                        pr_number=pr_number,
+                        issue_number=issue_number,
+                        decision=decision,
+                        reason=reason,
+                        reopen_comment=reopen_comment or reason,
+                    )
+                    step_succeeded = True
             else:
                 step_succeeded = True
 

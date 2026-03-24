@@ -168,6 +168,95 @@ class GitHubActionToolkit:
             return self._record_and_execute(action)
         return self._record_and_execute(action, lambda: self.client.pull_request_merge(target_number, params))
 
+    def coding_session(
+        self,
+        issue_number: int,
+        repo: str,
+        branch_name: str,
+        pr_title: str,
+        pr_body: str,
+        base_branch: str,
+        coding_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        action = {
+            "action_type": "coding_session",
+            "target_kind": "issue",
+            "target_number": issue_number,
+            "repo": repo,
+            "branch_name": branch_name,
+            "pr_title": pr_title,
+            "pr_body": pr_body,
+            "base_branch": base_branch,
+            "coding_result": dict(coding_result or {}),
+            "dry_run": self.dry_run,
+        }
+        return self._record_and_execute(action)
+
+    def run_tests(
+        self,
+        pr_number: Optional[int],
+        test_passed: bool,
+        test_summary: str,
+        stdout: str,
+        stderr: str,
+    ) -> Dict[str, Any]:
+        message = (
+            f"## Test Results\n\n"
+            f"{'✅ Tests passed' if test_passed else '❌ Tests failed'}\n\n"
+            f"**Summary:** {test_summary}\n\n"
+            f"<details><summary>Output</summary>\n\n"
+            f"```\n{stdout[-3000:] if stdout else ''}\n```\n\n"
+            f"</details>"
+        )
+        action = {
+            "action_type": "run_tests",
+            "target_kind": "pull_request",
+            "target_number": pr_number,
+            "test_passed": test_passed,
+            "test_summary": test_summary,
+            "stdout": stdout,
+            "stderr": stderr,
+            "message": message,
+            "dry_run": self.dry_run,
+        }
+        if not pr_number:
+            return self._record_and_execute(action)
+        return self._record_and_execute(action, lambda: self.client.issue_comment(pr_number, message))
+
+    def merge_or_reopen(
+        self,
+        pr_number: Optional[int],
+        issue_number: Optional[int],
+        decision: str,
+        reason: str,
+        reopen_comment: str = "",
+    ) -> Dict[str, Any]:
+        decision = (decision or "").strip().lower()
+        action = {
+            "action_type": "merge_or_reopen",
+            "target_kind": "pull_request",
+            "target_number": pr_number,
+            "issue_number": issue_number,
+            "decision": decision,
+            "reason": reason,
+            "reopen_comment": reopen_comment,
+            "dry_run": self.dry_run,
+        }
+        if decision == "merge" and pr_number:
+            return self._record_and_execute(
+                action,
+                lambda: self.client.pull_request_merge(pr_number, {"merge_method": "squash"}),
+            )
+        if decision == "reopen" and issue_number:
+            return self._record_and_execute(
+                action,
+                lambda: {
+                    "comment": self.client.issue_comment(issue_number, reopen_comment),
+                    "labels_removed": self.client.issue_labels_remove(issue_number, ["ready-to-code"]),
+                },
+            )
+        return self._record_and_execute(action)
+
     def edit(self, target_kind: str, target_number: Optional[int], fields: Dict[str, Any]) -> Dict[str, Any]:
         fields = {key: value for key, value in dict(fields or {}).items() if value is not None}
         action = {
