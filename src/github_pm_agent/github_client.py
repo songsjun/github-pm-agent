@@ -186,6 +186,24 @@ class GitHubClient:
             method="POST",
         )
 
+    def get_pr_diff(self, pr_number: int) -> str:
+        """Return the unified diff of a pull request (up to ~100 KB)."""
+        try:
+            return self._run(
+                ["api", f"repos/{self.repo}/pulls/{pr_number}",
+                 "--accept", "application/vnd.github.v3.diff"]
+            )
+        except subprocess.CalledProcessError:
+            return ""
+
+    def submit_pr_review(self, pr_number: int, event: str, body: str = "") -> None:
+        """Submit a PR review with event=APPROVE | REQUEST_CHANGES | COMMENT."""
+        self.api(
+            f"repos/{self.repo}/pulls/{pr_number}/reviews",
+            {"event": event, "body": body},
+            method="POST",
+        )
+
     def issue_labels_remove(self, number: int, labels: Iterable[str]) -> None:
         for label in labels:
             try:

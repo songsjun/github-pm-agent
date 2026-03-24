@@ -193,6 +193,52 @@ class CodingSession:
             raise RuntimeError("test execution finished without a result")
         return result
 
+    def fix_and_push(self, plan: CodingPlan) -> None:
+        """
+        Apply fix files to the EXISTING feature branch (fetched from origin) and push.
+        Does NOT create a new PR — updates the existing one in-place.
+
+        1. Fetch the remote branch
+        2. Checkout locally (tracking remote)
+        3. Write all files in plan.files
+        4. Commit (if there are staged changes)
+        5. Push to origin
+        """
+        self._ensure_repo_ready()
+        branch_name = plan.branch_name
+        logger.info("Applying fix on existing branch %s for %s#%s", branch_name, self.repo, self.issue_number)
+
+        self._run_command(["git", "fetch", "origin", branch_name], cwd=self.work_dir)
+
+        branch_exists_locally = (
+            self._run_command(
+                ["git", "rev-parse", "--verify", branch_name], cwd=self.work_dir, check=False
+            ).returncode == 0
+        )
+        if branch_exists_locally:
+            self._run_command(["git", "checkout", branch_name], cwd=self.work_dir)
+            self._run_command(["git", "reset", "--hard", f"origin/{branch_name}"], cwd=self.work_dir)
+        else:
+            self._run_command(
+                ["git", "checkout", "-b", branch_name, f"origin/{branch_name}"],
+                cwd=self.work_dir,
+            )
+
+        for file_spec in plan.files:
+            destination = self._resolve_repo_path(file_spec["path"])
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(file_spec["content"], encoding="utf-8")
+
+        self._run_command(["git", "add", "-A"], cwd=self.work_dir)
+        diff_check = self._run_command(
+            ["git", "diff", "--cached", "--quiet"], cwd=self.work_dir, check=False
+        )
+        if diff_check.returncode == 1:  # staged changes exist
+            self._run_command(["git", "commit", "-m", plan.commit_message], cwd=self.work_dir)
+
+        self._branch_name = branch_name
+        self._run_command(["git", "push", "origin", branch_name], cwd=self.work_dir)
+
     def push_branch(self) -> str:
         """
         git push origin {branch_name}

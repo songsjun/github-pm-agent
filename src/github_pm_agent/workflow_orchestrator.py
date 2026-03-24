@@ -323,7 +323,18 @@ class WorkflowOrchestrator:
                 variables["test_results"] = ""
             variables["pr_number"] = str(artifacts.get("pr_number") or "")
             variables["pr_url"] = str(artifacts.get("pr_url") or "")
+            variables["review_round"] = str(instance.get_review_round())
             variables["test_failure_context"] = str(artifacts.get("test_failure_context") or "")
+            # Fetch live PR diff for code_review and fix_iteration phases
+            _raw_pr_num = artifacts.get("pr_number", "")
+            _pr_num_int = int(str(_raw_pr_num)) if str(_raw_pr_num).strip().isdigit() else None
+            if _pr_num_int and current_phase in ("code_review", "fix_iteration"):
+                try:
+                    variables["pr_diff"] = self.client.get_pr_diff(_pr_num_int)
+                except Exception:
+                    variables["pr_diff"] = ""
+            else:
+                variables["pr_diff"] = ""
             human_comment = meta.get("gate_human_comment", "")
             variables["human_comment"] = f"Human feedback:\n{human_comment}\n" if human_comment else ""
             pending = instance.get_pending_comments()
@@ -616,6 +627,163 @@ class WorkflowOrchestrator:
                         stderr=test_result_data.get("stderr", ""),
                     )
                     step_succeeded = True
+            elif step.get("action") == "check_review_result":
+                # Decide whether to approve/advance or loop back for fixes.
+                from github_pm_agent.utils import append_jsonl
+
+                artifacts = instance.get_artifacts()
+                combined_review = (
+                    artifacts.get("code_review_combined")
+                    or artifacts.get("code_review", "")
+                )
+                review_round = instance.get_review_round()
+                MAX_REVIEW_ROUNDS = 3
+                original_event = instance.get_original_event() or event.to_dict()
+
+                def _has_blocking(text: str) -> bool:
+                    lower = text.lower()
+                    return (
+                        "**blocking**" in lower
+                        or "severity: blocking" in lower
+                        or "severity**:** blocking" in lower
+                    )
+
+                _raw_pr = artifacts.get("pr_number", "")
+                _pr_num = int(str(_raw_pr)) if str(_raw_pr).strip().isdigit() else None
+
+                if not _has_blocking(combined_review):
+                    # LGTM or warnings only → approve PR, advance to pm_decision
+                    if _pr_num:
+                        try:
+                            self.actions.submit_pr_review(
+                                _pr_num, "APPROVE",
+                                "Automated code review passed — no blocking issues found."
+                            )
+                        except Exception:
+                            pass  # best-effort; branch protection may still block merge
+                    resumed_metadata = dict(original_event.get("metadata", {}))
+                    resumed_metadata["advance_to_phase"] = "pm_decision"
+                    resumed_metadata["artifacts"] = instance.get_artifacts()
+                    append_jsonl(
+                        self.engine.runtime_dir / "queue_pending.jsonl",
+                        {**original_event, "metadata": resumed_metadata},
+                    )
+                elif review_round >= MAX_REVIEW_ROUNDS:
+                    # Too many rounds — close PR, terminate, flag for human
+                    escalation_msg = (
+                        f"Code review found blocking issues after {review_round} round(s). "
+                        f"Automated fix limit reached — manual intervention required.\n\n"
+                        f"Latest review:\n{combined_review[:1500]}"
+                    )
+                    self.actions.comment("issue", event.target_number, escalation_msg)
+                    if _pr_num:
+                        try:
+                            self.client.api(
+                                f"repos/{event.repo}/pulls/{_pr_num}",
+                                {"state": "closed"},
+                                method="PATCH",
+                            )
+                        except Exception:
+                            pass
+                    instance.set_terminated(f"Code review exceeded {MAX_REVIEW_ROUNDS} rounds")
+                else:
+                    # Blocking issues remain — go to fix_iteration
+                    instance.set_review_round(review_round + 1)
+                    resumed_metadata = dict(original_event.get("metadata", {}))
+                    resumed_metadata["advance_to_phase"] = "fix_iteration"
+                    resumed_metadata["artifacts"] = instance.get_artifacts()
+                    append_jsonl(
+                        self.engine.runtime_dir / "queue_pending.jsonl",
+                        {**original_event, "metadata": resumed_metadata},
+                    )
+                step_succeeded = True
+                break  # always stop current loop; re-queue handles continuation
+            elif step.get("action") == "fix_coding_session":
+                try:
+                    from github_pm_agent.coding_session import CodingSession
+                    from github_pm_agent.devenv_client import DevEnvClient
+                    from github_pm_agent.utils import append_jsonl
+
+                    plan = CodingSession.parse_plan(last_content)
+                    if plan is None:
+                        self.actions.comment(
+                            "issue", event.target_number,
+                            "Failed to parse fix plan from AI output — manual fix required."
+                        )
+                        instance.set_terminated("Fix plan parse failure")
+                        break
+
+                    devenv_cfg = self.config.get("devenv", {})
+                    server_url = devenv_cfg.get("server_url", "")
+                    base_image = devenv_cfg.get("base_image", "python:3.12-slim")
+                    github_token = (event.metadata or {}).get("github_token") or self.config.get("github", {}).get("token", "")
+
+                    session = CodingSession(
+                        DevEnvClient(server_url=server_url),
+                        repo=event.repo,
+                        issue_number=event.target_number,
+                        github_token=github_token,
+                        base_image=base_image,
+                    )
+
+                    error_message = ""
+                    original_event = instance.get_original_event() or event.to_dict()
+
+                    try:
+                        session.setup()
+                        session.fix_and_push(plan)
+                        test_result = session.run_tests(plan)
+                        import json as _json
+                        instance.set_artifact("test_result", _json.dumps({
+                            "passed": test_result.passed,
+                            "summary": test_result.summary,
+                            "stdout": test_result.stdout,
+                            "stderr": test_result.stderr,
+                        }))
+
+                        resumed_metadata = dict(original_event.get("metadata", {}))
+                        if test_result.passed:
+                            instance.set_artifact("test_failure_context", "")
+                            resumed_metadata["advance_to_phase"] = "code_review"
+                            resumed_metadata["artifacts"] = instance.get_artifacts()
+                            append_jsonl(
+                                self.engine.runtime_dir / "queue_pending.jsonl",
+                                {**original_event, "metadata": resumed_metadata},
+                            )
+                        else:
+                            # Fix did not make tests pass — escalate
+                            fix_round = instance.get_review_round()
+                            self.actions.comment(
+                                "issue", event.target_number,
+                                f"Fix attempt (round {fix_round}) failed — tests still not passing.\n\n"
+                                f"{test_result.summary}"
+                            )
+                            instance.set_terminated(f"Fix tests failed at round {fix_round}")
+                    except Exception as exc:  # noqa: BLE001
+                        error_message = str(exc)
+                    finally:
+                        try:
+                            session.cleanup()
+                        except Exception as cleanup_exc:  # noqa: BLE001
+                            if error_message:
+                                error_message = f"{error_message}; cleanup: {cleanup_exc}"
+                            else:
+                                error_message = f"cleanup: {cleanup_exc}"
+
+                    if error_message:
+                        self.actions.comment(
+                            "issue", event.target_number,
+                            f"Fix iteration failed: {error_message}"
+                        )
+                        instance.set_terminated(f"Fix iteration error: {error_message[:200]}")
+                        break
+
+                    step_succeeded = True
+                    break  # re-queue handles continuation
+                except Exception as exc:  # noqa: BLE001
+                    self.actions.comment("issue", event.target_number, f"Fix iteration failed: {exc}")
+                    instance.set_terminated(str(exc)[:200])
+                    break
             elif step.get("action") == "merge_or_reopen":
                 from github_pm_agent.utils import extract_json_object
 
