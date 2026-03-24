@@ -130,14 +130,15 @@ class CodingSession:
 
     def run_tests(self, plan: CodingPlan) -> TestResult:
         """
-        Run tests in a devenv container:
-        1. Build a tar.gz of work_dir contents and upload as context
-        2. Build docker image from that context (Dockerfile: FROM {base_image}, COPY . /workspace, WORKDIR /workspace)
-        3. Start container (run_container with cmd "sleep infinity")
-        4. exec install_command inside container
-        5. exec test_command inside container
-        6. Parse result into TestResult
-        7. Stop container, delete workspace resources (but NOT work_dir - we may retry)
+        Run tests by baking install + test commands into the Docker image build.
+        Build logs capture full output; __TEST_EXIT_CODE__:<n> sentinel is parsed
+        to determine pass/fail.  This avoids exec_in_job which is not reliable on
+        all DevEnv server versions.
+
+        1. Upload context archive (code + generated Dockerfile with RUN steps)
+        2. Build image — RUN install, RUN test, echo __TEST_EXIT_CODE__:$?
+        3. Wait for build job; collect build logs
+        4. Parse exit code + output from logs → TestResult
         """
 
         self._ensure_repo_ready()
@@ -146,13 +147,13 @@ class CodingSession:
         if not plan.test_command.strip():
             raise RuntimeError("coding plan test_command is empty")
 
-        logger.info("Running tests for %s#%s in DevEnv workspace %s", self.repo, self.issue_number, self.workspace_id)
+        logger.info("Running tests for %s#%s (build-time)", self.repo, self.issue_number)
         context_id: str | None = None
         build_job_id: str | None = None
         result: TestResult | None = None
         failure: Exception | None = None
         try:
-            archive_bytes = self._build_context_archive()
+            archive_bytes = self._build_context_archive(plan=plan)
             context_id = self.devenv_client.upload_context(archive_bytes, filename="context.tar.gz")
             image_tag = self._image_tag()
 
@@ -161,42 +162,20 @@ class CodingSession:
                 tag=image_tag,
                 workspace=self.workspace_id,
             )
+            # Wait for build to reach terminal state (may succeed or fail)
+            build_job: dict[str, Any] = {}
             try:
-                self.devenv_client.wait_for_job(build_job_id)
-            except DevEnvError as exc:
-                build_logs = self._get_job_logs(build_job_id)
-                suffix = f"\nBuild logs:\n{build_logs}" if build_logs else ""
-                raise RuntimeError(f"failed to build test image {image_tag}: {exc}{suffix}") from exc
+                build_job = self.devenv_client.wait_for_job(build_job_id)
+            except DevEnvError:
+                # Failed build is expected when tests fail; we'll parse logs below
+                try:
+                    build_job = self.devenv_client.inspect_job(build_job_id)
+                except DevEnvError:
+                    pass
 
-            run_job_id: str = self.devenv_client.run_container(
-                image=image_tag,
-                workspace=self.workspace_id,
-                cmd="sleep infinity",
-            )
-            self.job_id = run_job_id
-            self._wait_for_container_ready(run_job_id)
+            build_logs_text = self._get_job_logs(build_job_id or "")
+            result = self._parse_build_test_result(build_logs_text, build_job)
 
-            install_result = self._exec_shell_command(run_job_id, plan.install_command)
-            install_exit_code, install_stdout, install_stderr = self._parse_exec_result(install_result)
-            if install_exit_code != 0:
-                install_summary = self._summarize_command_result(
-                    label="install",
-                    exit_code=install_exit_code,
-                    stdout=install_stdout,
-                    stderr=install_stderr,
-                )
-                raise RuntimeError(install_summary)
-
-            test_result_payload = self._exec_shell_command(run_job_id, plan.test_command)
-            exit_code, stdout, stderr = self._parse_exec_result(test_result_payload)
-            passed = exit_code == 0
-            result = TestResult(
-                passed=passed,
-                exit_code=exit_code,
-                stdout=stdout,
-                stderr=stderr,
-                summary=self._summarize_command_result("tests", exit_code, stdout, stderr),
-            )
         except DevEnvError as exc:
             failure = RuntimeError(f"failed to run tests in DevEnv workspace {self.workspace_id}: {exc}")
         except RuntimeError as exc:
@@ -398,8 +377,21 @@ class CodingSession:
             return f"https://github.com/{self.repo}.git"
         return f"https://{quote(self.github_token, safe='')}@github.com/{self.repo}.git"
 
-    def _build_context_archive(self) -> bytes:
-        dockerfile = f"FROM {self.base_image}\nCOPY . {_CONTAINER_WORKDIR}\nWORKDIR {_CONTAINER_WORKDIR}\n"
+    def _build_context_archive(self, plan: "CodingPlan | None" = None) -> bytes:
+        if plan is not None:
+            # Bake install + test into RUN steps so build logs capture full output.
+            # The sentinel line lets us parse exit code without exec or artifact APIs.
+            install_cmd = plan.install_command.replace("'", "'\\''")
+            test_cmd = plan.test_command.replace("'", "'\\''")
+            dockerfile = (
+                f"FROM {self.base_image}\n"
+                f"COPY . {_CONTAINER_WORKDIR}\n"
+                f"WORKDIR {_CONTAINER_WORKDIR}\n"
+                f"RUN {install_cmd}\n"
+                f"RUN sh -c '{test_cmd}'; echo __TEST_EXIT_CODE__:$?\n"
+            )
+        else:
+            dockerfile = f"FROM {self.base_image}\nCOPY . {_CONTAINER_WORKDIR}\nWORKDIR {_CONTAINER_WORKDIR}\n"
         _SKIP_NAMES = {".git", "Dockerfile"}
 
         def _filter(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
@@ -476,6 +468,48 @@ class CodingSession:
             "",
         )
         return exit_code, stdout, stderr
+
+    def _parse_build_test_result(self, build_logs: str, build_job: dict[str, Any]) -> TestResult:
+        """Parse test results from Docker build logs captured during a build-time test run."""
+        # Look for the sentinel line: __TEST_EXIT_CODE__:<n>
+        exit_code = 1  # default to failure
+        for line in reversed(build_logs.splitlines()):
+            stripped = line.strip()
+            if stripped.startswith("__TEST_EXIT_CODE__:"):
+                try:
+                    exit_code = int(stripped.split(":", 1)[1].strip())
+                    break
+                except ValueError:
+                    pass
+
+        # Extract the test output: lines between the last RUN step and the sentinel
+        test_output_lines: list[str] = []
+        capturing = False
+        for line in build_logs.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Step") and "RUN sh -c" in stripped:
+                capturing = True
+                test_output_lines = []
+                continue
+            if capturing:
+                if stripped.startswith("__TEST_EXIT_CODE__:"):
+                    break
+                test_output_lines.append(line)
+
+        # If the test step was never reached (e.g. install failed), fall back to all build logs
+        if not capturing:
+            test_output_lines = build_logs.splitlines()
+        stdout = "\n".join(test_output_lines).strip()
+        passed = exit_code == 0
+        status_label = "PASSED" if passed else "FAILED"
+        summary = f"Tests {status_label} (exit code {exit_code}).\n\n{stdout[:2000]}" if stdout else f"Tests {status_label} (exit code {exit_code})."
+        return TestResult(
+            passed=passed,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr="",
+            summary=summary,
+        )
 
     def _cleanup_test_resources(self, *, build_job_id: str | None, context_id: str | None) -> list[str]:
         errors: list[str] = []
@@ -556,9 +590,18 @@ class CodingSession:
 
     def _get_job_logs(self, job_id: str) -> str:
         try:
-            return self.devenv_client.get_logs(job_id)
+            raw = self.devenv_client.get_logs(job_id)
         except DevEnvError:
             return ""
+        # DevEnv may return {"job_id": ..., "lines": [...]} instead of plain text
+        if raw.strip().startswith("{"):
+            try:
+                payload = json.loads(raw)
+                if isinstance(payload, dict) and isinstance(payload.get("lines"), list):
+                    return "\n".join(str(line) for line in payload["lines"])
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return raw
 
     def _temp_dir_prefix(self) -> str:
         safe_repo = re.sub(r"[^A-Za-z0-9_.-]+", "-", self.repo).strip("-") or "repo"

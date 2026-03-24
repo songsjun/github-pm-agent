@@ -41,5 +41,9 @@ Requirements:
 - Choose an `install_command` if setup is required before testing.
 - Set `branch_name` using the `ai/issue-{number}-{short-slug}` pattern.
 - Set `commit_message` to a clear conventional commit message for this issue.
+- **Bootstrap first**: If the repository lacks project setup files required to run tests (e.g., `package.json`, `tsconfig.json`, `pyproject.toml`, `requirements.txt`, `jest.config.js`, `.env.example`), include them in `files` with appropriate content. Never assume they already exist — always generate them if missing.
+- For TypeScript/Node projects: generate `package.json` (with name, version, scripts.test, devDependencies including jest/ts-jest/typescript), `tsconfig.json`, and any jest config needed to run the test command.
+- For Python projects: generate `pyproject.toml` or `requirements.txt` if missing.
+- The `install_command` must install everything the `test_command` needs.
 
 Output ONLY the JSON block. No explanation before or after.

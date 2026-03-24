@@ -201,6 +201,20 @@ class WorkflowOrchestrator:
 
         instance = WorkflowInstance.load(runtime_dir, event.repo, target_number)
 
+        # Reset state if this is a different workflow type than the one stored
+        # (e.g., issue_coding event arriving for an issue whose issue_changed workflow completed)
+        current_workflow_type = workflow.get("event_type", event.event_type)
+        stored_workflow_type = instance.get_workflow_type()
+        if not stored_workflow_type:
+            # Migration: check original_event.event_type as fallback for states set by old code
+            original_ev = instance.get_original_event()
+            if original_ev:
+                stored_workflow_type = original_ev.get("event_type", "")
+        if stored_workflow_type and stored_workflow_type != current_workflow_type:
+            instance.reset_for_workflow_type(current_workflow_type)
+        elif not stored_workflow_type:
+            instance.set_workflow_type(current_workflow_type)
+
         if not instance.get_original_event():
             instance.set_original_event(event.to_dict())
 
@@ -284,10 +298,32 @@ class WorkflowOrchestrator:
                 "pr_title": event.title,
                 "pr_body": event.body,
                 "current_phase": current_phase,
+                # Coding workflow variables
+                "issue_number": str(event.target_number or ""),
+                "repo": event.repo or "",
+                "default_branch": self.config.get("github", {}).get("default_branch", "main"),
+                "base_branch": self.config.get("github", {}).get("default_branch", "main"),
             }
             for phase_name, artifact_text in artifacts.items():
                 if not phase_name.startswith("_"):
                     variables[f"artifact_{phase_name}"] = artifact_text
+            # Coding workflow convenience aliases from artifacts
+            test_result = artifacts.get("test_result") or {}
+            if isinstance(test_result, str):
+                import json as _json_local  # noqa: PLC0415
+                try:
+                    test_result = _json_local.loads(test_result)
+                except (_json_local.JSONDecodeError, ValueError):
+                    test_result = {}
+            if isinstance(test_result, dict):
+                variables["test_passed"] = "true" if test_result.get("passed") else "false"
+                variables["test_results"] = test_result.get("summary", "")
+            else:
+                variables["test_passed"] = "false"
+                variables["test_results"] = ""
+            variables["pr_number"] = str(artifacts.get("pr_number") or "")
+            variables["pr_url"] = str(artifacts.get("pr_url") or "")
+            variables["test_failure_context"] = str(artifacts.get("test_failure_context") or "")
             human_comment = meta.get("gate_human_comment", "")
             variables["human_comment"] = f"Human feedback:\n{human_comment}\n" if human_comment else ""
             pending = instance.get_pending_comments()
@@ -451,6 +487,7 @@ class WorkflowOrchestrator:
                     should_break = False
                     failure_comment = ""
                     error_message = ""
+                    pr_body = ""
 
                     try:
                         session.setup()
@@ -462,8 +499,9 @@ class WorkflowOrchestrator:
                             "stdout": test_result.stdout,
                             "stderr": test_result.stderr,
                         }
-                        instance.set_artifact("test_result", test_result_data)
-                        instance.set_artifact("coding_iteration", session.iteration)
+                        import json as _json
+                        instance.set_artifact("test_result", _json.dumps(test_result_data))
+                        instance.set_artifact("coding_iteration", str(session.iteration))
 
                         pr_body = (
                             f"Closes #{event.target_number}\n\n"
@@ -483,8 +521,8 @@ class WorkflowOrchestrator:
                         if test_result.passed:
                             branch_name = session.push_branch()
                             pr = session.create_pr(plan.commit_message, pr_body, base_branch)
-                            instance.set_artifact("pr_number", pr.get("number"))
-                            instance.set_artifact("pr_url", pr.get("url"))
+                            instance.set_artifact("pr_number", str(pr.get("number") or ""))
+                            instance.set_artifact("pr_url", str(pr.get("url") or ""))
                             instance.set_artifact("branch_name", branch_name)
                             instance.set_artifact("test_failure_context", "")
                             coding_result.update(
@@ -555,9 +593,8 @@ class WorkflowOrchestrator:
                     break
             elif step.get("action") == "run_tests":
                 artifacts = instance.get_artifacts()
-                pr_number = artifacts.get("pr_number")
-                if not isinstance(pr_number, int):
-                    pr_number = int(pr_number) if str(pr_number).isdigit() else None
+                _raw_pr = artifacts.get("pr_number", "")
+                pr_number: Optional[int] = int(str(_raw_pr)) if str(_raw_pr).strip().isdigit() else None
                 if pr_number is None:
                     import logging
 
@@ -592,9 +629,8 @@ class WorkflowOrchestrator:
                     reopen_comment = str(parsed.get("reopen_comment", "")).strip()
 
                 artifacts = instance.get_artifacts()
-                pr_number = artifacts.get("pr_number")
-                if not isinstance(pr_number, int):
-                    pr_number = int(pr_number) if str(pr_number).isdigit() else None
+                _raw_pr = artifacts.get("pr_number", "")
+                pr_number: Optional[int] = int(str(_raw_pr)) if str(_raw_pr).strip().isdigit() else None
                 issue_number = event.target_number
                 if pr_number is None:
                     import logging

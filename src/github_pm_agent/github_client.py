@@ -188,7 +188,12 @@ class GitHubClient:
 
     def issue_labels_remove(self, number: int, labels: Iterable[str]) -> None:
         for label in labels:
-            self.api(f"repos/{self.repo}/issues/{number}/labels/{label}", method="DELETE")
+            try:
+                self.api(f"repos/{self.repo}/issues/{number}/labels/{label}", method="DELETE")
+            except subprocess.CalledProcessError as exc:
+                # 404 means the label is not present — treat as success
+                if b"404" not in (exc.stderr or b"") and "404" not in str(exc):
+                    raise
 
     def issue_assignees_remove(self, number: int, assignees: Iterable[str]) -> Dict[str, Any]:
         return self.api(

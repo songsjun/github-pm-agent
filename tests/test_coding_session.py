@@ -192,58 +192,50 @@ class CodingSessionTest(unittest.TestCase):
         self.assertFalse(session.work_dir.exists())
 
     def test_run_tests_success(self) -> None:
+        """Build-time test execution: passed when __TEST_EXIT_CODE__:0 found in build logs."""
         session, client = self._make_session()
         (session.work_dir / "README.md").write_text("test repo\n", encoding="utf-8")
         plan = self._make_plan(files=[])
         client.upload_context.return_value = "ctx-1"
         client.build_image.return_value = "j-build"
         client.wait_for_job.return_value = {"status": "done"}
-        client.run_container.return_value = "j-run"
-        client.inspect_job.return_value = {"status": "running", "container_id": "c1"}
-        client.exec_in_job.side_effect = [
-            {"exit_code": 0, "stdout": "", "stderr": ""},
-            {"exit_code": 0, "stdout": "1 passed", "stderr": ""},
-        ]
+        build_logs = (
+            "Step 4/4 : RUN sh -c 'npm test'\n"
+            " ---> Running in abc123\n"
+            "1 passed, 0 failed\n"
+            "__TEST_EXIT_CODE__:0\n"
+            " ---> abc456\n"
+            "Successfully built abc456\n"
+        )
+        client.get_logs.return_value = build_logs
 
         result = session.run_tests(plan)
 
-        self.assertEqual(
-            result,
-            TestResult(
-                passed=True,
-                exit_code=0,
-                stdout="1 passed",
-                stderr="",
-                summary="Tests passed (exit 0): 1 passed",
-            ),
-        )
+        self.assertTrue(result.passed)
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("1 passed, 0 failed", result.stdout)
 
     def test_run_tests_failure_returns_failed_result(self) -> None:
+        """Build-time test execution: failed when __TEST_EXIT_CODE__:1 found in build logs."""
         session, client = self._make_session()
         (session.work_dir / "README.md").write_text("test repo\n", encoding="utf-8")
         plan = self._make_plan(files=[])
         client.upload_context.return_value = "ctx-1"
         client.build_image.return_value = "j-build"
         client.wait_for_job.return_value = {"status": "done"}
-        client.run_container.return_value = "j-run"
-        client.inspect_job.return_value = {"status": "running", "container_id": "c1"}
-        client.exec_in_job.side_effect = [
-            {"exit_code": 0, "stdout": "", "stderr": ""},
-            {"exit_code": 1, "stdout": "FAILED", "stderr": "assert error"},
-        ]
+        build_logs = (
+            "Step 4/4 : RUN sh -c 'npm test'\n"
+            " ---> Running in abc123\n"
+            "FAILED: 1 error\n"
+            "__TEST_EXIT_CODE__:1\n"
+        )
+        client.get_logs.return_value = build_logs
 
         result = session.run_tests(plan)
 
-        self.assertEqual(
-            result,
-            TestResult(
-                passed=False,
-                exit_code=1,
-                stdout="FAILED",
-                stderr="assert error",
-                summary="Tests failed (exit 1): assert error",
-            ),
-        )
+        self.assertFalse(result.passed)
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("FAILED: 1 error", result.stdout)
 
 
 if __name__ == "__main__":
