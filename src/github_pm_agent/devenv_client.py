@@ -84,7 +84,7 @@ class DevEnvClient:
             ),
             "upload_context",
         )
-        context_id = str(payload.get("id", "")).strip()
+        context_id = str(payload.get("upload_id") or payload.get("id", "")).strip()
         if not context_id:
             raise DevEnvError("upload_context response missing id")
         return context_id
@@ -112,7 +112,7 @@ class DevEnvClient:
                 "POST",
                 "/api/jobs/build",
                 json_body={
-                    "context_id": context_id,
+                    "upload_id": context_id,
                     "tag": tag,
                     "workspace": workspace,
                     "build_args": build_args or {},
@@ -120,7 +120,7 @@ class DevEnvClient:
             ),
             "build_image",
         )
-        job_id = str(payload.get("job_id", "")).strip()
+        job_id = str(payload.get("id") or payload.get("job_id", "")).strip()
         if not job_id:
             raise DevEnvError("build_image response missing job_id")
         return job_id
@@ -149,7 +149,7 @@ class DevEnvClient:
             ),
             "run_container",
         )
-        job_id = str(payload.get("job_id", "")).strip()
+        job_id = str(payload.get("id") or payload.get("job_id", "")).strip()
         if not job_id:
             raise DevEnvError("run_container response missing job_id")
         return job_id

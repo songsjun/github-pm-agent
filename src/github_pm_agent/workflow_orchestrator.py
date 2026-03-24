@@ -201,6 +201,20 @@ class WorkflowOrchestrator:
 
         instance = WorkflowInstance.load(runtime_dir, event.repo, target_number)
 
+        # Reset state if this is a different workflow type than the one stored
+        # (e.g., issue_coding event arriving for an issue whose issue_changed workflow completed)
+        current_workflow_type = workflow.get("event_type", event.event_type)
+        stored_workflow_type = instance.get_workflow_type()
+        if not stored_workflow_type:
+            # Migration: check original_event.event_type as fallback for states set by old code
+            original_ev = instance.get_original_event()
+            if original_ev:
+                stored_workflow_type = original_ev.get("event_type", "")
+        if stored_workflow_type and stored_workflow_type != current_workflow_type:
+            instance.reset_for_workflow_type(current_workflow_type)
+        elif not stored_workflow_type:
+            instance.set_workflow_type(current_workflow_type)
+
         if not instance.get_original_event():
             instance.set_original_event(event.to_dict())
 
@@ -284,10 +298,43 @@ class WorkflowOrchestrator:
                 "pr_title": event.title,
                 "pr_body": event.body,
                 "current_phase": current_phase,
+                # Coding workflow variables
+                "issue_number": str(event.target_number or ""),
+                "repo": event.repo or "",
+                "default_branch": self.config.get("github", {}).get("default_branch", "main"),
+                "base_branch": self.config.get("github", {}).get("default_branch", "main"),
             }
             for phase_name, artifact_text in artifacts.items():
                 if not phase_name.startswith("_"):
                     variables[f"artifact_{phase_name}"] = artifact_text
+            # Coding workflow convenience aliases from artifacts
+            test_result = artifacts.get("test_result") or {}
+            if isinstance(test_result, str):
+                import json as _json_local  # noqa: PLC0415
+                try:
+                    test_result = _json_local.loads(test_result)
+                except (_json_local.JSONDecodeError, ValueError):
+                    test_result = {}
+            if isinstance(test_result, dict):
+                variables["test_passed"] = "true" if test_result.get("passed") else "false"
+                variables["test_results"] = test_result.get("summary", "")
+            else:
+                variables["test_passed"] = "false"
+                variables["test_results"] = ""
+            variables["pr_number"] = str(artifacts.get("pr_number") or "")
+            variables["pr_url"] = str(artifacts.get("pr_url") or "")
+            variables["review_round"] = str(instance.get_review_round())
+            variables["test_failure_context"] = str(artifacts.get("test_failure_context") or "")
+            # Fetch live PR diff for code_review and fix_iteration phases
+            _raw_pr_num = artifacts.get("pr_number", "")
+            _pr_num_int = int(str(_raw_pr_num)) if str(_raw_pr_num).strip().isdigit() else None
+            if _pr_num_int and current_phase in ("code_review", "fix_iteration"):
+                try:
+                    variables["pr_diff"] = self.client.get_pr_diff(_pr_num_int)
+                except Exception:
+                    variables["pr_diff"] = ""
+            else:
+                variables["pr_diff"] = ""
             human_comment = meta.get("gate_human_comment", "")
             variables["human_comment"] = f"Human feedback:\n{human_comment}\n" if human_comment else ""
             pending = instance.get_pending_comments()
@@ -431,7 +478,9 @@ class WorkflowOrchestrator:
                     devenv_cfg = self.config.get("devenv", {})
                     server_url = devenv_cfg.get("server_url", "")
                     base_image = devenv_cfg.get("base_image", "python:3.12-slim")
-                    github_token = (event.metadata or {}).get("github_token") or self.config.get("github", {}).get("token", "")
+                    # Use worker's token for git push so the PM (different token) can
+                    # approve the PR without hitting "last pusher cannot self-approve".
+                    github_token = (event.metadata or {}).get("github_token") or self._get_worker_github_token(executors)
                     base_branch = self.config.get("github", {}).get("default_branch", "main")
 
                     previous_iteration = instance.get_artifacts().get("coding_iteration", 0)
@@ -451,6 +500,7 @@ class WorkflowOrchestrator:
                     should_break = False
                     failure_comment = ""
                     error_message = ""
+                    pr_body = ""
 
                     try:
                         session.setup()
@@ -462,8 +512,9 @@ class WorkflowOrchestrator:
                             "stdout": test_result.stdout,
                             "stderr": test_result.stderr,
                         }
-                        instance.set_artifact("test_result", test_result_data)
-                        instance.set_artifact("coding_iteration", session.iteration)
+                        import json as _json
+                        instance.set_artifact("test_result", _json.dumps(test_result_data))
+                        instance.set_artifact("coding_iteration", str(session.iteration))
 
                         pr_body = (
                             f"Closes #{event.target_number}\n\n"
@@ -483,8 +534,8 @@ class WorkflowOrchestrator:
                         if test_result.passed:
                             branch_name = session.push_branch()
                             pr = session.create_pr(plan.commit_message, pr_body, base_branch)
-                            instance.set_artifact("pr_number", pr.get("number"))
-                            instance.set_artifact("pr_url", pr.get("url"))
+                            instance.set_artifact("pr_number", str(pr.get("number") or ""))
+                            instance.set_artifact("pr_url", str(pr.get("url") or ""))
                             instance.set_artifact("branch_name", branch_name)
                             instance.set_artifact("test_failure_context", "")
                             coding_result.update(
@@ -555,9 +606,8 @@ class WorkflowOrchestrator:
                     break
             elif step.get("action") == "run_tests":
                 artifacts = instance.get_artifacts()
-                pr_number = artifacts.get("pr_number")
-                if not isinstance(pr_number, int):
-                    pr_number = int(pr_number) if str(pr_number).isdigit() else None
+                _raw_pr = artifacts.get("pr_number", "")
+                pr_number: Optional[int] = int(str(_raw_pr)) if str(_raw_pr).strip().isdigit() else None
                 if pr_number is None:
                     import logging
 
@@ -579,6 +629,164 @@ class WorkflowOrchestrator:
                         stderr=test_result_data.get("stderr", ""),
                     )
                     step_succeeded = True
+            elif step.get("action") == "check_review_result":
+                # Decide whether to approve/advance or loop back for fixes.
+                from github_pm_agent.utils import append_jsonl
+
+                artifacts = instance.get_artifacts()
+                combined_review = (
+                    artifacts.get("code_review_combined")
+                    or artifacts.get("code_review", "")
+                )
+                review_round = instance.get_review_round()
+                MAX_REVIEW_ROUNDS = 3
+                original_event = instance.get_original_event() or event.to_dict()
+
+                def _has_blocking(text: str) -> bool:
+                    lower = text.lower()
+                    return (
+                        "**blocking**" in lower
+                        or "severity: blocking" in lower
+                        or "severity**:** blocking" in lower
+                    )
+
+                _raw_pr = artifacts.get("pr_number", "")
+                _pr_num = int(str(_raw_pr)) if str(_raw_pr).strip().isdigit() else None
+
+                if not _has_blocking(combined_review):
+                    # LGTM or warnings only → approve PR, advance to pm_decision
+                    if _pr_num:
+                        try:
+                            self.actions.submit_pr_review(
+                                _pr_num, "APPROVE",
+                                "Automated code review passed — no blocking issues found."
+                            )
+                        except Exception:
+                            pass  # best-effort; branch protection may still block merge
+                    resumed_metadata = dict(original_event.get("metadata", {}))
+                    resumed_metadata["advance_to_phase"] = "pm_decision"
+                    resumed_metadata["artifacts"] = instance.get_artifacts()
+                    append_jsonl(
+                        self.engine.runtime_dir / "queue_pending.jsonl",
+                        {**original_event, "metadata": resumed_metadata},
+                    )
+                elif review_round >= MAX_REVIEW_ROUNDS:
+                    # Too many rounds — close PR, terminate, flag for human
+                    escalation_msg = (
+                        f"Code review found blocking issues after {review_round} round(s). "
+                        f"Automated fix limit reached — manual intervention required.\n\n"
+                        f"Latest review:\n{combined_review[:1500]}"
+                    )
+                    self.actions.comment("issue", event.target_number, escalation_msg)
+                    if _pr_num:
+                        try:
+                            self.client.api(
+                                f"repos/{event.repo}/pulls/{_pr_num}",
+                                {"state": "closed"},
+                                method="PATCH",
+                            )
+                        except Exception:
+                            pass
+                    instance.set_terminated(f"Code review exceeded {MAX_REVIEW_ROUNDS} rounds")
+                else:
+                    # Blocking issues remain — go to fix_iteration
+                    instance.set_review_round(review_round + 1)
+                    resumed_metadata = dict(original_event.get("metadata", {}))
+                    resumed_metadata["advance_to_phase"] = "fix_iteration"
+                    resumed_metadata["artifacts"] = instance.get_artifacts()
+                    append_jsonl(
+                        self.engine.runtime_dir / "queue_pending.jsonl",
+                        {**original_event, "metadata": resumed_metadata},
+                    )
+                step_succeeded = True
+                break  # always stop current loop; re-queue handles continuation
+            elif step.get("action") == "fix_coding_session":
+                try:
+                    from github_pm_agent.coding_session import CodingSession
+                    from github_pm_agent.devenv_client import DevEnvClient
+                    from github_pm_agent.utils import append_jsonl
+
+                    plan = CodingSession.parse_plan(last_content)
+                    if plan is None:
+                        self.actions.comment(
+                            "issue", event.target_number,
+                            "Failed to parse fix plan from AI output — manual fix required."
+                        )
+                        instance.set_terminated("Fix plan parse failure")
+                        break
+
+                    devenv_cfg = self.config.get("devenv", {})
+                    server_url = devenv_cfg.get("server_url", "")
+                    base_image = devenv_cfg.get("base_image", "python:3.12-slim")
+                    # Use worker's token so PM (different account) can approve the PR.
+                    github_token = (event.metadata or {}).get("github_token") or self._get_worker_github_token(executors)
+
+                    session = CodingSession(
+                        DevEnvClient(server_url=server_url),
+                        repo=event.repo,
+                        issue_number=event.target_number,
+                        github_token=github_token,
+                        base_image=base_image,
+                    )
+
+                    error_message = ""
+                    original_event = instance.get_original_event() or event.to_dict()
+
+                    try:
+                        session.setup()
+                        session.fix_and_push(plan)
+                        test_result = session.run_tests(plan)
+                        import json as _json
+                        instance.set_artifact("test_result", _json.dumps({
+                            "passed": test_result.passed,
+                            "summary": test_result.summary,
+                            "stdout": test_result.stdout,
+                            "stderr": test_result.stderr,
+                        }))
+
+                        resumed_metadata = dict(original_event.get("metadata", {}))
+                        if test_result.passed:
+                            instance.set_artifact("test_failure_context", "")
+                            resumed_metadata["advance_to_phase"] = "code_review"
+                            resumed_metadata["artifacts"] = instance.get_artifacts()
+                            append_jsonl(
+                                self.engine.runtime_dir / "queue_pending.jsonl",
+                                {**original_event, "metadata": resumed_metadata},
+                            )
+                        else:
+                            # Fix did not make tests pass — escalate
+                            fix_round = instance.get_review_round()
+                            self.actions.comment(
+                                "issue", event.target_number,
+                                f"Fix attempt (round {fix_round}) failed — tests still not passing.\n\n"
+                                f"{test_result.summary}"
+                            )
+                            instance.set_terminated(f"Fix tests failed at round {fix_round}")
+                    except Exception as exc:  # noqa: BLE001
+                        error_message = str(exc)
+                    finally:
+                        try:
+                            session.cleanup()
+                        except Exception as cleanup_exc:  # noqa: BLE001
+                            if error_message:
+                                error_message = f"{error_message}; cleanup: {cleanup_exc}"
+                            else:
+                                error_message = f"cleanup: {cleanup_exc}"
+
+                    if error_message:
+                        self.actions.comment(
+                            "issue", event.target_number,
+                            f"Fix iteration failed: {error_message}"
+                        )
+                        instance.set_terminated(f"Fix iteration error: {error_message[:200]}")
+                        break
+
+                    step_succeeded = True
+                    break  # re-queue handles continuation
+                except Exception as exc:  # noqa: BLE001
+                    self.actions.comment("issue", event.target_number, f"Fix iteration failed: {exc}")
+                    instance.set_terminated(str(exc)[:200])
+                    break
             elif step.get("action") == "merge_or_reopen":
                 from github_pm_agent.utils import extract_json_object
 
@@ -592,9 +800,8 @@ class WorkflowOrchestrator:
                     reopen_comment = str(parsed.get("reopen_comment", "")).strip()
 
                 artifacts = instance.get_artifacts()
-                pr_number = artifacts.get("pr_number")
-                if not isinstance(pr_number, int):
-                    pr_number = int(pr_number) if str(pr_number).isdigit() else None
+                _raw_pr = artifacts.get("pr_number", "")
+                pr_number: Optional[int] = int(str(_raw_pr)) if str(_raw_pr).strip().isdigit() else None
                 issue_number = event.target_number
                 if pr_number is None:
                     import logging
@@ -864,6 +1071,35 @@ class WorkflowOrchestrator:
         # Legacy roles-based dispatch
         roles = step.get("roles", ["pm"])
         return [{"role": role, "agent_id": None, "label": role, "extra_vars": {}} for role in roles]
+
+    def _get_worker_github_token(self, executors: List[Dict[str, Any]]) -> str:
+        """Resolve the GitHub token for the first worker executor in the step.
+
+        Worker agents push code to GitHub. Using the worker's own token (separate
+        from the PM's token) ensures the PR reviewer (PM) is a different GitHub user
+        than the last pusher (worker), satisfying the "require approval from someone
+        other than last pusher" branch protection rule.
+
+        Falls back to the config ``github.token`` or empty string if no worker token
+        is configured.
+        """
+        import os
+        for executor in executors:
+            agent_id = executor.get("agent_id")
+            if not agent_id:
+                continue
+            agent_cfg = next(
+                (a for a in self.agent_configs if isinstance(a, dict) and a.get("id") == agent_id),
+                None,
+            )
+            if agent_cfg is None:
+                continue
+            token_env = agent_cfg.get("token_env")
+            if token_env:
+                token = os.environ.get(token_env, "")
+                if token:
+                    return token
+        return self.config.get("github", {}).get("token", "")
 
     def _collect_blocking_unknowns(self, ai_outputs: List[Dict[str, Any]], phase: str) -> List[str]:
         """Extract blocking_unknowns from worker outputs in the given phase.

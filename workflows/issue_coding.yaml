@@ -1,32 +1,36 @@
-event_type: issue_changed
-trigger_action: labeled
-trigger_label: ready-to-code
+event_type: issue_coding
 
 steps:
-  # Phase 1: Workers implement the code from the issue description
-  # Slot 1 generates the coding plan (files + test_command + branch_name etc.)
+  # Phase 1: Worker implements code from the issue description.
+  # Generates a coding plan, runs tests in DevEnv, opens a PR on success.
   - phase: implement
     slots: 1
     prompt_path: prompts/coding/implement.md
     action: coding_session
     gate: false
 
-  # Phase 2: Workers review the PR from two angles
-  # slot 1 — Correctness & Edge Cases, slot 2 — Design & Maintainability
+  # Phase 2: Two workers review the PR from complementary angles.
+  # After review, check_review_result decides:
+  #   LGTM / warnings only → approve PR → advance to pm_decision
+  #   Blocking issues + rounds remaining → advance to fix_iteration
+  #   Blocking issues + rounds exhausted → escalate (terminate workflow)
   - phase: code_review
     slots: 2
     prompt_path: prompts/coding/code_review.md
     output_per_role: true
+    action: check_review_result
     gate: false
 
-  # Phase 3: Worker runs tests and reports result
-  - phase: test_verify
+  # Phase 3: Worker fixes blocking issues found in code_review.
+  # Pushes new commits to the existing PR branch and re-runs tests.
+  # On test pass → back to code_review; on failure → escalate.
+  - phase: fix_iteration
     slots: 1
-    prompt_path: prompts/coding/test_verify.md
-    action: run_tests
+    prompt_path: prompts/coding/fix_iteration.md
+    action: fix_coding_session
     gate: false
 
-  # Phase 4: PM decides to merge or reopen
+  # Phase 4: PM makes the final merge / reopen decision (human-gated).
   - phase: pm_decision
     roles: [pm]
     prompt_path: prompts/coding/pm_decision.md

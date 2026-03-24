@@ -156,6 +156,26 @@ class WorkflowInstance:
     def get_terminated_reason(self) -> str:
         return str(self._state.get("terminated_reason", ""))
 
+    def get_review_round(self) -> int:
+        """Return the current code-review / fix iteration count (0-indexed)."""
+        return int(self._state.get("review_round", 0))
+
+    def set_review_round(self, round_num: int) -> None:
+        self._state["review_round"] = round_num
+        self._save()
+
+    def get_workflow_type(self) -> Optional[str]:
+        return self._state.get("workflow_type") or None
+
+    def set_workflow_type(self, workflow_type: str) -> None:
+        self._state["workflow_type"] = workflow_type
+        self._save()
+
+    def reset_for_workflow_type(self, workflow_type: str) -> None:
+        """Clear all state and start fresh for a new workflow type."""
+        self._state = {"workflow_type": workflow_type}
+        self._save()
+
     def is_completed(self) -> bool:
         return bool(self._state.get("completed"))
 

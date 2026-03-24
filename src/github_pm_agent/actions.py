@@ -223,6 +223,20 @@ class GitHubActionToolkit:
             return self._record_and_execute(action)
         return self._record_and_execute(action, lambda: self.client.issue_comment(pr_number, message))
 
+    def submit_pr_review(self, pr_number: int, event: str = "APPROVE", body: str = "") -> Dict[str, Any]:
+        action = {
+            "action_type": "submit_pr_review",
+            "target_kind": "pull_request",
+            "target_number": pr_number,
+            "event": event,
+            "body": body[:300] if body else "",
+            "dry_run": self.dry_run,
+        }
+        return self._record_and_execute(
+            action,
+            lambda: self.client.submit_pr_review(pr_number, event, body),
+        )
+
     def merge_or_reopen(
         self,
         pr_number: Optional[int],
