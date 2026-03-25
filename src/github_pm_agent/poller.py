@@ -289,10 +289,23 @@ class GitHubPoller:
                 issue = item.get("issue") or {}
                 number = issue.get("number")
                 body = item.get("event", "")
+                event_name = str(item.get("event", "changed"))
+                label_name = str((item.get("label") or {}).get("name") or "")
+                issue_state = str(issue.get("state") or "").lower()
+                issue_labels = [
+                    str((label or {}).get("name", ""))
+                    for label in issue.get("labels", [])
+                    if isinstance(label, dict) and (label or {}).get("name")
+                ]
+                event_type = f"issue_event_{event_name}"
+                if issue_state != "closed" and event_name == "labeled" and label_name == "ready-to-code":
+                    event_type = "issue_coding"
+                elif issue_state != "closed" and event_name == "reopened" and "ready-to-code" in issue_labels:
+                    event_type = "issue_coding"
                 events.append(
                     Event(
-                        event_id=_event_id("issue_event", item["id"], occurred_at, item.get("event", "")),
-                        event_type=f"issue_event_{item.get('event', 'changed')}",
+                        event_id=_event_id("issue_event", item["id"], occurred_at, event_name),
+                        event_type=event_type,
                         source="issue_events",
                         occurred_at=occurred_at,
                         repo=self.repo,
@@ -303,9 +316,10 @@ class GitHubPoller:
                         target_kind="issue",
                         target_number=number,
                         metadata={
-                            "event": item.get("event"),
+                            "event": event_name,
                             "commit_id": item.get("commit_id"),
-                            "label": ((item.get("label") or {}).get("name")),
+                            "label": label_name,
+                            "labels": issue_labels,
                             "assignee": ((item.get("assignee") or {}).get("login")),
                             "review_requested_reviewer": ((item.get("requested_reviewer") or {}).get("login")),
                             "milestone": ((item.get("milestone") or {}).get("title")),

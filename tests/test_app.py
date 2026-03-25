@@ -194,3 +194,79 @@ class GitHubPMAgentAppTest(unittest.TestCase):
         self.assertEqual(result["repositories"][0]["repo"], "acme/widgets")
         self.assertEqual(result["repositories"][1]["repo"], "acme/widgets-2")
         queue.enqueue.assert_called_once()
+
+    def test_ready_to_code_issue_label_webhook_routes_to_issue_coding(self) -> None:
+        app = self._build_app()
+
+        event = app._event_from_github_payload(
+            "issues",
+            {
+                "action": "labeled",
+                "repository": {"full_name": "acme/widgets"},
+                "issue": {
+                    "number": 17,
+                    "title": "Implement weather map",
+                    "body": "details",
+                    "labels": [{"name": "frontend"}, {"name": "ready-to-code"}],
+                },
+                "label": {"name": "ready-to-code"},
+                "sender": {"login": "pm"},
+                "updated_at": "2026-03-19T12:00:00Z",
+            },
+        )
+
+        assert event is not None
+        self.assertEqual(event.event_type, "issue_coding")
+        self.assertEqual(event.title, "Implement weather map")
+        self.assertEqual(event.body, "details")
+        self.assertEqual(event.url, "")
+        self.assertEqual(event.metadata["label"], "ready-to-code")
+        self.assertEqual(event.metadata["labels"], ["frontend", "ready-to-code"])
+
+    def test_ready_to_code_label_on_closed_issue_stays_issue_event(self) -> None:
+        app = self._build_app()
+
+        event = app._event_from_github_payload(
+            "issues",
+            {
+                "action": "labeled",
+                "repository": {"full_name": "acme/widgets"},
+                "issue": {
+                    "number": 18,
+                    "title": "Closed work item",
+                    "body": "details",
+                    "state": "closed",
+                    "labels": [{"name": "ready-to-code"}],
+                },
+                "label": {"name": "ready-to-code"},
+                "sender": {"login": "pm"},
+                "updated_at": "2026-03-19T12:05:00Z",
+            },
+        )
+
+        assert event is not None
+        self.assertEqual(event.event_type, "issue_event_labeled")
+
+    def test_issue_comment_webhook_keeps_comment_body(self) -> None:
+        app = self._build_app()
+
+        event = app._event_from_github_payload(
+            "issue_comment",
+            {
+                "action": "created",
+                "repository": {"full_name": "acme/widgets"},
+                "issue": {
+                    "number": 19,
+                    "title": "Issue title",
+                    "body": "issue body",
+                },
+                "comment": {"body": "comment body"},
+                "sender": {"login": "alice"},
+                "updated_at": "2026-03-19T12:10:00Z",
+            },
+        )
+
+        assert event is not None
+        self.assertEqual(event.event_type, "issue_comment")
+        self.assertEqual(event.title, "issue_comment")
+        self.assertEqual(event.body, "comment body")

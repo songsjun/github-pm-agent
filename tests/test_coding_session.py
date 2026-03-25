@@ -262,6 +262,32 @@ class CodingSessionTest(unittest.TestCase):
         self.assertIn("2 passed", result.stdout)
         self.assertNotIn("__TEST_EXIT_CODE__:0", result.stdout)
 
+    def test_setup_clones_with_auth_env_without_embedding_token_in_url(self) -> None:
+        client = MagicMock()
+        session = CodingSession(client, repo="acme/widgets", issue_number=42, github_token="secret-token")
+        self.addCleanup(shutil.rmtree, str(session.work_dir), True)
+
+        clone_calls = []
+
+        def fake_run_command(command, *, cwd=None, env=None, check=True):
+            clone_calls.append({"command": command, "cwd": cwd, "env": env, "check": check})
+            if command[:2] == ["git", "clone"]:
+                (session.work_dir / ".git").mkdir(parents=True, exist_ok=True)
+            return _completed()
+
+        with patch.object(session, "_run_command", side_effect=fake_run_command):
+            session.setup()
+
+        clone_call = clone_calls[0]
+        self.assertEqual(
+            clone_call["command"],
+            ["git", "clone", "https://github.com/acme/widgets.git", str(session.work_dir)],
+        )
+        self.assertNotIn("secret-token", " ".join(clone_call["command"]))
+        self.assertIsNotNone(clone_call["env"])
+        self.assertEqual(clone_call["env"]["GIT_CONFIG_COUNT"], "1")
+        self.assertIn("AUTHORIZATION: basic ", clone_call["env"]["GIT_CONFIG_VALUE_0"])
+
 
 if __name__ == "__main__":
     unittest.main()

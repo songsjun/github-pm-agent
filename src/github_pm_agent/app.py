@@ -285,16 +285,23 @@ class GitHubPMAgentApp:
         occurred_at = self._payload_timestamp(payload)
         actor = self._payload_actor(payload)
         event_id = self._payload_event_id(event_kind, payload, occurred_at)
-        title = str(payload.get("title") or payload.get("name") or event_kind)
+        primary = self._payload_primary_object(event_kind, payload)
+        title = str(primary.get("title") or payload.get("title") or payload.get("name") or event_kind)
         comment = payload.get("comment")
         comment_body = comment.get("body") if isinstance(comment, dict) else ""
         head_commit = payload.get("head_commit")
         commit_body = head_commit.get("message") if isinstance(head_commit, dict) else ""
-        body = str(payload.get("body") or comment_body or commit_body or "")
+        body = str(primary.get("body") or payload.get("body") or comment_body or commit_body or "")
         target_kind, target_number = self._payload_target(payload, event_kind)
         metadata = {
             "action": payload.get("action", ""),
             "repository": repo,
+            "label": ((payload.get("label") or {}).get("name") if isinstance(payload.get("label"), dict) else ""),
+            "labels": [
+                str((label or {}).get("name", ""))
+                for label in ((payload.get("issue") or payload).get("labels") or [])
+                if isinstance(label, dict) and (label or {}).get("name")
+            ],
         }
         return Event(
             event_id=event_id,
@@ -303,7 +310,7 @@ class GitHubPMAgentApp:
             occurred_at=occurred_at,
             repo=repo,
             actor=actor,
-            url=str(payload.get("html_url") or payload.get("url") or ""),
+            url=str(primary.get("html_url") or primary.get("url") or payload.get("html_url") or payload.get("url") or ""),
             title=title,
             body=body,
             target_kind=target_kind,
@@ -361,6 +368,17 @@ class GitHubPMAgentApp:
                 return "workflow_run", self._payload_number(run)
         return "none", None
 
+    def _payload_primary_object(self, event_kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if event_kind == "issues" and isinstance(payload.get("issue"), dict):
+            return payload["issue"]
+        if event_kind == "pull_request" and isinstance(payload.get("pull_request"), dict):
+            return payload["pull_request"]
+        if event_kind == "discussion" and isinstance(payload.get("discussion"), dict):
+            return payload["discussion"]
+        if event_kind == "workflow_run" and isinstance(payload.get("workflow_run"), dict):
+            return payload["workflow_run"]
+        return payload
+
     def _payload_number(self, payload: Dict[str, Any]) -> Optional[int]:
         for key in ("number", "id", "run_number"):
             value = payload.get(key)
@@ -378,6 +396,14 @@ class GitHubPMAgentApp:
     def _normalize_webhook_event_type(self, event_kind: str, payload: Dict[str, Any]) -> str:
         action = str(payload.get("action") or "").lower()
         if event_kind == "issues":
+            issue_payload = payload.get("issue") or payload
+            issue_state = str(issue_payload.get("state") or payload.get("state") or "").lower()
+            labels = [str((label or {}).get("name", "")) for label in issue_payload.get("labels", []) if isinstance(label, dict)]
+            label_name = str((payload.get("label") or {}).get("name") or "")
+            if issue_state != "closed" and action == "labeled" and label_name == "ready-to-code":
+                return "issue_coding"
+            if issue_state != "closed" and action == "reopened" and "ready-to-code" in labels:
+                return "issue_coding"
             if action in {"closed", "reopened", "assigned", "unassigned", "labeled", "unlabeled", "milestoned", "demilestoned"}:
                 return f"issue_event_{action}"
             return "issue_changed"

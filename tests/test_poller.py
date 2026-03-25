@@ -203,6 +203,77 @@ class GitHubPollerTest(unittest.TestCase):
         self.assertEqual(events[0].target_number, 7)
         self.assertEqual(events[1].target_number, 8)
 
+    def test_ready_to_code_label_event_routes_to_issue_coding(self) -> None:
+        since = "2026-03-19T10:00:00Z"
+        client = FakeClient(
+            api_pages={
+                "repos/acme/widgets/issues/events": [
+                    [
+                        {
+                            "id": 501,
+                            "event": "labeled",
+                            "created_at": "2026-03-19T10:05:00Z",
+                            "actor": {"login": "pm"},
+                            "label": {"name": "ready-to-code"},
+                            "issue": {
+                                "number": 12,
+                                "html_url": "https://example.test/issues/12",
+                                "labels": [{"name": "frontend"}, {"name": "ready-to-code"}],
+                            },
+                        },
+                        {
+                            "id": 502,
+                            "event": "labeled",
+                            "created_at": "2026-03-19T10:06:00Z",
+                            "actor": {"login": "pm"},
+                            "label": {"name": "bug"},
+                            "issue": {
+                                "number": 13,
+                                "html_url": "https://example.test/issues/13",
+                                "labels": [{"name": "bug"}],
+                            },
+                        },
+                    ]
+                ]
+            }
+        )
+        poller = GitHubPoller(client, "acme/widgets", "main", [])
+
+        events = poller._poll_issue_events(since)
+
+        self.assertEqual([event.event_type for event in events], ["issue_coding", "issue_event_labeled"])
+        self.assertEqual(events[0].metadata["label"], "ready-to-code")
+        self.assertEqual(events[0].metadata["labels"], ["frontend", "ready-to-code"])
+
+    def test_ready_to_code_label_on_closed_issue_does_not_route_to_issue_coding(self) -> None:
+        since = "2026-03-19T10:00:00Z"
+        client = FakeClient(
+            api_pages={
+                "repos/acme/widgets/issues/events": [
+                    [
+                        {
+                            "id": 503,
+                            "event": "labeled",
+                            "created_at": "2026-03-19T10:07:00Z",
+                            "actor": {"login": "pm"},
+                            "label": {"name": "ready-to-code"},
+                            "issue": {
+                                "number": 14,
+                                "state": "closed",
+                                "html_url": "https://example.test/issues/14",
+                                "labels": [{"name": "ready-to-code"}],
+                            },
+                        }
+                    ]
+                ]
+            }
+        )
+        poller = GitHubPoller(client, "acme/widgets", "main", [])
+
+        events = poller._poll_issue_events(since)
+
+        self.assertEqual([event.event_type for event in events], ["issue_event_labeled"])
+
     def test_poll_reraises_non_scope_project_errors(self) -> None:
         since = "2026-03-19T10:00:00Z"
 

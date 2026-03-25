@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import json
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -89,3 +91,27 @@ def extract_json_object(text: str) -> Optional[Any]:
         except json.JSONDecodeError:
             continue
     return None
+
+
+def git_auth_env(
+    github_token: str,
+    *,
+    host: str = "github.com",
+    base_env: Optional[dict[str, str]] = None,
+) -> Optional[dict[str, str]]:
+    """Return subprocess env that authenticates git over HTTPS without persisting the token."""
+    if not github_token:
+        return dict(base_env) if base_env is not None else None
+
+    env = dict(base_env) if base_env is not None else dict(os.environ)
+    basic_auth = base64.b64encode(f"x-access-token:{github_token}".encode("utf-8")).decode("ascii")
+
+    try:
+        config_count = int(env.get("GIT_CONFIG_COUNT", "0") or "0")
+    except ValueError:
+        config_count = 0
+
+    env["GIT_CONFIG_COUNT"] = str(config_count + 1)
+    env[f"GIT_CONFIG_KEY_{config_count}"] = f"http.https://{host}/.extraheader"
+    env[f"GIT_CONFIG_VALUE_{config_count}"] = f"AUTHORIZATION: basic {basic_auth}"
+    return env

@@ -13,10 +13,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 from github_pm_agent.devenv_client import DevEnvClient, DevEnvError, TERMINAL_JOB_STATUSES
-from github_pm_agent.utils import extract_json_object
+from github_pm_agent.utils import extract_json_object, git_auth_env
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +70,8 @@ class CodingSession:
         """
         1. Create devenv workspace (idempotent: ok if already exists)
         2. Create temp work_dir and git clone the repo into it
-           - Use HTTPS with token if github_token provided: https://{token}@github.com/{repo}.git
-           - Otherwise use git clone https://github.com/{repo}.git
+           - Use a temporary git auth header when github_token is provided
+           - Keep the stored remote URL token-free
         3. Set up git user config in work_dir for later commits
         """
 
@@ -91,7 +90,10 @@ class CodingSession:
 
         if not (self.work_dir / ".git").exists():
             logger.info("Cloning %s into %s", self.repo, self.work_dir)
-            self._run_command(["git", "clone", self._git_clone_url(), str(self.work_dir)])
+            self._run_command(
+                ["git", "clone", self._repo_clone_url(), str(self.work_dir)],
+                env=self._git_command_env(),
+            )
 
         self._run_command(["git", "config", "user.name", _GIT_USER_NAME], cwd=self.work_dir)
         self._run_command(["git", "config", "user.email", _GIT_USER_EMAIL], cwd=self.work_dir)
@@ -208,7 +210,7 @@ class CodingSession:
         branch_name = plan.branch_name
         logger.info("Applying fix on existing branch %s for %s#%s", branch_name, self.repo, self.issue_number)
 
-        self._run_command(["git", "fetch", "origin", branch_name], cwd=self.work_dir)
+        self._run_command(["git", "fetch", "origin", branch_name], cwd=self.work_dir, env=self._git_command_env())
 
         branch_exists_locally = (
             self._run_command(
@@ -240,17 +242,17 @@ class CodingSession:
 
         # Rebase on the latest main so the PR stays conflict-free for merge.
         logger.info("Rebasing fix branch %s on origin/main for %s#%s", branch_name, self.repo, self.issue_number)
-        self._run_command(["git", "fetch", "origin", "main"], cwd=self.work_dir)
+        self._run_command(["git", "fetch", "origin", "main"], cwd=self.work_dir, env=self._git_command_env())
         rebase_result = self._run_command(
             ["git", "rebase", "origin/main"], cwd=self.work_dir, check=False
         )
         if rebase_result.returncode != 0:
             logger.warning("Rebase failed for fix branch %s — aborting and pushing as-is", branch_name)
             self._run_command(["git", "rebase", "--abort"], cwd=self.work_dir, check=False)
-            self._run_command(["git", "push", "origin", branch_name], cwd=self.work_dir)
+            self._run_command(["git", "push", "origin", branch_name], cwd=self.work_dir, env=self._git_command_env())
         else:
             self._run_command(
-                ["git", "push", "origin", branch_name, "--force-with-lease"], cwd=self.work_dir
+                ["git", "push", "origin", branch_name, "--force-with-lease"], cwd=self.work_dir, env=self._git_command_env()
             )
 
     def push_branch(self) -> str:
@@ -262,18 +264,18 @@ class CodingSession:
 
         branch_name = self._current_branch_name()
         logger.info("Rebasing branch %s on origin/main for %s#%s", branch_name, self.repo, self.issue_number)
-        self._run_command(["git", "fetch", "origin", "main"], cwd=self.work_dir)
+        self._run_command(["git", "fetch", "origin", "main"], cwd=self.work_dir, env=self._git_command_env())
         rebase_result = self._run_command(
             ["git", "rebase", "origin/main"], cwd=self.work_dir, check=False
         )
         if rebase_result.returncode != 0:
             logger.warning("Rebase failed for %s — aborting rebase and pushing as-is", branch_name)
             self._run_command(["git", "rebase", "--abort"], cwd=self.work_dir, check=False)
-            self._run_command(["git", "push", "origin", branch_name], cwd=self.work_dir)
+            self._run_command(["git", "push", "origin", branch_name], cwd=self.work_dir, env=self._git_command_env())
         else:
             # Force push after rebase to update the remote branch.
             self._run_command(
-                ["git", "push", "origin", branch_name, "--force-with-lease"], cwd=self.work_dir
+                ["git", "push", "origin", branch_name, "--force-with-lease"], cwd=self.work_dir, env=self._git_command_env()
             )
         return branch_name
 
@@ -445,10 +447,8 @@ class CodingSession:
         if not (self.work_dir / ".git").exists():
             raise RuntimeError("coding session repository is not initialized; call setup() first")
 
-    def _git_clone_url(self) -> str:
-        if not self.github_token:
-            return f"https://github.com/{self.repo}.git"
-        return f"https://{quote(self.github_token, safe='')}@github.com/{self.repo}.git"
+    def _repo_clone_url(self) -> str:
+        return f"https://github.com/{self.repo}.git"
 
     def _build_context_archive(self, plan: "CodingPlan | None" = None) -> bytes:
         if plan is not None:
@@ -660,6 +660,11 @@ class CodingSession:
         env = dict(os.environ)
         env["GITHUB_TOKEN"] = self.github_token
         return env
+
+    def _git_command_env(self) -> dict[str, str] | None:
+        if not self.github_token:
+            return None
+        return git_auth_env(self.github_token, base_env=os.environ)
 
     def _image_tag(self) -> str:
         safe_workspace = re.sub(r"[^a-z0-9_.-]+", "-", self.workspace_id.lower()).strip("-") or "workspace"

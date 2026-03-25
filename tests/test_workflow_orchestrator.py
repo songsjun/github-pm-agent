@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from unittest.mock import patch
 
 from github_pm_agent.models import Event
 from github_pm_agent.workflow_instance import WorkflowInstance
@@ -1026,6 +1028,7 @@ def test_issue_coding_unparseable_review_output_terminates_workflow() -> None:
         runtime_dir = Path(tmpdir)
         instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
         instance.set_phase("code_review")
+        instance.set_artifact("code_review", "Looks good to me overall.")
         instance.set_artifact("code_review_combined", "Looks good to me overall.")
         instance.set_artifact("pr_number", "17")
 
@@ -1080,6 +1083,70 @@ def test_issue_coding_combined_lgtm_reviews_are_accepted() -> None:
         assert resumed.metadata["advance_to_phase"] == "pm_decision"
         final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
         assert final_instance.is_terminated() is False
+
+
+def test_issue_coding_context_prep_failure_terminates_workflow() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        with patch.object(
+            WorkflowOrchestrator,
+            "_prepare_phase_ai_cwd",
+            side_effect=RuntimeError("git clone failed: repository not found"),
+        ):
+            result = orchestrator.process(_issue_coding_event())
+
+        assert result["terminated"] is True
+        assert "failed to prepare repository context" in actions.comment_calls[0]["message"]
+        assert engine.run_raw_text_handler_calls == []
+        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert final_instance.is_terminated() is True
+
+
+def test_prepare_phase_ai_cwd_clones_with_auth_env_without_token_in_url() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(
+            _project_root(),
+            engine,
+            actions,
+            FakeClient({}),
+            {"github": {"token": "secret-token"}},
+        )
+
+        recorded: list[dict[str, Any]] = []
+
+        def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            recorded.append({"command": command, "kwargs": kwargs})
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with patch("github_pm_agent.workflow_orchestrator.subprocess.run", side_effect=fake_run):
+            ai_cwd = orchestrator._prepare_phase_ai_cwd(
+                _issue_coding_event(),
+                {"action": "coding_session"},
+                [],
+                {},
+            )
+
+        assert ai_cwd is not None
+        clone_call = recorded[0]
+        assert clone_call["command"] == [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "https://github.com/songsjun/example.git",
+            str(ai_cwd),
+        ]
+        assert "secret-token" not in " ".join(clone_call["command"])
+        env = clone_call["kwargs"]["env"]
+        assert env["GIT_CONFIG_COUNT"] == "1"
+        assert "AUTHORIZATION: basic " in env["GIT_CONFIG_VALUE_0"]
 
 
 def test_issue_coding_blocking_reviews_requeue_fix_iteration_with_new_event_id() -> None:

@@ -3,15 +3,19 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import inspect
+import logging
 import os
 import re
 import shutil
 import subprocess
-from urllib.parse import quote
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
+from github_pm_agent.utils import git_auth_env
+
+
+logger = logging.getLogger(__name__)
 
 
 class _PermissionBoundActions:
@@ -397,7 +401,7 @@ class WorkflowOrchestrator:
             node_id = meta.get("node_id") or (
                 instance.get_original_event() or {}
             ).get("metadata", {}).get("node_id", "")
-            ai_cwd = self._prepare_phase_ai_cwd(event, step, executors, artifacts)
+            ai_cwd: Optional[Path] = None
 
             # Idempotency guard: if this phase already produced an artifact (a previous
             # event triggered the same workflow), skip re-running executors to prevent
@@ -413,6 +417,30 @@ class WorkflowOrchestrator:
             elif existing_artifact is not None and not meta.get("rerun_phase") and not meta.get("advance_to_phase"):
                 last_content = existing_artifact
                 executors = []
+
+            if executors:
+                try:
+                    ai_cwd = self._prepare_phase_ai_cwd(event, step, executors, artifacts)
+                except RuntimeError as exc:
+                    failure_message = (
+                        f"Workflow stopped during `{current_phase}`: failed to prepare repository context.\n\n{exc}"
+                    )
+                    if event.target_kind in ("issue", "pull_request") and event.target_number:
+                        self.actions.comment(event.target_kind, event.target_number, failure_message)
+                    elif event.target_kind == "discussion" and node_id:
+                        self.actions.comment_on_discussion(node_id, event.target_number, failure_message)
+                    instance.set_terminated(f"AI context preparation failed in {current_phase}: {exc}")
+                    return {
+                        "phase": current_phase,
+                        "ai_outputs": all_ai_outputs,
+                        "gate": {},
+                        "artifacts": instance.get_artifacts(),
+                        "created_issues": created_issues,
+                        "issue_creation_error": issue_creation_error,
+                        "terminated": True,
+                        "terminated_reason": instance.get_terminated_reason(),
+                        "escalation_refs": [],
+                    }
 
             for executor in executors:
                 exec_vars = {**variables, **executor["extra_vars"]}
@@ -1396,7 +1424,7 @@ class WorkflowOrchestrator:
         artifacts: Dict[str, Any],
     ) -> Optional[Path]:
         """Clone the target repo into a readable local context for coding-related AI phases."""
-        if step.get("action") not in {"coding_session", "check_review_result", "fix_coding_session", "merge_or_reopen"}:
+        if step.get("action") not in {"coding_session", "check_review_result", "fix_coding_session"}:
             return None
 
         safe_repo = str(event.repo or "").replace("/", "__", 1)
@@ -1407,45 +1435,63 @@ class WorkflowOrchestrator:
         context_dir.parent.mkdir(parents=True, exist_ok=True)
 
         github_token = self._get_worker_github_token(executors) or self._get_default_github_token()
-        clone_url = (
-            f"https://{quote(github_token, safe='')}@github.com/{event.repo}.git"
-            if github_token
-            else f"https://github.com/{event.repo}.git"
-        )
-        clone_result = subprocess.run(
-            ["git", "clone", "--depth", "1", clone_url, str(context_dir)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if clone_result.returncode != 0:
-            shutil.rmtree(context_dir, ignore_errors=True)
-            return None
+        clone_url = f"https://github.com/{event.repo}.git"
+        git_env = git_auth_env(github_token)
 
-        branch_name = str(artifacts.get("branch_name") or "").strip()
-        if branch_name:
-            subprocess.run(
-                ["git", "fetch", "origin", branch_name],
-                cwd=str(context_dir),
+        try:
+            clone_result = subprocess.run(
+                ["git", "clone", "--depth", "1", clone_url, str(context_dir)],
                 capture_output=True,
                 text=True,
                 check=False,
+                env=git_env,
             )
-            checkout_result = subprocess.run(
-                ["git", "checkout", branch_name],
-                cwd=str(context_dir),
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if checkout_result.returncode != 0:
-                subprocess.run(
-                    ["git", "checkout", "-B", branch_name, f"origin/{branch_name}"],
+            if clone_result.returncode != 0:
+                raise RuntimeError(
+                    f"git clone failed for {event.repo}: "
+                    f"{clone_result.stderr.strip() or clone_result.stdout.strip() or 'no output'}"
+                )
+
+            branch_name = str(artifacts.get("branch_name") or "").strip()
+            if branch_name:
+                fetch_result = subprocess.run(
+                    ["git", "fetch", "origin", branch_name],
+                    cwd=str(context_dir),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=git_env,
+                )
+                if fetch_result.returncode != 0:
+                    raise RuntimeError(
+                        f"git fetch failed for branch {branch_name}: "
+                        f"{fetch_result.stderr.strip() or fetch_result.stdout.strip() or 'no output'}"
+                    )
+
+                checkout_result = subprocess.run(
+                    ["git", "checkout", branch_name],
                     cwd=str(context_dir),
                     capture_output=True,
                     text=True,
                     check=False,
                 )
+                if checkout_result.returncode != 0:
+                    fallback_result = subprocess.run(
+                        ["git", "checkout", "-B", branch_name, f"origin/{branch_name}"],
+                        cwd=str(context_dir),
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    if fallback_result.returncode != 0:
+                        raise RuntimeError(
+                            f"git checkout failed for branch {branch_name}: "
+                            f"{fallback_result.stderr.strip() or fallback_result.stdout.strip() or 'no output'}"
+                        )
+        except Exception:
+            shutil.rmtree(context_dir, ignore_errors=True)
+            raise
+
         return context_dir
 
     def _collect_blocking_unknowns(self, ai_outputs: List[Dict[str, Any]], phase: str) -> List[str]:
