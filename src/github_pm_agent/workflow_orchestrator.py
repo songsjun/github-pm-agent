@@ -1011,8 +1011,14 @@ class WorkflowOrchestrator:
             summary["contract_violation"] = True
             return summary
 
-        rebuilt = "".join(block.group(0) for block in blocks).strip()
-        if rebuilt != stripped:
+        # Allow whitespace between blocks but reject any non-whitespace content
+        # that does not belong to a recognised **Blocking**/**Warning** block.
+        non_block = re.sub(
+            r"(?ms)^\*\*(?:Blocking|Warning)\*\*.*?(?=^\*\*(?:Blocking|Warning)\*\*|\Z)",
+            "",
+            stripped,
+        )
+        if non_block.strip():
             summary["contract_violation"] = True
             return summary
 
@@ -1036,6 +1042,7 @@ class WorkflowOrchestrator:
             try:
                 loaded = _json_local.loads(test_result)
             except (_json_local.JSONDecodeError, ValueError):
+                logger.warning("Failed to parse test_result artifact as JSON: %r", test_result[:200])
                 return {}
             return loaded if isinstance(loaded, dict) else {}
         return test_result if isinstance(test_result, dict) else {}

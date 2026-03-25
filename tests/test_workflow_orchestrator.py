@@ -1207,6 +1207,38 @@ def test_phase_gate_scanner_repeated_issue_gate_uses_gate_instance_key() -> None
         assert resumed.metadata["execute_gated_action"] is True
 
 
+def test_review_output_with_trailing_newlines_is_not_contract_violation() -> None:
+    """Whitespace between/after blocks must not trigger contract_violation."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_phase("code_review")
+        # Real AI output: two blocks separated by a blank line, trailing newline
+        combined = (
+            "**Warning** — unused import in utils.py\n\n"
+            "- **Severity:** warning\n\n"
+            "**Warning** — missing docstring on public method\n\n"
+            "- **Severity:** warning\n"
+        )
+        # Both artifacts must be set so the idempotency guard fires and skips AI re-run.
+        instance.set_artifact("code_review", combined)
+        instance.set_artifact("code_review_combined", combined)
+        instance.set_artifact("pr_number", "17")
+        instance.set_original_event(_issue_coding_event().to_dict())
+
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        orchestrator.process(_issue_coding_event())
+
+        # Warnings only → should approve PR, NOT terminate
+        assert len(actions.submit_pr_review_calls) == 1
+        assert actions.submit_pr_review_calls[0]["event"] == "APPROVE"
+        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert final_instance.is_terminated() is False
+
+
 def test_issue_changed_workflow_runs_on_opened() -> None:
     """issue_changed workflow runs worker analysis when action=opened."""
     with tempfile.TemporaryDirectory() as tmpdir:

@@ -70,8 +70,7 @@ class WorkflowInstance:
         self._state["gate_issue_number"] = issue_number
         if next_phase:
             self._state["gate_next_phase"] = next_phase
-        if posted_at:
-            self._state["gate_posted_at"] = posted_at
+        self._state["gate_posted_at"] = posted_at
         self._state["gate_resume_mode"] = resume_mode or "advance"
         self._save()
 
