@@ -30,7 +30,44 @@ steps:
     action: fix_coding_session
     gate: false
 
-  # Phase 4: PM makes the final merge / reopen decision (human-gated).
+  # Phase 4: A separate "test author" agent writes black-box acceptance tests.
+  # This agent sees only the feature spec and interface contracts — NOT the
+  # implementation bodies — ensuring tests validate behavior, not implementation.
+  # Only test files (*.test.ts, *.spec.ts) are accepted; others are rejected.
+  # Non-fatal: if this phase fails, the workflow continues to typecheck.
+  - phase: write_acceptance_tests
+    slots: 1
+    prompt_path: prompts/coding/write_acceptance_tests.md
+    action: write_acceptance_tests_session
+    gate: false
+
+  # Phase 5: Run tsc --noEmit on the PR branch in DevEnv. Hard signal: if the
+  # TypeScript compiler reports errors, evidence_check will FAIL automatically.
+  # The AI step summarizes the result for the gate comment.
+  - phase: typecheck
+    roles: [pm]
+    prompt_path: prompts/coding/typecheck.md
+    action: run_typecheck
+    gate: false
+
+  # Phase 6: PM checks integration across route and lib modules via static
+  # import analysis. Detects parallel data stores and dead exports before merge.
+  # Output is advisory — passed to evidence_check as $artifact_integration_check.
+  - phase: integration_check
+    roles: [pm]
+    prompt_path: prompts/coding/integration_check.md
+    gate: false
+
+  # Phase 7: PM synthesizes all evidence (typecheck, tests, code review, integration)
+  # into a structured PASS/FAIL verdict. This is the objective gate that drives
+  # the merge decision — text opinions are secondary.
+  - phase: evidence_check
+    roles: [pm]
+    prompt_path: prompts/coding/evidence_check.md
+    gate: false
+
+  # Phase 8: PM makes the final merge / reopen decision (human-gated).
+  # Uses $artifact_evidence_check as the primary decision driver.
   - phase: pm_decision
     roles: [pm]
     prompt_path: prompts/coding/pm_decision.md

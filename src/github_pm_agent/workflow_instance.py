@@ -164,6 +164,17 @@ class WorkflowInstance:
         self._state["review_round"] = round_num
         self._save()
 
+    def get_gate_round(self, phase: str) -> int:
+        """Return how many times the gate for *phase* has been re-run due to revise/reject."""
+        return int(self._state.get("gate_rounds", {}).get(phase, 0))
+
+    def increment_gate_round(self, phase: str) -> int:
+        """Increment and return the gate re-run counter for *phase*."""
+        rounds = self._state.setdefault("gate_rounds", {})
+        rounds[phase] = int(rounds.get(phase, 0)) + 1
+        self._save()
+        return int(rounds[phase])
+
     def get_workflow_type(self) -> Optional[str]:
         return self._state.get("workflow_type") or None
 

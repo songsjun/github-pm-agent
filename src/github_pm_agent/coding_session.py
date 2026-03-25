@@ -193,6 +193,50 @@ class CodingSession:
             raise RuntimeError("test execution finished without a result")
         return result
 
+    def run_command_on_branch(
+        self, branch_name: str, install_command: str, command: str
+    ) -> TestResult:
+        """Checkout an existing remote branch and run a command (e.g. tsc --noEmit) in Docker.
+
+        Useful for running a typecheck or lint pass on the exact state of a PR branch
+        without modifying any files.  Reuses the same Docker build-time sentinel mechanism
+        as run_tests() so the exit code is captured reliably.
+        """
+        self._ensure_repo_ready()
+
+        # Fetch and checkout the remote branch (read-only — no file writes)
+        self._run_command(["git", "fetch", "origin", branch_name], cwd=self.work_dir)
+        branch_exists_locally = (
+            self._run_command(
+                ["git", "rev-parse", "--verify", branch_name], cwd=self.work_dir, check=False
+            ).returncode == 0
+        )
+        if branch_exists_locally:
+            self._run_command(["git", "checkout", branch_name], cwd=self.work_dir)
+            self._run_command(
+                ["git", "reset", "--hard", f"origin/{branch_name}"], cwd=self.work_dir
+            )
+        else:
+            self._run_command(
+                ["git", "checkout", "-b", branch_name, f"origin/{branch_name}"],
+                cwd=self.work_dir,
+            )
+        self._branch_name = branch_name
+
+        # Build a throwaway plan that carries the install + command
+        throwaway_plan = CodingPlan(
+            files=[],
+            install_command=install_command,
+            test_command=command,
+            branch_name=branch_name,
+            commit_message="(typecheck — no commit)",
+        )
+        logger.info(
+            "Running command on branch %s for %s#%s: %s",
+            branch_name, self.repo, self.issue_number, command,
+        )
+        return self.run_tests(throwaway_plan)
+
     def fix_and_push(self, plan: CodingPlan) -> None:
         """
         Apply fix files to the EXISTING feature branch (fetched from origin) and push.

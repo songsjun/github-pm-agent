@@ -1,0 +1,28 @@
+event_type: milestone_check
+
+steps:
+  # Holistic product review after all issues in a milestone are merged.
+  # PM reads main branch code (route + lib files) and checks each PRD feature
+  # and user journey against actual implementations — not design documents.
+  #
+  # Output: PRD coverage table + user journey walkthrough + verdict
+  #   READY           → all Must-have features implemented, all journeys Connected
+  #   GAPS_FOUND      → partial implementations; product partially works
+  #   CRITICAL_GAPS   → Must-have features missing or primary journeys broken
+  #
+  # Trigger manually after all milestone PRs are merged:
+  #   github-pm-agent webhook --config config/local.json \
+  #     --event-type milestone_check \
+  #     --payload-file payload.json
+  #
+  # Minimum payload.json:
+  #   { "repo": "owner/repo", "discussion_number": 4 }
+  #
+  # The orchestrator fetches route and lib files from the main branch automatically.
+  # $artifact_requirements must be available as a stored artifact from the
+  # discussion workflow, or the owner can paste the PRD in the trigger payload.
+  - phase: prd_alignment
+    roles: [pm]
+    prompt_path: prompts/coding/milestone_check.md
+    output_mode: raw_text
+    gate: true

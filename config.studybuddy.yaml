@@ -40,7 +40,7 @@ ai:
       script: scripts/run_ai_cli.py
       provider_name: codex
       default_model: gpt-5.4
-      codex_path: /opt/homebrew/bin/codex
+      codex_path: /Users/ss/.nvm/versions/node/v24.14.0/bin/codex
       reasoning_effort: low
 
 runtime_dir: .runtime-studybuddy

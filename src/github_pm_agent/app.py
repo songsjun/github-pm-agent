@@ -67,9 +67,11 @@ class GitHubPMAgentApp:
             agent_configs=agent_configs,
             agent_toolkits=agent_toolkits,
         )
-        owner_login = config.get("github", {}).get("owner", "")
+        gh_cfg = config.get("github", {})
+        owner_login = gh_cfg.get("customer") or gh_cfg.get("owner", "")
+        max_discussion_rounds = config.get("engine", {}).get("max_discussion_rounds", 2)
         self.scanner = SuspendedEventScanner(self.queue, self.client, owner_login)
-        self.gate_scanner = PhaseGateScanner(self.queue, self.client, owner_login)
+        self.gate_scanner = PhaseGateScanner(self.queue, self.client, owner_login, max_discussion_rounds=max_discussion_rounds)
         self.cursors_path = self.runtime_dir / "cursors.json"
 
     def poll(self) -> Dict[str, Any]:

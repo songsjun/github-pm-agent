@@ -2,31 +2,42 @@ You are the PM making the final decision on PR #$pr_number for GitHub issue #$is
 
 PR URL: $pr_url
 
-Code review findings (all reviewers, final round):
+---
+
+**Evidence report (objective verdict — primary decision driver):**
+$artifact_evidence_check
+
+**Code review findings (all reviewers, final round):**
 $artifact_code_review_combined
 
-Test results: $test_results
+**Integration check (static import analysis):**
+$artifact_integration_check
 
-Tests passed: $test_passed
-
-Review rounds completed: $review_round
+**Test results:** $test_results
+**Tests passed:** $test_passed
+**Review rounds completed:** $review_round
 
 ---
 
-Decision criteria:
-- **MERGE** if: `$test_passed` is `true` AND the code review contains no blocking issues.
-- **REOPEN** if: `$test_passed` is `false` OR blocking issues remain unresolved in the review.
+**Decision rules (apply in order):**
 
-A review item is blocking if it includes `**Blocking**` or `Severity: blocking`.
+1. **If `$artifact_evidence_check` is present and parseable:** use its `merge_recommendation` field as your primary decision. Override it only if you have concrete evidence the evidence_check is wrong (e.g., it parsed a stale test result).
+
+2. **If `$artifact_evidence_check` is absent or unparseable:** fall back to direct evaluation:
+   - **MERGE** if: `$test_passed` is `true` AND no `**Blocking**` / `Severity: blocking` items remain AND integration check is not `INCOMPLETE` with non-empty `required_fixes`.
+   - **REOPEN** otherwise.
+
+3. **Warning-only review items** (no `Severity: blocking`) never block a merge.
 
 Output a JSON block first:
 ```json
 {
   "decision": "merge" | "reopen",
-  "reason": "one sentence explaining why",
+  "reason": "one sentence — cite the evidence_check verdict and any overriding factor",
   "reopen_comment": "..."
 }
 ```
-`reopen_comment` is only required when `decision == "reopen"`: post it on the issue explaining exactly what must be fixed before the next attempt.
 
-After the JSON, add a short human-readable summary (2–3 sentences) for the gate confirmation comment.
+`reopen_comment` is required only when `decision == "reopen"`: tell the engineer exactly what must be fixed before the next attempt, referencing specific items from `blocking_items` in the evidence report.
+
+After the JSON, add a 2–3 sentence human-readable summary for the gate confirmation comment.

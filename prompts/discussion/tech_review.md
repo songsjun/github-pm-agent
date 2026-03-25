@@ -13,7 +13,13 @@ $pending_comments
 
 ---
 
-**SCOPE CALIBRATION — do this first, silently:**
+**STEP 1 — USE PRD COVERAGE GATE DECISIONS:**
+Check `$pending_comments` for a PRD coverage table from the prd_coverage_gate phase. If one is present:
+- For every row marked `Engineer must address in final design`: your `final_design` must address it. Do not silently drop it.
+- For every row marked `Owner decision: defer to post-MVP?` where the owner has confirmed deferral: note the deferral explicitly in `final_design` under a "Deferred features" section, with the reason.
+- For every row marked `Narrowed`: either restore the full PRD scope in final_design, or explicitly document the narrowing and get owner sign-off in your evaluation_summary.
+
+**SCOPE CALIBRATION — do this second, silently:**
 Before evaluating, verify:
 1. Does the proposed architecture match the scope in the PRD? (If PRD says "single user", has engineer proposed single-user infrastructure?)
 2. Are security requirements proportional to scope? (Is security asking for enterprise controls on a personal tool?)

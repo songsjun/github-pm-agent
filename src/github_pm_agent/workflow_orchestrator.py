@@ -269,8 +269,11 @@ class WorkflowOrchestrator:
 
         advance_to = meta.get("advance_to_phase")
         if advance_to:
+            _prev_gated_phase = instance.get_phase()
             instance.set_phase(advance_to)
             instance.clear_gate()
+            # Persist key phase outputs as repo docs so all agents can reference them.
+            self._commit_phase_docs(_prev_gated_phase, instance)
 
         current_phase = instance.get_phase()
         if current_phase is None:
@@ -325,6 +328,20 @@ class WorkflowOrchestrator:
             variables["pr_url"] = str(artifacts.get("pr_url") or "")
             variables["review_round"] = str(instance.get_review_round())
             variables["test_failure_context"] = str(artifacts.get("test_failure_context") or "")
+            # Typecheck result (populated after run_typecheck action)
+            _tc_raw = artifacts.get("typecheck_result") or {}
+            if isinstance(_tc_raw, str):
+                import json as _json_tc  # noqa: PLC0415
+                try:
+                    _tc_raw = _json_tc.loads(_tc_raw)
+                except (_json_tc.JSONDecodeError, ValueError):
+                    _tc_raw = {}
+            if isinstance(_tc_raw, dict):
+                variables["typecheck_passed"] = "true" if _tc_raw.get("passed") else "false"
+                variables["typecheck_output"] = _tc_raw.get("output", "")
+            else:
+                variables["typecheck_passed"] = "false"
+                variables["typecheck_output"] = ""
             # Fetch live PR diff for code_review and fix_iteration phases
             _raw_pr_num = artifacts.get("pr_number", "")
             _pr_num_int = int(str(_raw_pr_num)) if str(_raw_pr_num).strip().isdigit() else None
@@ -335,6 +352,135 @@ class WorkflowOrchestrator:
                     variables["pr_diff"] = ""
             else:
                 variables["pr_diff"] = ""
+            # Inject repo docs (prd.md, tech_design.md) for phases that benefit from
+            # persistent architecture context.  Files are committed by _commit_phase_docs
+            # after gate confirmation, so they may not exist yet for early phases.
+            _doc_phases = ("implement", "code_review", "fix_iteration",
+                           "integration_check", "prd_alignment")
+            if current_phase in _doc_phases:
+                for _doc_var, _doc_path in (
+                    ("repo_prd", "docs/prd.md"),
+                    ("repo_tech_design", "docs/tech_design.md"),
+                    ("repo_conventions", "docs/conventions.md"),
+                ):
+                    if _doc_var not in variables:
+                        try:
+                            _doc_content = self.client.get_file_content(_doc_path)
+                            variables[_doc_var] = _doc_content
+                        except Exception:  # noqa: BLE001
+                            variables[_doc_var] = ""
+                if current_phase == "prd_alignment":
+                    try:
+                        variables["repo_component_inventory"] = self.client.get_file_content(
+                            "docs/component_inventory.md"
+                        )
+                    except Exception:  # noqa: BLE001
+                        variables["repo_component_inventory"] = ""
+
+            # For prd_alignment (milestone_check): fetch route and lib files from main branch
+            if current_phase == "prd_alignment":
+                for _ref in ("main", "master"):
+                    try:
+                        _routes = self.client.get_source_files(
+                            _ref, ["src/app/api/", "src/app/routes/", "app/api/", "routes/", "api/"]
+                        )
+                    except Exception:  # noqa: BLE001
+                        _routes = ""
+                    try:
+                        _libs = self.client.get_source_files(
+                            _ref, ["src/lib/", "lib/", "src/services/", "services/"]
+                        )
+                    except Exception:  # noqa: BLE001
+                        _libs = ""
+                    if _routes or _libs:
+                        variables["route_file_contents"] = _routes
+                        variables["lib_file_contents"] = _libs
+                        break
+                else:
+                    variables["route_file_contents"] = ""
+                    variables["lib_file_contents"] = ""
+
+            # For implement, code_review, fix_iteration: inject existing file contents and
+            # dependency interfaces so agents can preserve exports and use correct signatures.
+            # NOTE: write_acceptance_tests is intentionally excluded — the test author must
+            # NOT see implementation bodies; it gets dependency_interfaces (signatures) only.
+            if current_phase in ("implement", "code_review", "fix_iteration", "write_acceptance_tests"):
+                issue_body = event.body or ""
+                _file_paths, _dep_paths = self._parse_issue_body_files(issue_body)
+
+                # write_acceptance_tests must not see implementation bodies — test author
+                # works from spec + interface contracts only (black-box perspective).
+                _inject_existing = current_phase != "write_acceptance_tests"
+
+                if _file_paths and _inject_existing:
+                    _existing_parts: List[str] = []
+                    for _fp in _file_paths:
+                        try:
+                            _existing = self.client.get_file_content(_fp)
+                            if _existing:
+                                _existing_parts.append(
+                                    f"**Current content of `{_fp}`:**\n```\n{_existing}\n```"
+                                )
+                            else:
+                                _existing_parts.append(
+                                    f"**`{_fp}`:** does not exist yet (new file)."
+                                )
+                        except Exception:  # noqa: BLE001
+                            _existing_parts.append(
+                                f"**`{_fp}`:** does not exist yet (new file)."
+                            )
+                    variables["existing_file_contents"] = "\n\n".join(_existing_parts)
+                else:
+                    variables["existing_file_contents"] = ""
+
+                if _dep_paths:
+                    _dep_parts: List[str] = []
+                    for _dep in _dep_paths:
+                        try:
+                            _dep_content = self.client.get_file_content(_dep)
+                            if _dep_content:
+                                _dep_parts.append(
+                                    f"**`{_dep}`:**\n```\n{_dep_content}\n```"
+                                )
+                            else:
+                                _dep_parts.append(
+                                    f"**`{_dep}`:** (file not found — dependency does not exist yet)"
+                                )
+                        except Exception:  # noqa: BLE001
+                            _dep_parts.append(f"**`{_dep}`:** (could not fetch)")
+                    variables["dependency_interfaces"] = "\n\n".join(_dep_parts)
+                else:
+                    variables["dependency_interfaces"] = ""
+
+            # For integration_check: fetch route and lib files from the PR branch
+            if current_phase == "integration_check":
+                _branch = str(artifacts.get("branch_name") or "")
+                if _branch:
+                    try:
+                        variables["route_file_contents"] = self.client.get_source_files(
+                            _branch, ["src/app/api/", "src/app/routes/", "app/api/", "routes/", "api/"]
+                        )
+                    except Exception:  # noqa: BLE001
+                        variables["route_file_contents"] = ""
+                    try:
+                        variables["lib_file_contents"] = self.client.get_source_files(
+                            _branch, ["src/lib/", "lib/", "src/services/", "services/"]
+                        )
+                    except Exception:  # noqa: BLE001
+                        variables["lib_file_contents"] = ""
+                else:
+                    variables["route_file_contents"] = ""
+                    variables["lib_file_contents"] = ""
+
+            # For pm_decision: if test_result artifact is missing, fall back to live PR CI status
+            if current_phase == "pm_decision" and not artifacts.get("test_result") and _pr_num_int:
+                try:
+                    ci = self.client.get_pr_ci_status(_pr_num_int)
+                    variables["test_passed"] = "true" if ci.get("passed") else "false"
+                    if ci.get("summary"):
+                        variables["test_results"] = ci["summary"]
+                except Exception:
+                    pass
             human_comment = meta.get("gate_human_comment", "")
             variables["human_comment"] = f"Human feedback:\n{human_comment}\n" if human_comment else ""
             pending = instance.get_pending_comments()
@@ -787,6 +933,153 @@ class WorkflowOrchestrator:
                     self.actions.comment("issue", event.target_number, f"Fix iteration failed: {exc}")
                     instance.set_terminated(str(exc)[:200])
                     break
+            elif step.get("action") == "run_typecheck":
+                # Run tsc --noEmit (or a project-specific typecheck command) on the PR
+                # branch in a fresh DevEnv container.  Stores result as typecheck_result
+                # artifact so evidence_check can use it as a hard signal.
+                try:
+                    from github_pm_agent.coding_session import CodingSession
+                    from github_pm_agent.devenv_client import DevEnvClient
+                    import json as _json_tc_action
+
+                    artifacts = instance.get_artifacts()
+                    branch_name = str(artifacts.get("branch_name") or "")
+                    if not branch_name:
+                        instance.set_artifact(
+                            "typecheck_result",
+                            _json_tc_action.dumps({"passed": False, "output": "branch_name artifact missing — cannot run typecheck", "command": ""}),
+                        )
+                        step_succeeded = True
+                    else:
+                        # Derive install_command from the implement artifact
+                        _impl_raw = artifacts.get("implement") or ""
+                        _impl_plan = CodingSession.parse_plan(_impl_raw)
+                        install_cmd = _impl_plan.install_command if _impl_plan else "echo 'no install'"
+                        # Typecheck command: prefer project-level script, fall back to tsc
+                        typecheck_cmd = "npx tsc --noEmit 2>&1 || true; npx tsc --noEmit; echo __TEST_EXIT_CODE__:$?"
+                        # Simpler: use the build-time sentinel via run_tests mechanism
+                        # Overwrite test_command to be the typecheck command
+                        typecheck_only_cmd = "npx tsc --noEmit"
+
+                        devenv_cfg = self.config.get("devenv", {})
+                        server_url = devenv_cfg.get("server_url", "")
+                        base_image = devenv_cfg.get("base_image", "node:20-slim")
+                        github_token = (event.metadata or {}).get("github_token") or self._get_worker_github_token(executors)
+
+                        session = CodingSession(
+                            DevEnvClient(server_url=server_url),
+                            repo=event.repo,
+                            issue_number=event.target_number,
+                            github_token=github_token,
+                            base_image=base_image,
+                        )
+                        error_message = ""
+                        try:
+                            session.setup()
+                            tc_result = session.run_command_on_branch(
+                                branch_name, install_cmd, typecheck_only_cmd
+                            )
+                            instance.set_artifact(
+                                "typecheck_result",
+                                _json_tc_action.dumps({
+                                    "passed": tc_result.passed,
+                                    "output": tc_result.summary,
+                                    "command": typecheck_only_cmd,
+                                }),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            error_message = str(exc)
+                        finally:
+                            try:
+                                session.cleanup()
+                            except Exception as cleanup_exc:  # noqa: BLE001
+                                if error_message:
+                                    error_message = f"{error_message}; cleanup: {cleanup_exc}"
+                                else:
+                                    error_message = f"cleanup: {cleanup_exc}"
+
+                        if error_message:
+                            # Don't terminate — typecheck failure is non-fatal for the workflow
+                            # (evidence_check will record it as a signal)
+                            instance.set_artifact(
+                                "typecheck_result",
+                                _json_tc_action.dumps({"passed": False, "output": error_message, "command": typecheck_only_cmd}),
+                            )
+                        step_succeeded = True
+                except Exception as exc:  # noqa: BLE001
+                    import json as _json_tc_fb
+                    instance.set_artifact(
+                        "typecheck_result",
+                        _json_tc_fb.dumps({"passed": False, "output": str(exc), "command": ""}),
+                    )
+                    step_succeeded = True
+
+            elif step.get("action") == "write_acceptance_tests_session":
+                # A separate "test author" agent writes black-box acceptance tests and
+                # commits them to the existing PR branch.  The agent saw only the spec
+                # and interface contracts — not the implementation bodies.
+                try:
+                    from github_pm_agent.coding_session import CodingSession
+                    from github_pm_agent.devenv_client import DevEnvClient
+
+                    plan = CodingSession.parse_plan(last_content)
+                    if plan is None:
+                        self.actions.comment(
+                            "issue", event.target_number,
+                            "Failed to parse acceptance-test plan — skipping test authorship phase."
+                        )
+                        step_succeeded = True  # non-fatal: continue to integration_check
+                    else:
+                        # Safety: only allow test files (prevent agent from touching impl)
+                        _test_file_patterns = (".test.", ".spec.", "__tests__", "/tests/", "/test/")
+                        _non_test = [
+                            f["path"] for f in plan.files
+                            if not any(p in f["path"] for p in _test_file_patterns)
+                        ]
+                        if _non_test:
+                            self.actions.comment(
+                                "issue", event.target_number,
+                                f"Acceptance-test plan tried to modify non-test files: {_non_test}. Skipping."
+                            )
+                            step_succeeded = True
+                        else:
+                            devenv_cfg = self.config.get("devenv", {})
+                            server_url = devenv_cfg.get("server_url", "")
+                            base_image = devenv_cfg.get("base_image", "node:20-slim")
+                            github_token = (event.metadata or {}).get("github_token") or self._get_worker_github_token(executors)
+
+                            session = CodingSession(
+                                DevEnvClient(server_url=server_url),
+                                repo=event.repo,
+                                issue_number=event.target_number,
+                                github_token=github_token,
+                                base_image=base_image,
+                            )
+                            error_message = ""
+                            try:
+                                session.setup()
+                                session.fix_and_push(plan)
+                            except Exception as exc:  # noqa: BLE001
+                                error_message = str(exc)
+                            finally:
+                                try:
+                                    session.cleanup()
+                                except Exception as cleanup_exc:  # noqa: BLE001
+                                    error_message = f"{error_message}; cleanup: {cleanup_exc}" if error_message else f"cleanup: {cleanup_exc}"
+
+                            if error_message:
+                                self.actions.comment(
+                                    "issue", event.target_number,
+                                    f"Acceptance test authorship failed: {error_message} — continuing to review."
+                                )
+                            step_succeeded = True
+                except Exception as exc:  # noqa: BLE001
+                    self.actions.comment(
+                        "issue", event.target_number,
+                        f"Acceptance test phase error: {exc} — skipping."
+                    )
+                    step_succeeded = True
+
             elif step.get("action") == "merge_or_reopen":
                 from github_pm_agent.utils import extract_json_object
 
@@ -830,7 +1123,7 @@ class WorkflowOrchestrator:
                 next_step = steps[idx + 1] if 0 <= idx < len(steps) - 1 else None
                 next_phase = next_step["phase"] if next_step else None
 
-                owner = self.config.get("github", {}).get("owner", "")
+                owner = self.config.get("github", {}).get("customer") or self.config.get("github", {}).get("owner", "")
                 node_id = meta.get("node_id") or (
                     instance.get_original_event() or {}
                 ).get("metadata", {}).get("node_id", "")
@@ -846,13 +1139,20 @@ class WorkflowOrchestrator:
                     gate_body += f"\n\n---\n_Comment in this discussion to confirm and advance to **{next_phase}**._"
 
                 posted_at = utc_now_iso()
-                self.actions.comment_on_discussion(node_id, target_number, gate_body)
-                if next_phase:
-                    instance.set_discussion_gate(node_id, posted_at, next_phase)
+                if node_id:
+                    self.actions.comment_on_discussion(node_id, target_number, gate_body)
+                    if next_phase:
+                        instance.set_discussion_gate(node_id, posted_at, next_phase)
+                else:
+                    # No discussion node_id (e.g. issue_coding workflow) — post as issue comment
+                    self.actions.comment("issue", target_number, gate_body)
+                    if not next_phase:
+                        # Last phase: mark workflow complete so future events don't re-run it
+                        instance.set_completed()
                 gate_result = {"gate_discussion_node_id": node_id, "gate_posted_at": posted_at, "next_phase": next_phase}
                 if pending:
                     instance.clear_pending_comments()
-                break  # wait for human
+                break  # wait for human (or workflow is complete)
 
             # Only clear pending_comments for non-slot phases (PM/synthesis steps).
             # Slot-based phases (workers) pass pending_comments downstream so the
@@ -883,6 +1183,126 @@ class WorkflowOrchestrator:
             "issue_creation_error": issue_creation_error,
             "escalation_refs": [],
         }
+
+    @staticmethod
+    def _parse_issue_body_files(body: str) -> Tuple[List[str], List[str]]:
+        """Extract file paths and dependency paths from a structured issue body.
+
+        Supports two body formats:
+
+        New format (feature_module / multi-file):
+          ## Files
+          - `path/to/file1.ts` (create) — description
+          - `path/to/file2.ts` (modify) — description
+
+        Legacy format (single-file):
+          ## File
+          `path/to/file.ts`
+
+        In both cases also parses:
+          ## Depends on
+          - `path/to/dep.ts` — reason
+
+        Returns (file_paths, dep_paths).  Both default to empty list if absent.
+        """
+        import re
+
+        file_paths: List[str] = []
+        dep_paths: List[str] = []
+
+        def _extract_backtick_paths(section_text: str) -> List[str]:
+            paths = []
+            for m in re.finditer(r"`([^`]+\.[a-zA-Z0-9]+)`", section_text):
+                candidate = m.group(1).strip()
+                if "/" in candidate or candidate.startswith("src"):
+                    paths.append(candidate)
+            return paths
+
+        # New multi-file format: ## Files section
+        files_match = re.search(r"##\s+Files\s*\n(.*?)(?=\n##|\Z)", body, re.DOTALL)
+        if files_match:
+            file_paths = _extract_backtick_paths(files_match.group(1))
+
+        # Legacy single-file format: ## File section (fallback)
+        if not file_paths:
+            file_match = re.search(r"##\s+File\s*\n`([^`\n]+)`", body)
+            if file_match:
+                file_paths = [file_match.group(1).strip()]
+
+        # Depends on section (same for both formats)
+        depends_match = re.search(r"##\s+Depends on\s*\n(.*?)(?=\n##|\Z)", body, re.DOTALL)
+        if depends_match:
+            dep_paths = _extract_backtick_paths(depends_match.group(1))
+
+        return file_paths, dep_paths
+
+    def _commit_phase_docs(self, phase: str, instance: Any) -> None:
+        """Commit approved phase artifacts as markdown files in docs/ on the repo.
+
+        Called after a human gate is confirmed.  Only acts on the three phases
+        whose outputs are used as persistent context by coding agents:
+
+        - ``requirements``  → docs/prd.md
+        - ``tech_review``   → docs/tech_design.md  (uses the parsed final_design artifact)
+        - ``coverage_gate`` → docs/component_inventory.md
+        """
+        import logging
+
+        _log = logging.getLogger(__name__)
+
+        _phase_to_doc: Dict[str, tuple] = {
+            "requirements": ("docs/prd.md", "docs: commit approved PRD"),
+            "tech_review": ("docs/tech_design.md", "docs: commit approved technical design"),
+            "coverage_gate": ("docs/component_inventory.md", "docs: commit approved component inventory"),
+        }
+        if phase not in _phase_to_doc:
+            return
+
+        doc_path, commit_msg = _phase_to_doc[phase]
+
+        artifacts = instance.get_artifacts()
+        if phase == "tech_review":
+            # tech_review stores the parsed final_design separately
+            content = artifacts.get("final_design") or artifacts.get("tech_review", "")
+        else:
+            content = artifacts.get(phase, "")
+
+        if not content:
+            _log.warning("_commit_phase_docs: no artifact for phase=%s, skipping", phase)
+            return
+
+        try:
+            ok = self.client.commit_file(doc_path, content, commit_msg)
+            if ok:
+                _log.info("Committed %s after phase=%s", doc_path, phase)
+            else:
+                _log.warning("commit_file returned False for %s (phase=%s)", doc_path, phase)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("Failed to commit %s: %s", doc_path, exc)
+
+        # For coverage_gate: also extract the ## Project Conventions section and
+        # commit it as docs/conventions.md for coding agents to reference.
+        if phase == "coverage_gate" and content:
+            import re as _re
+            conv_match = _re.search(
+                r"(##\s+Project Conventions\s*\n.*)",
+                content,
+                _re.DOTALL | _re.IGNORECASE,
+            )
+            if conv_match:
+                conventions_content = conv_match.group(1).strip()
+                try:
+                    ok2 = self.client.commit_file(
+                        "docs/conventions.md",
+                        conventions_content,
+                        "docs: commit approved project conventions",
+                    )
+                    if ok2:
+                        _log.info("Committed docs/conventions.md after phase=coverage_gate")
+                    else:
+                        _log.warning("commit_file returned False for docs/conventions.md")
+                except Exception as exc2:  # noqa: BLE001
+                    _log.warning("Failed to commit docs/conventions.md: %s", exc2)
 
     def _create_issues_from_artifact(
         self, content: str, event: Any
@@ -927,7 +1347,7 @@ class WorkflowOrchestrator:
             return {"terminated": True, "reason": reason}
 
         if decision == "escalate":
-            owner = self.config.get("github", {}).get("owner", "")
+            owner = self.config.get("github", {}).get("customer") or self.config.get("github", {}).get("owner", "")
             evaluation = parsed.get("evaluation_summary", content[:500])
             gate_title = f"[workflow-gate] {event.repo} Discussion #{event.target_number} phase={current_phase}"
             gate_body = (
@@ -962,7 +1382,7 @@ class WorkflowOrchestrator:
         instance = WorkflowInstance.load(self.engine.runtime_dir, event.repo, discussion_number)
         if not instance.get_phase() or instance.is_completed() or instance.is_terminated():
             return {"skipped": True, "reason": "no_active_workflow", "escalation_refs": []}
-        owner_login = str(self.config.get("github", {}).get("owner", "") or "").strip()
+        owner_login = str(self.config.get("github", {}).get("customer") or self.config.get("github", {}).get("owner", "") or "").strip()
         bot_logins = {
             str(agent.get("login", "") or "").strip()
             for agent in self.config.get("agents", [])
@@ -994,7 +1414,7 @@ class WorkflowOrchestrator:
         if not instance.get_phase() or instance.is_completed() or instance.is_terminated():
             return {"skipped": True, "reason": "no_active_workflow", "escalation_refs": []}
         # Record owner comments as pending (for future gate support on issues)
-        owner_login = str(self.config.get("github", {}).get("owner", "") or "").strip()
+        owner_login = str(self.config.get("github", {}).get("customer") or self.config.get("github", {}).get("owner", "") or "").strip()
         actor_login = str(getattr(event, "actor", "") or "").strip()
         if owner_login and actor_login == owner_login and event.body:
             instance.add_pending_comment(event.body)
@@ -1403,7 +1823,7 @@ class WorkflowOrchestrator:
                 if key in issue.get("title", ""):
                     return issue.get("number")
 
-        owner = self.config.get("github", {}).get("owner", "")
+        owner = self.config.get("github", {}).get("customer") or self.config.get("github", {}).get("owner", "")
         full_body = f"@{owner}\n\n{detail}" if owner else detail
         result = self.actions.create_issue(title=title, body=full_body, labels=["agent-escalate"])
         if isinstance(result, dict):

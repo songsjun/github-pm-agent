@@ -21,6 +21,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", required=True, help="Path to a JSON config file")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    start_parser = subparsers.add_parser(
+        "start",
+        help="Bootstrap a new GitHub project from a requirements file",
+    )
+    start_parser.add_argument(
+        "--requirements",
+        required=True,
+        help="Path to the raw requirements markdown file",
+    )
+
     subparsers.add_parser("poll", help="Poll GitHub and enqueue new events")
     subparsers.add_parser("cycle", help="Poll GitHub and process the queue")
     subparsers.add_parser("reconcile", help="Process pending queue items without polling")
@@ -73,6 +83,22 @@ def _load_payload(path: str | None) -> Any:
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
+
+    # Handle `start` before building a full app — the template config has no github.repo yet.
+    if args.command == "start":
+        requirements_path = Path(args.requirements).expanduser().resolve()
+        if not requirements_path.exists():
+            print(f"Error: requirements file not found: {requirements_path}", file=sys.stderr)
+            return 1
+        requirements = requirements_path.read_text(encoding="utf-8")
+        config = load_config(args.config)
+        root = project_root(config)
+        from github_pm_agent.project_initializer import ProjectInitializer
+        initializer = ProjectInitializer(config, root)
+        result = initializer.initialize(requirements)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+
     app = _app_from_args(args)
 
     if args.command == "poll":

@@ -65,7 +65,19 @@ steps:
     output_per_role: true
     gate: false
 
-  # Phase 4: PM evaluates all proposals, writes final design doc → owner confirms
+  # Phase 3c: PM cross-references every PRD feature against the tech proposals,
+  # producing a coverage table (Full / Partial / Narrowed / Missing per feature).
+  # Owner confirms gap decisions (gate: true) — marking each gap as
+  # "engineer must fix" or "defer to post-MVP" — before the final design is written.
+  - phase: prd_coverage_gate
+    roles: [pm]
+    prompt_path: prompts/discussion/prd_coverage_gate.md
+    output_mode: raw_text
+    gate: true
+
+  # Phase 4: PM evaluates all proposals, writes final design doc → owner confirms.
+  # Uses prd_coverage_gate decisions (from $pending_comments) to fill gaps or
+  # explicitly mark deferrals in the final_design.
   - phase: tech_review
     roles: [pm]
     prompt_path: prompts/discussion/tech_review.md
@@ -79,7 +91,19 @@ steps:
     output_per_role: true
     gate: false
 
-  # Phase 5: PM breaks down into GitHub Issues (dev + test tasks)
+  # Phase 4c: PM enumerates all system components from the tech design into a
+  # structured layer coverage map. Owner confirms (gate: true) — adding missing
+  # components or marking deferrals — before issue breakdown begins.
+  # This creates a human-verified constraint that issue_breakdown must satisfy.
+  - phase: coverage_gate
+    roles: [pm]
+    prompt_path: prompts/discussion/coverage_gate.md
+    output_mode: raw_text
+    gate: true
+
+  # Phase 5: PM breaks down into GitHub Issues (dev + test tasks).
+  # Uses the coverage_gate layer map (from $pending_comments) as the primary
+  # coverage constraint to ensure no system layer is silently dropped.
   - phase: issue_breakdown
     roles: [pm]
     prompt_path: prompts/discussion/issue_breakdown.md

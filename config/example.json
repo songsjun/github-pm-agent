@@ -1,9 +1,11 @@
 {
   "github": {
+    "customer": "songsjun",
     "repo": "songsjun/StudyBuddy",
     "repos": [
       "songsjun/StudyBuddy"
     ],
+    "repo_visibility": "private",
     "gh_path": "gh",
     "default_branch": "main",
     "mentions": [
@@ -23,6 +25,7 @@
     "continue_on_error": true,
     "stale_pr_review_hours": 48,
     "blocked_issue_stale_hours": 48,
+    "max_discussion_rounds": 2,
     "second_opinion": {
       "enabled": false,
       "provider": "gemini_cli",

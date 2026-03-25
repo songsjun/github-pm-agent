@@ -47,10 +47,11 @@ def classify_gate_response(text: str) -> str:
 class PhaseGateScanner:
     """Watches workflow-gate issues; re-queues discussion events when gates are resolved."""
 
-    def __init__(self, queue: Any, client: Any, owner_login: str) -> None:
+    def __init__(self, queue: Any, client: Any, owner_login: str, max_discussion_rounds: int = 2) -> None:
         self.queue = queue
         self.client = client
         self.owner_login = owner_login
+        self.max_discussion_rounds = max_discussion_rounds
         self.advanced_path = queue.runtime_dir / "gate_advanced.jsonl"
 
     def scan_and_advance(self) -> List[Dict[str, Any]]:
@@ -173,13 +174,23 @@ class PhaseGateScanner:
         - confirm_revise → accumulate supplement, re-run the *current* PM synthesis phase
         - reject         → re-run the current PM synthesis phase with rejection reason
         - unclear        → advance anyway (treat as confirm) to avoid stalling
+
+        When the re-run count for the current phase reaches max_discussion_rounds,
+        force-advance regardless of reject/revise to prevent infinite loops.
         """
         response_type = classify_gate_response(human_comment)
         current_phase = instance.get_phase() or next_phase
         if response_type == "confirm_revise":
             instance.add_user_supplement(current_phase, human_comment)
+            round_num = instance.increment_gate_round(current_phase)
+            if round_num >= self.max_discussion_rounds:
+                # Rounds exhausted — treat as confirm and advance
+                return "confirm_revise_maxed", next_phase
             return response_type, current_phase  # re-run current PM phase
         if response_type == "reject":
+            round_num = instance.increment_gate_round(current_phase)
+            if round_num >= self.max_discussion_rounds:
+                return "reject_maxed", next_phase
             return response_type, current_phase  # re-run current PM phase
         # confirm or unclear → advance
         return response_type, next_phase

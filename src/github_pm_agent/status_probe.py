@@ -320,7 +320,10 @@ class StatusProbe:
         return len(comments)
 
     def _latest_release(self) -> Dict[str, Any]:
-        releases = self.client.api(f"repos/{self.repo}/releases", {"per_page": 1})
+        try:
+            releases = self.client.api(f"repos/{self.repo}/releases", {"per_page": 1})
+        except Exception:  # noqa: BLE001
+            return {}
         if isinstance(releases, list) and releases:
             return releases[0]
         return {}

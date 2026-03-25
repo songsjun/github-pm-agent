@@ -186,6 +186,49 @@ class GitHubClient:
             method="POST",
         )
 
+    def get_source_files(self, ref: str, dir_prefixes: List[str], max_bytes: int = 40000) -> str:
+        """Fetch source files from a branch and return as a formatted string.
+
+        Fetches the full recursive git tree for *ref*, filters to files whose
+        paths start with any entry in *dir_prefixes*, and returns their
+        contents concatenated as ``### path\\n```\\ncontent\\n``` `` blocks.
+        Stops once the accumulated content exceeds *max_bytes*.
+        """
+        import base64
+
+        try:
+            commit_data = self.api(f"repos/{self.repo}/commits/{ref}")
+            tree_sha = (commit_data.get("commit") or {}).get("tree", {}).get("sha", "")
+            if not tree_sha:
+                return ""
+            tree_data = self.api(f"repos/{self.repo}/git/trees/{tree_sha}", {"recursive": "1"})
+        except Exception:  # noqa: BLE001
+            return ""
+
+        source_exts = (".ts", ".tsx", ".js", ".jsx", ".py")
+        items = [
+            item for item in tree_data.get("tree", [])
+            if item.get("type") == "blob"
+            and any(item.get("path", "").startswith(p) for p in dir_prefixes)
+            and item.get("path", "").endswith(source_exts)
+        ]
+
+        parts: List[str] = []
+        total = 0
+        for item in items:
+            if total >= max_bytes:
+                break
+            try:
+                file_data = self.api(f"repos/{self.repo}/contents/{item['path']}", {"ref": ref})
+                raw = file_data.get("content", "")
+                content = base64.b64decode(raw).decode("utf-8", errors="replace") if raw else ""
+                parts.append(f"### {item['path']}\n```\n{content}\n```")
+                total += len(content)
+            except Exception:  # noqa: BLE001
+                pass
+
+        return "\n\n".join(parts)
+
     def get_pr_diff(self, pr_number: int) -> str:
         """Return the unified diff of a pull request (up to ~100 KB)."""
         try:
@@ -195,6 +238,32 @@ class GitHubClient:
             )
         except subprocess.CalledProcessError:
             return ""
+
+    def get_pr_ci_status(self, pr_number: int) -> Dict[str, Any]:
+        """Return a dict with `passed` (bool) and `summary` (str) from live PR check runs."""
+        try:
+            pr_data = self.api(f"repos/{self.repo}/pulls/{pr_number}", method="GET")
+            head_sha = pr_data.get("head", {}).get("sha", "")
+            if not head_sha:
+                return {"passed": False, "summary": "could not determine head SHA"}
+            checks_data = self.api(
+                f"repos/{self.repo}/commits/{head_sha}/check-runs",
+                method="GET",
+            )
+            runs = checks_data.get("check_runs", []) if isinstance(checks_data, dict) else []
+            if not runs:
+                # No check runs — treat as passed (no CI configured)
+                return {"passed": True, "summary": "no check runs found"}
+            conclusions = [r.get("conclusion") for r in runs if r.get("status") == "completed"]
+            failed = [r.get("name", "unknown") for r in runs if r.get("conclusion") in ("failure", "timed_out", "cancelled")]
+            in_progress = [r for r in runs if r.get("status") not in ("completed",)]
+            if in_progress:
+                return {"passed": False, "summary": f"{len(in_progress)} check(s) still in progress"}
+            passed = not failed
+            summary = "All checks passed" if passed else f"Failed checks: {', '.join(failed)}"
+            return {"passed": passed, "summary": summary}
+        except Exception as exc:
+            return {"passed": False, "summary": f"could not fetch CI status: {exc}"}
 
     def submit_pr_review(self, pr_number: int, event: str, body: str = "") -> None:
         """Submit a PR review with event=APPROVE | REQUEST_CHANGES | COMMENT."""
@@ -219,6 +288,44 @@ class GitHubClient:
             {"assignees[]": list(assignees)},
             method="DELETE",
         )
+
+    def get_file_content(self, path: str, ref: str = "HEAD") -> str:
+        """Return the decoded text content of a single file from the repo.
+
+        Returns an empty string if the file does not exist or cannot be fetched.
+        """
+        import base64
+
+        try:
+            data = self.api(f"repos/{self.repo}/contents/{path}", {"ref": ref})
+            raw = data.get("content", "")
+            return base64.b64decode(raw).decode("utf-8", errors="replace") if raw else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def commit_file(self, path: str, content: str, message: str) -> bool:
+        """Create or update *path* on the repo's default branch.
+
+        Uses the GitHub Contents API (PUT).  Fetches the existing file's SHA
+        first so the call works as an update when the file already exists.
+        Returns True on success, False on error.
+        """
+        import base64
+
+        encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        params: Dict[str, Any] = {"message": message, "content": encoded}
+        try:
+            existing = self.api(f"repos/{self.repo}/contents/{path}")
+            sha = existing.get("sha", "")
+            if sha:
+                params["sha"] = sha
+        except Exception:  # noqa: BLE001
+            pass  # file doesn't exist yet — create new
+        try:
+            self.api(f"repos/{self.repo}/contents/{path}", params, method="PUT")
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     def create_issue(self, title: str, body: str, labels: Optional[List[str]] = None) -> Dict[str, Any]:
         params: Dict[str, Any] = {"title": title, "body": body}
