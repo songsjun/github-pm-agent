@@ -31,6 +31,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to the raw requirements markdown file",
     )
 
+    subparsers.add_parser(
+        "release",
+        help="Generate README and development report, then create a release PR",
+    )
+
     subparsers.add_parser("poll", help="Poll GitHub and enqueue new events")
     subparsers.add_parser("cycle", help="Poll GitHub and process the queue")
     subparsers.add_parser("reconcile", help="Process pending queue items without polling")
@@ -83,6 +88,16 @@ def _load_payload(path: str | None) -> Any:
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
+
+    # Handle `release` before building a full app — uses config directly.
+    if args.command == "release":
+        config = load_config(args.config)
+        root = project_root(config)
+        from github_pm_agent.project_release import ProjectRelease
+        releaser = ProjectRelease(config, root)
+        result = releaser.release()
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
 
     # Handle `start` before building a full app — the template config has no github.repo yet.
     if args.command == "start":
