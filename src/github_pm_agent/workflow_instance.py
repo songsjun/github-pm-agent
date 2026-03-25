@@ -57,17 +57,36 @@ class WorkflowInstance:
     def get_gate_next_phase(self) -> Optional[str]:
         return self._state.get("gate_next_phase")
 
-    def set_gate(self, issue_number: int, next_phase: str = "") -> None:
+    def get_gate_resume_mode(self) -> str:
+        return str(self._state.get("gate_resume_mode", "advance") or "advance")
+
+    def set_gate(
+        self,
+        issue_number: int,
+        next_phase: str = "",
+        posted_at: str = "",
+        resume_mode: str = "advance",
+    ) -> None:
         self._state["gate_issue_number"] = issue_number
         if next_phase:
             self._state["gate_next_phase"] = next_phase
+        if posted_at:
+            self._state["gate_posted_at"] = posted_at
+        self._state["gate_resume_mode"] = resume_mode or "advance"
         self._save()
 
-    def set_discussion_gate(self, node_id: str, posted_at: str, next_phase: str) -> None:
+    def set_discussion_gate(
+        self,
+        node_id: str,
+        posted_at: str,
+        next_phase: str,
+        resume_mode: str = "advance",
+    ) -> None:
         """Gate tracked via Discussion comment (no issue created)."""
         self._state["gate_discussion_node_id"] = node_id
         self._state["gate_posted_at"] = posted_at
         self._state["gate_next_phase"] = next_phase
+        self._state["gate_resume_mode"] = resume_mode or "advance"
         self._save()
 
     def get_discussion_gate_node_id(self) -> Optional[str]:
@@ -81,6 +100,7 @@ class WorkflowInstance:
         self._state.pop("gate_next_phase", None)
         self._state.pop("gate_discussion_node_id", None)
         self._state.pop("gate_posted_at", None)
+        self._state.pop("gate_resume_mode", None)
         self._save()
 
     # --- Clarification (intra-phase suspension) ---

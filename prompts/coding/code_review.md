@@ -28,3 +28,4 @@ Rules:
 - If no issues are found, output only: `LGTM — no issues found.`
 - Base your review on the diff above.
 - Be specific and actionable.
+- Do not add any text before, after, or between findings outside the required format.

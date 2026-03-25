@@ -18,6 +18,7 @@ Decision criteria:
 - **REOPEN** if: `$test_passed` is `false` OR blocking issues remain unresolved in the review.
 
 A review item is blocking if it includes `**Blocking**` or `Severity: blocking`.
+The runtime will validate the final decision deterministically using the test result and parsed review findings. Your job is to explain that outcome clearly.
 
 Output a JSON block first:
 ```json

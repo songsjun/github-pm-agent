@@ -36,3 +36,4 @@ steps:
     prompt_path: prompts/coding/pm_decision.md
     action: merge_or_reopen
     gate: true
+    gate_before_action: true

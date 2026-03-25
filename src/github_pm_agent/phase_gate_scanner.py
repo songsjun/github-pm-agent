@@ -117,7 +117,14 @@ class PhaseGateScanner:
             discussion_node_id = instance.get_discussion_gate_node_id()
             gate_posted_at = instance.get_gate_posted_at()
             if discussion_node_id and gate_posted_at:
-                gate_key = f"{repo}:discussion:{number}:{next_phase}"
+                gate_key = self._build_gate_key(
+                    repo,
+                    "discussion",
+                    number,
+                    next_phase,
+                    gate_posted_at,
+                    discussion_node_id,
+                )
                 if gate_key in already_advanced:
                     continue
                 owner, name = (repo.split("/", 1) + [""])[:2]
@@ -127,11 +134,8 @@ class PhaseGateScanner:
                 response_type, target_phase = self._classify_and_route(
                     instance, next_phase, human_comment
                 )
-                # For reject/confirm_revise, target_phase is current_phase (re-run), not next_phase.
-                # Using a response-specific key prevents the confirm key from being consumed,
-                # which would permanently block a future genuine confirm for next_phase.
-                if response_type in ("confirm_revise", "reject"):
-                    gate_key = f"{repo}:discussion:{number}:{next_phase}:{response_type}"
+                if target_phase is None:
+                    continue
                 self._advance(instance, repo, number, target_phase, human_comment, gate_key, response_type)
                 results.append({
                     "repo": repo,
@@ -144,13 +148,28 @@ class PhaseGateScanner:
 
             # Legacy issue-based gate
             gate_issue_number = instance.get_gate_issue_number()
-            if gate_issue_number is None or (repo, gate_issue_number) in already_advanced:
+            gate_key = self._build_gate_key(
+                repo,
+                "issue",
+                gate_issue_number or number,
+                next_phase,
+                gate_posted_at,
+                instance.get_gate_resume_mode(),
+            )
+            if gate_issue_number is None or gate_key in already_advanced or (repo, gate_issue_number) in already_advanced:
                 continue
-            human_comment = self._check_issue_gate_resolved(gate_issue_number, repo)
+            human_comment = self._check_issue_gate_resolved(
+                gate_issue_number,
+                repo,
+                gate_posted_at,
+                allow_closed_without_comment=instance.get_gate_resume_mode() != "execute_action",
+            )
             if human_comment is None:
                 continue
             response_type, target_phase = self._classify_and_route(instance, next_phase, human_comment)
-            self._advance(instance, repo, number, target_phase, human_comment, (repo, gate_issue_number), response_type)
+            if target_phase is None:
+                continue
+            self._advance(instance, repo, number, target_phase, human_comment, gate_key, response_type)
             results.append({
                 "repo": repo,
                 "discussion_number": number,
@@ -166,13 +185,13 @@ class PhaseGateScanner:
         instance: WorkflowInstance,
         next_phase: str,
         human_comment: str,
-    ) -> tuple:
+    ) -> Tuple[str, Optional[str]]:
         """Classify the gate response and return (response_type, target_phase).
 
         - confirm        → advance to next_phase as planned
         - confirm_revise → accumulate supplement, re-run the *current* PM synthesis phase
         - reject         → re-run the current PM synthesis phase with rejection reason
-        - unclear        → advance anyway (treat as confirm) to avoid stalling
+        - unclear        → stay blocked for execute_action gates, otherwise advance
         """
         response_type = classify_gate_response(human_comment)
         current_phase = instance.get_phase() or next_phase
@@ -181,7 +200,9 @@ class PhaseGateScanner:
             return response_type, current_phase  # re-run current PM phase
         if response_type == "reject":
             return response_type, current_phase  # re-run current PM phase
-        # confirm or unclear → advance
+        if response_type == "unclear" and instance.get_gate_resume_mode() == "execute_action":
+            return response_type, None
+        # confirm or non-final unclear → advance
         return response_type, next_phase
 
     def _advance(
@@ -203,6 +224,13 @@ class PhaseGateScanner:
         new_metadata["artifacts"] = instance.get_artifacts()
         new_metadata["gate_human_comment"] = human_comment
         new_metadata["gate_response_type"] = response_type
+        if (
+            instance.get_gate_resume_mode() == "execute_action"
+            and response_type in ("confirm", "unclear")
+        ):
+            new_metadata["execute_gated_action"] = True
+        else:
+            new_metadata.pop("execute_gated_action", None)
         resumed_event_dict = {**original_event, "metadata": new_metadata}
         append_jsonl(self.queue.pending_path, resumed_event_dict)
         append_jsonl(
@@ -218,6 +246,17 @@ class PhaseGateScanner:
             },
         )
         instance.clear_gate()
+
+    def _build_gate_key(
+        self,
+        repo: str,
+        kind: str,
+        number: int,
+        next_phase: str,
+        posted_at: str,
+        discriminator: str = "",
+    ) -> str:
+        return f"{repo}:{kind}:{number}:{next_phase}:{posted_at}:{discriminator}"
 
     def _already_advanced(self) -> Set[Any]:
         result = set()
@@ -250,15 +289,25 @@ class PhaseGateScanner:
                 return comment.get("body") or ""
         return None
 
-    def _check_issue_gate_resolved(self, issue_number: int, repo: str) -> Optional[str]:
+    def _check_issue_gate_resolved(
+        self,
+        issue_number: int,
+        repo: str,
+        gate_posted_at: str = "",
+        allow_closed_without_comment: bool = True,
+    ) -> Optional[str]:
         """Return human comment text if gate issue is resolved, None if still open."""
         if self.owner_login:
             comments = self.client.api(f"repos/{repo}/issues/{issue_number}/comments", method="GET")
             if isinstance(comments, list):
                 for comment in comments:
+                    if gate_posted_at and comment.get("created_at", "") <= gate_posted_at:
+                        continue
                     login = (comment.get("user") or {}).get("login", "")
                     if login == self.owner_login:
                         return comment.get("body") or ""
+        if not allow_closed_without_comment:
+            return None
         issue = self.client.api(f"repos/{repo}/issues/{issue_number}", method="GET")
         if isinstance(issue, dict) and issue.get("state") == "closed":
             return ""

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -370,7 +371,10 @@ class WorkflowOrchestrator:
             # clarification or gate confirmation), so always execute them fresh so that
             # worker outputs incorporate the owner's answers and synthesis is regenerated.
             existing_artifact = instance.get_artifacts().get(current_phase)
-            if existing_artifact is not None and not meta.get("rerun_phase") and not meta.get("advance_to_phase"):
+            if existing_artifact is not None and meta.get("execute_gated_action"):
+                last_content = existing_artifact
+                executors = []
+            elif existing_artifact is not None and not meta.get("rerun_phase") and not meta.get("advance_to_phase"):
                 last_content = existing_artifact
                 executors = []
 
@@ -426,7 +430,15 @@ class WorkflowOrchestrator:
             step_succeeded = False
 
             # Actions must run before gate creation so gates can reflect the action result.
-            if step.get("action") == "create_issues":
+            defer_gated_action = bool(
+                step.get("gate_before_action")
+                and step.get("action")
+                and not meta.get("execute_gated_action")
+            )
+
+            if defer_gated_action:
+                step_succeeded = True
+            elif step.get("action") == "create_issues":
                 created_issues, issue_creation_error = self._create_issues_from_artifact(last_content, event)
                 issue_refs = []
                 for item in created_issues:
@@ -638,22 +650,22 @@ class WorkflowOrchestrator:
                     artifacts.get("code_review_combined")
                     or artifacts.get("code_review", "")
                 )
+                review_summary = self._summarize_review_artifact(combined_review)
                 review_round = instance.get_review_round()
                 MAX_REVIEW_ROUNDS = 3
                 original_event = instance.get_original_event() or event.to_dict()
 
-                def _has_blocking(text: str) -> bool:
-                    lower = text.lower()
-                    return (
-                        "**blocking**" in lower
-                        or "severity: blocking" in lower
-                        or "severity**:** blocking" in lower
-                    )
-
                 _raw_pr = artifacts.get("pr_number", "")
                 _pr_num = int(str(_raw_pr)) if str(_raw_pr).strip().isdigit() else None
 
-                if not _has_blocking(combined_review):
+                if review_summary["contract_violation"]:
+                    self.actions.comment(
+                        "issue",
+                        event.target_number,
+                        "Automated code review output could not be machine-verified. Manual review required before merge.",
+                    )
+                    instance.set_terminated("Code review output was not machine-verifiable")
+                elif review_summary["blocking_count"] == 0:
                     # LGTM or warnings only → approve PR, advance to pm_decision
                     if _pr_num:
                         try:
@@ -791,15 +803,25 @@ class WorkflowOrchestrator:
                 from github_pm_agent.utils import extract_json_object
 
                 parsed = extract_json_object(last_content)
-                decision = "reopen"
-                reason = last_content.strip()
-                reopen_comment = ""
-                if isinstance(parsed, dict):
-                    decision = str(parsed.get("decision", "reopen")).strip().lower() or "reopen"
-                    reason = str(parsed.get("reason", reason)).strip()
-                    reopen_comment = str(parsed.get("reopen_comment", "")).strip()
-
                 artifacts = instance.get_artifacts()
+                review_summary = self._summarize_review_artifact(
+                    artifacts.get("code_review_combined")
+                    or artifacts.get("code_review", "")
+                )
+                deterministic = self._deterministic_pm_decision(artifacts, review_summary)
+                decision = deterministic["decision"]
+                reason = deterministic["reason"]
+                reopen_comment = deterministic["reopen_comment"]
+                if isinstance(parsed, dict):
+                    parsed_reason = str(parsed.get("reason", "")).strip()
+                    parsed_reopen_comment = str(parsed.get("reopen_comment", "")).strip()
+                    if parsed_reason:
+                        reason = parsed_reason
+                    if parsed_reopen_comment:
+                        reopen_comment = parsed_reopen_comment
+                if decision == "merge":
+                    reopen_comment = ""
+
                 _raw_pr = artifacts.get("pr_number", "")
                 pr_number: Optional[int] = int(str(_raw_pr)) if str(_raw_pr).strip().isdigit() else None
                 issue_number = event.target_number
@@ -818,17 +840,22 @@ class WorkflowOrchestrator:
                         issue_number=issue_number,
                         decision=decision,
                         reason=reason,
-                        reopen_comment=reopen_comment or reason,
+                        reopen_comment=(reopen_comment or reason) if decision == "reopen" else "",
                     )
                     step_succeeded = True
             else:
                 step_succeeded = True
 
-            if step.get("gate"):
+            if step.get("gate") and not meta.get("execute_gated_action"):
                 from github_pm_agent.utils import utc_now_iso
                 idx = next((i for i, s in enumerate(steps) if s.get("phase") == current_phase), -1)
                 next_step = steps[idx + 1] if 0 <= idx < len(steps) - 1 else None
                 next_phase = next_step["phase"] if next_step else None
+                gate_next_phase = next_phase
+                gate_resume_mode = "advance"
+                if step.get("gate_before_action") and step.get("action"):
+                    gate_next_phase = current_phase
+                    gate_resume_mode = "execute_action"
 
                 owner = self.config.get("github", {}).get("owner", "")
                 node_id = meta.get("node_id") or (
@@ -840,16 +867,50 @@ class WorkflowOrchestrator:
                 display_content = last_content
                 if step.get("action") == "evaluate_design":
                     display_content = instance.get_artifacts().get("final_design") or last_content
+                elif step.get("action") == "merge_or_reopen":
+                    decision_preview = self._deterministic_pm_decision(
+                        instance.get_artifacts(),
+                        self._summarize_review_artifact(
+                            instance.get_artifacts().get("code_review_combined")
+                            or instance.get_artifacts().get("code_review", "")
+                        ),
+                    )
+                    display_content = self._summarize_pm_decision_output(last_content) or decision_preview["reason"]
 
                 gate_body = f"{'@' + owner + chr(10) + chr(10) if owner else ''}**Phase `{current_phase}` complete.**\n\n{display_content}"
-                if next_phase:
-                    gate_body += f"\n\n---\n_Comment in this discussion to confirm and advance to **{next_phase}**._"
+                if gate_resume_mode == "execute_action":
+                    gate_body += "\n\n---\n_Comment to confirm and execute this decision._"
+                elif next_phase:
+                    gate_body += f"\n\n---\n_Comment to confirm and advance to **{next_phase}**._"
 
                 posted_at = utc_now_iso()
-                self.actions.comment_on_discussion(node_id, target_number, gate_body)
-                if next_phase:
-                    instance.set_discussion_gate(node_id, posted_at, next_phase)
-                gate_result = {"gate_discussion_node_id": node_id, "gate_posted_at": posted_at, "next_phase": next_phase}
+                self._post_output_comment(event, self.actions, gate_body, node_id)
+                if event.target_kind == "discussion" and node_id:
+                    instance.set_discussion_gate(
+                        node_id,
+                        posted_at,
+                        gate_next_phase or current_phase,
+                        resume_mode=gate_resume_mode,
+                    )
+                    gate_result = {
+                        "gate_discussion_node_id": node_id,
+                        "gate_posted_at": posted_at,
+                        "next_phase": gate_next_phase,
+                    }
+                elif event.target_kind in ("issue", "pull_request") and target_number:
+                    instance.set_gate(
+                        target_number,
+                        gate_next_phase or current_phase,
+                        posted_at=posted_at,
+                        resume_mode=gate_resume_mode,
+                    )
+                    gate_result = {
+                        "gate_issue_number": target_number,
+                        "gate_posted_at": posted_at,
+                        "next_phase": gate_next_phase,
+                    }
+                else:
+                    gate_result = {"gate_posted_at": posted_at, "next_phase": gate_next_phase}
                 if pending:
                     instance.clear_pending_comments()
                 break  # wait for human
@@ -883,6 +944,144 @@ class WorkflowOrchestrator:
             "issue_creation_error": issue_creation_error,
             "escalation_refs": [],
         }
+
+    def _summarize_review_artifact(self, content: str) -> Dict[str, Any]:
+        summary = {
+            "blocking_count": 0,
+            "warning_count": 0,
+            "contract_violation": False,
+            "has_lgtm": False,
+        }
+        segments = self._split_review_outputs(content)
+        if not segments:
+            summary["contract_violation"] = True
+            return summary
+
+        for segment in segments:
+            segment_summary = self._summarize_single_review_output(segment)
+            if segment_summary["contract_violation"]:
+                summary["contract_violation"] = True
+                return summary
+            summary["blocking_count"] += segment_summary["blocking_count"]
+            summary["warning_count"] += segment_summary["warning_count"]
+            summary["has_lgtm"] = summary["has_lgtm"] or segment_summary["has_lgtm"]
+        return summary
+
+    def _split_review_outputs(self, content: str) -> List[str]:
+        stripped = content.strip()
+        if not stripped:
+            return []
+        if "### " not in stripped and re.search(r"(?m)^\s*---\s*$", stripped) is None:
+            return [stripped]
+
+        segments: List[str] = []
+        for chunk in re.split(r"(?m)^\s*---\s*$", stripped):
+            cleaned_lines = [
+                line
+                for line in chunk.splitlines()
+                if re.match(r"^\s*###\s+", line) is None
+            ]
+            cleaned = "\n".join(cleaned_lines).strip()
+            if cleaned:
+                segments.append(cleaned)
+        return segments or [stripped]
+
+    def _summarize_single_review_output(self, content: str) -> Dict[str, Any]:
+        stripped = content.strip()
+        summary = {
+            "blocking_count": 0,
+            "warning_count": 0,
+            "contract_violation": False,
+            "has_lgtm": False,
+        }
+        if not stripped:
+            summary["contract_violation"] = True
+            return summary
+        if re.fullmatch(r"LGTM\s*[—-]\s*no issues found\.\s*", stripped, re.IGNORECASE):
+            summary["has_lgtm"] = True
+            return summary
+
+        blocks = list(
+            re.finditer(
+                r"(?ms)^\*\*(Blocking|Warning)\*\*.*?(?=^\*\*(?:Blocking|Warning)\*\*|\Z)",
+                stripped,
+            )
+        )
+        if not blocks:
+            summary["contract_violation"] = True
+            return summary
+
+        rebuilt = "".join(block.group(0) for block in blocks).strip()
+        if rebuilt != stripped:
+            summary["contract_violation"] = True
+            return summary
+
+        for block in blocks:
+            block_text = block.group(0)
+            severity = re.search(r"(?im)^\-\s+\*\*Severity:\*\*\s*(blocking|warning)\s*$", block_text)
+            if severity is None:
+                summary["contract_violation"] = True
+                return summary
+            if severity.group(1).lower() == "blocking":
+                summary["blocking_count"] += 1
+            else:
+                summary["warning_count"] += 1
+        return summary
+
+    def _load_test_result_artifact(self, artifacts: Dict[str, Any]) -> Dict[str, Any]:
+        test_result = artifacts.get("test_result") or {}
+        if isinstance(test_result, str):
+            import json as _json_local  # noqa: PLC0415
+
+            try:
+                loaded = _json_local.loads(test_result)
+            except (_json_local.JSONDecodeError, ValueError):
+                return {}
+            return loaded if isinstance(loaded, dict) else {}
+        return test_result if isinstance(test_result, dict) else {}
+
+    def _deterministic_pm_decision(
+        self,
+        artifacts: Dict[str, Any],
+        review_summary: Dict[str, Any],
+    ) -> Dict[str, str]:
+        test_result = self._load_test_result_artifact(artifacts)
+        test_passed = bool(test_result.get("passed"))
+        if review_summary["contract_violation"]:
+            return {
+                "decision": "reopen",
+                "reason": "Automated review output was not machine-verifiable, so merge was blocked.",
+                "reopen_comment": "The automated review output could not be verified. Re-run review or inspect manually before retrying.",
+            }
+        if not test_passed:
+            return {
+                "decision": "reopen",
+                "reason": "Tests did not pass, so the change cannot be merged.",
+                "reopen_comment": "Tests must pass before merge. Fix the failing tests and rerun the workflow.",
+            }
+        if review_summary["blocking_count"] > 0:
+            return {
+                "decision": "reopen",
+                "reason": f"{review_summary['blocking_count']} blocking review issue(s) remain unresolved.",
+                "reopen_comment": "Resolve the blocking review issues and rerun the workflow.",
+            }
+        return {
+            "decision": "merge",
+            "reason": "Tests passed and no blocking review issues remain.",
+            "reopen_comment": "",
+        }
+
+    def _summarize_pm_decision_output(self, content: str) -> str:
+        stripped = content.strip()
+        if not stripped:
+            return ""
+        if stripped.startswith("```json"):
+            summary = re.sub(r"(?s)^```json\s*.*?```\s*", "", stripped).strip()
+            if summary:
+                return summary
+        if stripped.startswith("{"):
+            return ""
+        return stripped
 
     def _create_issues_from_artifact(
         self, content: str, event: Any

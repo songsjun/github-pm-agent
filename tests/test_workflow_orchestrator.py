@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -15,6 +16,8 @@ class RecordingActions:
         self.comment_calls: List[Dict[str, Any]] = []
         self.comment_on_discussion_calls: List[Dict[str, Any]] = []
         self.create_issue_calls: List[Dict[str, Any]] = []
+        self.submit_pr_review_calls: List[Dict[str, Any]] = []
+        self.merge_or_reopen_calls: List[Dict[str, Any]] = []
 
     def comment(self, target_kind: str, target_number: Optional[int], message: str) -> Dict[str, Any]:
         payload = {
@@ -46,6 +49,35 @@ class RecordingActions:
     def create_issue(self, title: str, body: str, labels: Optional[List[str]] = None) -> Dict[str, Any]:
         payload = {"title": title, "body": body, "labels": list(labels or []), "dry_run": self.dry_run}
         self.create_issue_calls.append(payload)
+        return payload
+
+    def submit_pr_review(self, pr_number: int, event: str = "APPROVE", body: str = "") -> Dict[str, Any]:
+        payload = {
+            "pr_number": pr_number,
+            "event": event,
+            "body": body,
+            "dry_run": self.dry_run,
+        }
+        self.submit_pr_review_calls.append(payload)
+        return payload
+
+    def merge_or_reopen(
+        self,
+        pr_number: Optional[int],
+        issue_number: Optional[int],
+        decision: str,
+        reason: str,
+        reopen_comment: str = "",
+    ) -> Dict[str, Any]:
+        payload = {
+            "pr_number": pr_number,
+            "issue_number": issue_number,
+            "decision": decision,
+            "reason": reason,
+            "reopen_comment": reopen_comment,
+            "dry_run": self.dry_run,
+        }
+        self.merge_or_reopen_calls.append(payload)
         return payload
 
 
@@ -792,6 +824,387 @@ def _issue_event(action: str = "opened", **metadata: Any) -> Event:
         target_number=42,
         metadata={"action": action, **metadata},
     )
+
+
+def _issue_coding_event(**metadata: Any) -> Event:
+    return Event(
+        event_id="evt-issue-coding-1",
+        event_type="issue_coding",
+        source="test",
+        occurred_at="2026-03-20T00:00:00Z",
+        repo="songsjun/example",
+        actor="alice",
+        url="https://example.test/issues/42",
+        title="Implement login page",
+        body="Users need to log in with email and password.",
+        target_kind="issue",
+        target_number=42,
+        metadata=dict(metadata),
+    )
+
+
+def test_issue_coding_pm_decision_opens_issue_gate_before_merge() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_phase("pm_decision")
+        instance.set_artifact("pr_number", "17")
+        instance.set_artifact("pr_url", "https://example.test/pr/17")
+        instance.set_artifact("code_review_combined", "LGTM — no issues found.")
+        instance.set_artifact("test_result", json.dumps({"passed": True, "summary": "3 passed"}))
+
+        class FakeEnginePMDecision(FakeEngine):
+            def run_raw_text_handler(
+                self,
+                event: Any,
+                prompt_path: str,
+                role: str = "pm",
+                variables: Optional[Dict[str, Any]] = None,
+            ) -> Dict[str, Any]:
+                self.run_raw_text_handler_calls.append(
+                    {"event_id": event.event_id, "prompt_path": prompt_path, "role": role}
+                )
+                return {
+                    "raw_text": (
+                        "```json\n"
+                        '{"decision":"reopen","reason":"model picked the wrong outcome","reopen_comment":"ignore me"}\n'
+                        "```\n"
+                        "Tests passed and the review is clean."
+                    )
+                }
+
+        actions = RecordingActions()
+        engine = FakeEnginePMDecision(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        result = orchestrator.process(_issue_coding_event())
+
+        assert actions.merge_or_reopen_calls == []
+        gate_comments = [c for c in actions.comment_calls if c.get("target_kind") == "issue"]
+        assert len(gate_comments) == 1
+        assert "confirm and execute this decision" in gate_comments[0]["message"]
+        assert "Tests passed and the review is clean." in gate_comments[0]["message"]
+        assert result["gate"]["gate_issue_number"] == 42
+        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert final_instance.get_gate_issue_number() == 42
+        assert final_instance.get_gate_next_phase() == "pm_decision"
+        assert final_instance.get_gate_resume_mode() == "execute_action"
+        assert final_instance.is_completed() is False
+
+
+def test_issue_coding_pm_decision_confirmation_executes_without_rerunning_ai() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_phase("pm_decision")
+        instance.set_artifact(
+            "pm_decision",
+            "```json\n"
+            '{"decision":"reopen","reason":"model picked the wrong outcome","reopen_comment":"ignore me"}\n'
+            "```\n"
+            "Tests passed and the review is clean.",
+        )
+        instance.set_artifact("pr_number", "17")
+        instance.set_artifact("pr_url", "https://example.test/pr/17")
+        instance.set_artifact("code_review_combined", "LGTM — no issues found.")
+        instance.set_artifact("test_result", json.dumps({"passed": True, "summary": "3 passed"}))
+
+        class FailingEngine(FakeEngine):
+            def run_raw_text_handler(
+                self,
+                event: Any,
+                prompt_path: str,
+                role: str = "pm",
+                variables: Optional[Dict[str, Any]] = None,
+            ) -> Dict[str, Any]:
+                raise AssertionError("pm_decision should not rerun after confirmation")
+
+        actions = RecordingActions()
+        engine = FailingEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        orchestrator.process(
+            _issue_coding_event(
+                advance_to_phase="pm_decision",
+                execute_gated_action=True,
+                gate_human_comment="ok",
+            )
+        )
+
+        assert len(actions.merge_or_reopen_calls) == 1
+        assert actions.merge_or_reopen_calls[0]["decision"] == "merge"
+        assert actions.merge_or_reopen_calls[0]["reopen_comment"] == ""
+        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert final_instance.is_completed() is True
+
+
+def test_issue_coding_unparseable_review_output_terminates_workflow() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_phase("code_review")
+        instance.set_artifact("code_review_combined", "Looks good to me overall.")
+        instance.set_artifact("pr_number", "17")
+
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        orchestrator.process(_issue_coding_event())
+
+        assert actions.submit_pr_review_calls == []
+        assert any(
+            "could not be machine-verified" in call["message"]
+            for call in actions.comment_calls
+            if call.get("target_kind") == "issue"
+        )
+        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert final_instance.is_terminated() is True
+
+
+def test_issue_coding_combined_lgtm_reviews_are_accepted() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_phase("code_review")
+        instance.set_artifact(
+            "code_review_combined",
+            "\n\n---\n\n".join(
+                [
+                    "### worker1_slot1\n\nLGTM — no issues found.",
+                    "### worker2_slot2\n\nLGTM — no issues found.",
+                ]
+            ),
+        )
+        instance.set_artifact("code_review", "LGTM — no issues found.")
+        instance.set_artifact("pr_number", "17")
+        instance.set_original_event(_issue_coding_event().to_dict())
+
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        orchestrator.process(_issue_coding_event())
+
+        assert len(actions.submit_pr_review_calls) == 1
+        assert actions.submit_pr_review_calls[0]["event"] == "APPROVE"
+        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert final_instance.is_terminated() is False
+
+
+def test_phase_gate_scanner_issue_gate_ignores_stale_comments_and_sets_execute_flag() -> None:
+    from github_pm_agent.phase_gate_scanner import PhaseGateScanner
+    from github_pm_agent.queue_store import QueueStore
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        store = QueueStore(runtime_dir)
+
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_phase("pm_decision")
+        instance.set_gate(
+            42,
+            "pm_decision",
+            posted_at="2026-03-20T12:00:00Z",
+            resume_mode="execute_action",
+        )
+        instance.set_original_event(
+            {
+                "event_id": "evt-issue-coding-1",
+                "event_type": "issue_coding",
+                "source": "test",
+                "occurred_at": "2026-03-20T00:00:00Z",
+                "repo": "songsjun/example",
+                "actor": "alice",
+                "url": "https://example.test/issues/42",
+                "title": "Implement login page",
+                "body": "Users need to log in with email and password.",
+                "target_kind": "issue",
+                "target_number": 42,
+                "metadata": {},
+            }
+        )
+
+        class FakeClientComments:
+            def api(self, path: str, params: Any = None, method: str = "GET") -> Any:
+                if path == "repos/songsjun/example/issues/42/comments":
+                    return [
+                        {
+                            "created_at": "2026-03-20T11:59:00Z",
+                            "user": {"login": "owner"},
+                            "body": "old comment",
+                        },
+                        {
+                            "created_at": "2026-03-20T12:05:00Z",
+                            "user": {"login": "owner"},
+                            "body": "ok",
+                        },
+                    ]
+                if path == "repos/songsjun/example/issues/42":
+                    return {"state": "open"}
+                return []
+
+        scanner = PhaseGateScanner(store, FakeClientComments(), "owner")
+
+        advanced = scanner.scan_and_advance()
+
+        assert advanced == [
+            {
+                "repo": "songsjun/example",
+                "discussion_number": 42,
+                "from_phase": "pm_decision",
+                "to_phase": "pm_decision",
+                "response_type": "confirm",
+            }
+        ]
+        resumed = store.pop()
+        assert resumed is not None
+        assert resumed.metadata["advance_to_phase"] == "pm_decision"
+        assert resumed.metadata["execute_gated_action"] is True
+        assert resumed.metadata["gate_human_comment"] == "ok"
+
+
+def test_phase_gate_scanner_execute_action_unclear_comment_keeps_gate_open() -> None:
+    from github_pm_agent.phase_gate_scanner import PhaseGateScanner
+    from github_pm_agent.queue_store import QueueStore
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        store = QueueStore(runtime_dir)
+
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_phase("pm_decision")
+        instance.set_gate(
+            42,
+            "pm_decision",
+            posted_at="2026-03-20T12:00:00Z",
+            resume_mode="execute_action",
+        )
+        instance.set_original_event(_issue_coding_event().to_dict())
+
+        class FakeClientUnclear:
+            def api(self, path: str, params: Any = None, method: str = "GET") -> Any:
+                if path == "repos/songsjun/example/issues/42/comments":
+                    return [
+                        {
+                            "created_at": "2026-03-20T12:05:00Z",
+                            "user": {"login": "owner"},
+                            "body": "thanks, looking",
+                        }
+                    ]
+                if path == "repos/songsjun/example/issues/42":
+                    return {"state": "open"}
+                return []
+
+        scanner = PhaseGateScanner(store, FakeClientUnclear(), "owner")
+
+        advanced = scanner.scan_and_advance()
+
+        assert advanced == []
+        assert store.pop() is None
+        reloaded = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert reloaded.get_gate_issue_number() == 42
+        assert reloaded.get_gate_resume_mode() == "execute_action"
+
+
+def test_phase_gate_scanner_execute_action_does_not_treat_closed_issue_as_confirmation() -> None:
+    from github_pm_agent.phase_gate_scanner import PhaseGateScanner
+    from github_pm_agent.queue_store import QueueStore
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        store = QueueStore(runtime_dir)
+
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_phase("pm_decision")
+        instance.set_gate(
+            42,
+            "pm_decision",
+            posted_at="2026-03-20T12:00:00Z",
+            resume_mode="execute_action",
+        )
+        instance.set_original_event(_issue_coding_event().to_dict())
+
+        class FakeClientClosedIssue:
+            def api(self, path: str, params: Any = None, method: str = "GET") -> Any:
+                if path == "repos/songsjun/example/issues/42/comments":
+                    return []
+                if path == "repos/songsjun/example/issues/42":
+                    return {"state": "closed"}
+                return []
+
+        scanner = PhaseGateScanner(store, FakeClientClosedIssue(), "owner")
+
+        advanced = scanner.scan_and_advance()
+
+        assert advanced == []
+        assert store.pop() is None
+        reloaded = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert reloaded.get_gate_issue_number() == 42
+
+
+def test_phase_gate_scanner_repeated_issue_gate_uses_gate_instance_key() -> None:
+    from github_pm_agent.phase_gate_scanner import PhaseGateScanner
+    from github_pm_agent.queue_store import QueueStore
+    from github_pm_agent.utils import append_jsonl
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        store = QueueStore(runtime_dir)
+
+        append_jsonl(
+            runtime_dir / "gate_advanced.jsonl",
+            {
+                "gate_key": "songsjun/example:issue:42:pm_decision:2026-03-20T12:00:00Z:execute_action",
+                "repo": "songsjun/example",
+                "discussion_number": 42,
+                "from_phase": "pm_decision",
+                "to_phase": "pm_decision",
+                "response_type": "confirm",
+                "advanced_at": "2026-03-20T12:01:00Z",
+            },
+        )
+
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_phase("pm_decision")
+        instance.set_gate(
+            42,
+            "pm_decision",
+            posted_at="2026-03-20T13:00:00Z",
+            resume_mode="execute_action",
+        )
+        instance.set_original_event(_issue_coding_event().to_dict())
+
+        class FakeClientComments:
+            def api(self, path: str, params: Any = None, method: str = "GET") -> Any:
+                if path == "repos/songsjun/example/issues/42/comments":
+                    return [
+                        {
+                            "created_at": "2026-03-20T13:05:00Z",
+                            "user": {"login": "owner"},
+                            "body": "ok",
+                        }
+                    ]
+                if path == "repos/songsjun/example/issues/42":
+                    return {"state": "open"}
+                return []
+
+        scanner = PhaseGateScanner(store, FakeClientComments(), "owner")
+
+        advanced = scanner.scan_and_advance()
+
+        assert advanced == [
+            {
+                "repo": "songsjun/example",
+                "discussion_number": 42,
+                "from_phase": "pm_decision",
+                "to_phase": "pm_decision",
+                "response_type": "confirm",
+            }
+        ]
+        resumed = store.pop()
+        assert resumed is not None
+        assert resumed.metadata["execute_gated_action"] is True
 
 
 def test_issue_changed_workflow_runs_on_opened() -> None:
