@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -83,7 +84,14 @@ class PhaseGateScanner:
                             new_meta["advance_to_phase"] = clarification["phase"]
                             new_meta["artifacts"] = instance_check.get_artifacts()
                             new_meta["gate_human_comment"] = answer
-                            append_jsonl(self.queue.pending_path, {**original_event, "metadata": new_meta})
+                            append_jsonl(
+                                self.queue.pending_path,
+                                self._resumed_event_payload(
+                                    original_event,
+                                    metadata=new_meta,
+                                    reason="clarification_resume",
+                                ),
+                            )
                             results.append({
                                 "repo": repo_c,
                                 "discussion_number": number_c,
@@ -231,7 +239,11 @@ class PhaseGateScanner:
             new_metadata["execute_gated_action"] = True
         else:
             new_metadata.pop("execute_gated_action", None)
-        resumed_event_dict = {**original_event, "metadata": new_metadata}
+        resumed_event_dict = self._resumed_event_payload(
+            original_event,
+            metadata=new_metadata,
+            reason=response_type or "gate_resume",
+        )
         append_jsonl(self.queue.pending_path, resumed_event_dict)
         append_jsonl(
             self.advanced_path,
@@ -257,6 +269,30 @@ class PhaseGateScanner:
         discriminator: str = "",
     ) -> str:
         return f"{repo}:{kind}:{number}:{next_phase}:{posted_at}:{discriminator}"
+
+    def _resumed_event_payload(
+        self,
+        original_event: Dict[str, Any],
+        *,
+        metadata: Dict[str, Any],
+        reason: str,
+    ) -> Dict[str, Any]:
+        resumed = dict(original_event)
+        resumed_metadata = dict(metadata)
+        queue_meta = dict(resumed_metadata.get("_queue", {}))
+        previous_attempt = queue_meta.get("attempt", 1)
+        if not isinstance(previous_attempt, int) or previous_attempt < 1:
+            previous_attempt = 1
+        queue_meta["attempt"] = previous_attempt + 1
+        queue_meta["requeued_from"] = reason
+        queue_meta["requeued_at"] = utc_now_iso()
+        resumed_metadata["_queue"] = queue_meta
+
+        original_event_id = str(original_event.get("event_id", "resume"))
+        seed = f"{original_event_id}:{reason}:{resumed_metadata.get('advance_to_phase', '')}:{queue_meta['attempt']}:{queue_meta['requeued_at']}"
+        resumed["event_id"] = f"resume:{hashlib.sha1(seed.encode('utf-8')).hexdigest()}"
+        resumed["metadata"] = resumed_metadata
+        return resumed
 
     def _already_advanced(self) -> Set[Any]:
         result = set()

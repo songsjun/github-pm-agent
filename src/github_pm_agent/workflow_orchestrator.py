@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
+import inspect
+import os
 import re
+import shutil
+import subprocess
+from urllib.parse import quote
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -105,6 +111,35 @@ class WorkflowOrchestrator:
         self.agent_configs = agent_configs or []
         self.agent_toolkits = agent_toolkits or {}
         self.workflows_dir = self.project_root / "workflows"
+
+    def _build_requeued_event(
+        self,
+        original_event: Dict[str, Any],
+        *,
+        metadata: Dict[str, Any],
+        reason: str,
+    ) -> Dict[str, Any]:
+        from github_pm_agent.utils import utc_now_iso
+
+        resumed = dict(original_event)
+        resumed_metadata = dict(metadata)
+        queue_meta = dict(resumed_metadata.get("_queue", {}))
+        previous_attempt = queue_meta.get("attempt", 1)
+        if not isinstance(previous_attempt, int) or previous_attempt < 1:
+            previous_attempt = 1
+        queue_meta["attempt"] = previous_attempt + 1
+        queue_meta["requeued_from"] = reason
+        queue_meta["requeued_at"] = utc_now_iso()
+        resumed_metadata["_queue"] = queue_meta
+
+        original_event_id = str(original_event.get("event_id", "resume"))
+        seed = (
+            f"{original_event_id}:{reason}:{resumed_metadata.get('advance_to_phase', '')}:"
+            f"{queue_meta['attempt']}:{queue_meta['requeued_at']}"
+        )
+        resumed["event_id"] = f"resume:{hashlib.sha1(seed.encode('utf-8')).hexdigest()}"
+        resumed["metadata"] = resumed_metadata
+        return resumed
 
     def process(self, event: Any) -> Dict[str, Any]:
         if event.event_type == "discussion_comment":
@@ -362,6 +397,7 @@ class WorkflowOrchestrator:
             node_id = meta.get("node_id") or (
                 instance.get_original_event() or {}
             ).get("metadata", {}).get("node_id", "")
+            ai_cwd = self._prepare_phase_ai_cwd(event, step, executors, artifacts)
 
             # Idempotency guard: if this phase already produced an artifact (a previous
             # event triggered the same workflow), skip re-running executors to prevent
@@ -380,12 +416,23 @@ class WorkflowOrchestrator:
 
             for executor in executors:
                 exec_vars = {**variables, **executor["extra_vars"]}
-                result = self.engine.run_raw_text_handler(
-                    event,
-                    prompt_path=step["prompt_path"],
-                    role=executor["role"],
-                    variables=exec_vars,
-                )
+                run_handler = self.engine.run_raw_text_handler
+                handler_params = inspect.signature(run_handler).parameters
+                if "cwd" in handler_params:
+                    result = run_handler(
+                        event,
+                        prompt_path=step["prompt_path"],
+                        role=executor["role"],
+                        variables=exec_vars,
+                        cwd=str(ai_cwd) if ai_cwd else None,
+                    )
+                else:
+                    result = run_handler(
+                        event,
+                        prompt_path=step["prompt_path"],
+                        role=executor["role"],
+                        variables=exec_vars,
+                    )
                 content = result.get("raw_text", "")
                 last_content = content
                 all_ai_outputs.append({"phase": current_phase, "role": executor["label"], "content": content})
@@ -571,7 +618,11 @@ class WorkflowOrchestrator:
                             resumed_metadata["artifacts"] = instance.get_artifacts()
                             append_jsonl(
                                 self.engine.runtime_dir / "queue_pending.jsonl",
-                                {**original_event, "metadata": resumed_metadata},
+                                self._build_requeued_event(
+                                    original_event,
+                                    metadata=resumed_metadata,
+                                    reason="implement_retry",
+                                ),
                             )
                             should_break = True
                         else:
@@ -680,7 +731,11 @@ class WorkflowOrchestrator:
                     resumed_metadata["artifacts"] = instance.get_artifacts()
                     append_jsonl(
                         self.engine.runtime_dir / "queue_pending.jsonl",
-                        {**original_event, "metadata": resumed_metadata},
+                        self._build_requeued_event(
+                            original_event,
+                            metadata=resumed_metadata,
+                            reason="review_approved",
+                        ),
                     )
                 elif review_round >= MAX_REVIEW_ROUNDS:
                     # Too many rounds — close PR, terminate, flag for human
@@ -708,7 +763,11 @@ class WorkflowOrchestrator:
                     resumed_metadata["artifacts"] = instance.get_artifacts()
                     append_jsonl(
                         self.engine.runtime_dir / "queue_pending.jsonl",
-                        {**original_event, "metadata": resumed_metadata},
+                        self._build_requeued_event(
+                            original_event,
+                            metadata=resumed_metadata,
+                            reason="review_blocking",
+                        ),
                     )
                 step_succeeded = True
                 break  # always stop current loop; re-queue handles continuation
@@ -763,7 +822,11 @@ class WorkflowOrchestrator:
                             resumed_metadata["artifacts"] = instance.get_artifacts()
                             append_jsonl(
                                 self.engine.runtime_dir / "queue_pending.jsonl",
-                                {**original_event, "metadata": resumed_metadata},
+                                self._build_requeued_event(
+                                    original_event,
+                                    metadata=resumed_metadata,
+                                    reason="fix_review_retry",
+                                ),
                             )
                         else:
                             # Fix did not make tests pass — escalate
@@ -1102,10 +1165,17 @@ class WorkflowOrchestrator:
         for item in parsed:
             if not isinstance(item, dict) or not item.get("title"):
                 continue
+            labels = []
+            for label in item.get("labels", []):
+                label_text = str(label).strip()
+                if label_text and label_text not in labels:
+                    labels.append(label_text)
+            if "ready-to-code" not in labels:
+                labels.append("ready-to-code")
             result = self.actions.create_issue(
                 title=item["title"],
                 body=item.get("body", ""),
-                labels=item.get("labels", []),
+                labels=labels,
             )
             created.append(result)
         return created, ""
@@ -1289,7 +1359,6 @@ class WorkflowOrchestrator:
         Falls back to the config ``github.token`` or empty string if no worker token
         is configured.
         """
-        import os
         for executor in executors:
             agent_id = executor.get("agent_id")
             if not agent_id:
@@ -1306,6 +1375,78 @@ class WorkflowOrchestrator:
                 if token:
                     return token
         return self.config.get("github", {}).get("token", "")
+
+    def _get_default_github_token(self) -> str:
+        for agent_cfg in sorted(
+            [a for a in self.agent_configs if isinstance(a, dict)],
+            key=lambda a: a.get("priority", 99),
+        ):
+            token_env = agent_cfg.get("token_env")
+            if token_env:
+                token = os.environ.get(token_env, "")
+                if token:
+                    return token
+        return self.config.get("github", {}).get("token", "")
+
+    def _prepare_phase_ai_cwd(
+        self,
+        event: Any,
+        step: Dict[str, Any],
+        executors: List[Dict[str, Any]],
+        artifacts: Dict[str, Any],
+    ) -> Optional[Path]:
+        """Clone the target repo into a readable local context for coding-related AI phases."""
+        if step.get("action") not in {"coding_session", "check_review_result", "fix_coding_session", "merge_or_reopen"}:
+            return None
+
+        safe_repo = str(event.repo or "").replace("/", "__", 1)
+        target_number = str(event.target_number or "none")
+        context_dir = self.engine.runtime_dir / "ai_context" / safe_repo / target_number
+        if context_dir.exists():
+            shutil.rmtree(context_dir, ignore_errors=True)
+        context_dir.parent.mkdir(parents=True, exist_ok=True)
+
+        github_token = self._get_worker_github_token(executors) or self._get_default_github_token()
+        clone_url = (
+            f"https://{quote(github_token, safe='')}@github.com/{event.repo}.git"
+            if github_token
+            else f"https://github.com/{event.repo}.git"
+        )
+        clone_result = subprocess.run(
+            ["git", "clone", "--depth", "1", clone_url, str(context_dir)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if clone_result.returncode != 0:
+            shutil.rmtree(context_dir, ignore_errors=True)
+            return None
+
+        branch_name = str(artifacts.get("branch_name") or "").strip()
+        if branch_name:
+            subprocess.run(
+                ["git", "fetch", "origin", branch_name],
+                cwd=str(context_dir),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            checkout_result = subprocess.run(
+                ["git", "checkout", branch_name],
+                cwd=str(context_dir),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if checkout_result.returncode != 0:
+                subprocess.run(
+                    ["git", "checkout", "-B", branch_name, f"origin/{branch_name}"],
+                    cwd=str(context_dir),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+        return context_dir
 
     def _collect_blocking_unknowns(self, ai_outputs: List[Dict[str, Any]], phase: str) -> List[str]:
         """Extract blocking_unknowns from worker outputs in the given phase.

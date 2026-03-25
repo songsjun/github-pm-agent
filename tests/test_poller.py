@@ -146,6 +146,63 @@ class GitHubPollerTest(unittest.TestCase):
 
         self.assertEqual(poller.poll(since), [])
 
+    def test_ready_to_code_issue_opening_routes_to_issue_coding(self) -> None:
+        since = "2026-03-19T10:00:00Z"
+        client = FakeClient(
+            api_pages={
+                "repos/acme/widgets/issues": [
+                    [
+                        {
+                            "id": 101,
+                            "number": 7,
+                            "title": "Implement app shell",
+                            "body": "issue body",
+                            "created_at": "2026-03-19T10:01:00Z",
+                            "updated_at": "2026-03-19T10:01:00Z",
+                            "html_url": "https://example.test/issues/7",
+                            "state": "open",
+                            "state_reason": None,
+                            "labels": [{"name": "frontend"}, {"name": "ready-to-code"}],
+                            "user": {"login": "pm"},
+                        },
+                        {
+                            "id": 102,
+                            "number": 8,
+                            "title": "Plain issue",
+                            "body": "plain body",
+                            "created_at": "2026-03-19T10:02:00Z",
+                            "updated_at": "2026-03-19T10:02:00Z",
+                            "html_url": "https://example.test/issues/8",
+                            "state": "open",
+                            "state_reason": None,
+                            "labels": [{"name": "bug"}],
+                            "user": {"login": "pm"},
+                        },
+                        {
+                            "id": 103,
+                            "number": 9,
+                            "title": "Edited ready issue",
+                            "body": "edited body",
+                            "created_at": "2026-03-19T09:00:00Z",
+                            "updated_at": "2026-03-19T10:03:00Z",
+                            "html_url": "https://example.test/issues/9",
+                            "state": "open",
+                            "state_reason": None,
+                            "labels": [{"name": "ready-to-code"}],
+                            "user": {"login": "pm"},
+                        },
+                    ]
+                ]
+            }
+        )
+        poller = GitHubPoller(client, "acme/widgets", "main", [])
+
+        events = poller._poll_issues(since)
+
+        self.assertEqual([event.event_type for event in events], ["issue_coding", "issue_changed"])
+        self.assertEqual(events[0].target_number, 7)
+        self.assertEqual(events[1].target_number, 8)
+
     def test_poll_reraises_non_scope_project_errors(self) -> None:
         since = "2026-03-19T10:00:00Z"
 

@@ -544,34 +544,38 @@ class CodingSession:
 
     def _parse_build_test_result(self, build_logs: str, build_job: dict[str, Any]) -> TestResult:
         """Parse test results from Docker build logs captured during a build-time test run."""
-        # Look for the sentinel line: __TEST_EXIT_CODE__:<n>
+        sentinel_pattern = re.compile(r"__TEST_EXIT_CODE__:(\d+)")
+
+        # BuildKit prefixes log lines with metadata like "#9 2.746", so match
+        # the sentinel anywhere in the line instead of only at the start.
         exit_code = 1  # default to failure
         for line in reversed(build_logs.splitlines()):
-            stripped = line.strip()
-            if stripped.startswith("__TEST_EXIT_CODE__:"):
+            match = sentinel_pattern.search(line)
+            if match:
                 try:
-                    exit_code = int(stripped.split(":", 1)[1].strip())
+                    exit_code = int(match.group(1))
                     break
                 except ValueError:
                     pass
 
-        # Extract the test output: lines between the last RUN step and the sentinel
+        # Extract lines after the last test RUN step and before the sentinel.
+        # Support both classic "Step 4/4" logs and BuildKit "[5/5] RUN" logs.
         test_output_lines: list[str] = []
-        capturing = False
-        for line in build_logs.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("Step") and "RUN sh -c" in stripped:
-                capturing = True
-                test_output_lines = []
-                continue
-            if capturing:
-                if stripped.startswith("__TEST_EXIT_CODE__:"):
+        lines = build_logs.splitlines()
+        run_step_index = None
+        for index, line in enumerate(lines):
+            if "RUN sh -c" in line:
+                run_step_index = index
+
+        if run_step_index is not None:
+            for line in lines[run_step_index + 1 :]:
+                if sentinel_pattern.search(line):
                     break
                 test_output_lines.append(line)
 
         # If the test step was never reached (e.g. install failed), fall back to all build logs
-        if not capturing:
-            test_output_lines = build_logs.splitlines()
+        if run_step_index is None:
+            test_output_lines = lines
         stdout = "\n".join(test_output_lines).strip()
         passed = exit_code == 0
         status_label = "PASSED" if passed else "FAILED"

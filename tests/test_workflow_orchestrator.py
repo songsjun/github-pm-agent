@@ -430,6 +430,29 @@ def test_create_issues_from_artifact_fails_loudly_on_bad_json() -> None:
         assert final_instance.get_pending_comments() == ["Keep this comment until the step succeeds."]
 
 
+def test_create_issues_from_artifact_adds_ready_to_code_label() -> None:
+    actions = RecordingActions()
+    engine = FakeEngine(actions)
+    orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+    created, error = orchestrator._create_issues_from_artifact(
+        json.dumps(
+            [
+                {
+                    "title": "Create app shell",
+                    "body": "body",
+                    "labels": ["frontend", "enhancement"],
+                }
+            ]
+        ),
+        _discussion_event(),
+    )
+
+    assert error == ""
+    assert len(created) == 1
+    assert actions.create_issue_calls[0]["labels"] == ["frontend", "enhancement", "ready-to-code"]
+
+
 def test_phase_workflow_skips_when_gate_already_open() -> None:
     """Re-polling a discussion with an open gate must not re-run the phase or create a new gate issue."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -805,8 +828,68 @@ def test_phase_gate_scanner_deduplicates_by_repo_and_issue_number() -> None:
         ]
         resumed = store.pop()
         assert resumed is not None
+        assert resumed.event_id.startswith("resume:")
         assert resumed.metadata["advance_to_phase"] == "issue_breakdown"
         assert resumed.metadata["gate_human_comment"] == ""
+
+
+def test_phase_gate_scanner_clarification_resume_uses_new_event_id() -> None:
+    from github_pm_agent.phase_gate_scanner import PhaseGateScanner
+    from github_pm_agent.queue_store import QueueStore
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        store = QueueStore(runtime_dir)
+
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        instance.set_phase("problem_framing")
+        instance.set_original_event(
+            {
+                "event_id": "evt-disc-1",
+                "event_type": "discussion",
+                "source": "test",
+                "occurred_at": "2026-03-20T00:00:00Z",
+                "repo": "songsjun/example",
+                "actor": "alice",
+                "url": "https://example.test/discussions/5",
+                "title": "Feature idea",
+                "body": "Let's brainstorm",
+                "target_kind": "discussion",
+                "target_number": 5,
+                "metadata": {},
+            }
+        )
+        instance.set_clarification("problem_framing", "2026-03-20T12:00:00Z", "D_disc_5")
+        instance.set_artifact("problem_framing", "artifact")
+
+        class FakeClientComments:
+            def get_discussion_comments(self, owner: str, name: str, number: int) -> Any:
+                return [
+                    {
+                        "createdAt": "2026-03-20T12:05:00Z",
+                        "author": {"login": "owner"},
+                        "body": "Here are the answers",
+                    }
+                ]
+
+        scanner = PhaseGateScanner(store, FakeClientComments(), "owner")
+
+        advanced = scanner.scan_and_advance()
+
+        assert advanced == [
+            {
+                "repo": "songsjun/example",
+                "discussion_number": 5,
+                "from_phase": "problem_framing",
+                "to_phase": "problem_framing",
+                "response_type": "clarification_resume",
+            }
+        ]
+        resumed = store.pop()
+        assert resumed is not None
+        assert resumed.event_id.startswith("resume:")
+        assert resumed.metadata["advance_to_phase"] == "problem_framing"
+        assert resumed.metadata["gate_human_comment"] == "Here are the answers"
 
 
 def _issue_event(action: str = "opened", **metadata: Any) -> Event:
@@ -963,8 +1046,11 @@ def test_issue_coding_unparseable_review_output_terminates_workflow() -> None:
 
 
 def test_issue_coding_combined_lgtm_reviews_are_accepted() -> None:
+    from github_pm_agent.queue_store import QueueStore
+
     with tempfile.TemporaryDirectory() as tmpdir:
         runtime_dir = Path(tmpdir)
+        store = QueueStore(runtime_dir)
         instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
         instance.set_phase("code_review")
         instance.set_artifact(
@@ -988,7 +1074,62 @@ def test_issue_coding_combined_lgtm_reviews_are_accepted() -> None:
 
         assert len(actions.submit_pr_review_calls) == 1
         assert actions.submit_pr_review_calls[0]["event"] == "APPROVE"
+        resumed = store.pop()
+        assert resumed is not None
+        assert resumed.event_id.startswith("resume:")
+        assert resumed.metadata["advance_to_phase"] == "pm_decision"
         final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert final_instance.is_terminated() is False
+
+
+def test_issue_coding_blocking_reviews_requeue_fix_iteration_with_new_event_id() -> None:
+    from github_pm_agent.queue_store import QueueStore
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        store = QueueStore(runtime_dir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_phase("code_review")
+        instance.set_artifact(
+            "code_review_combined",
+            "\n\n---\n\n".join(
+                [
+                    (
+                        "### worker1_slot1\n\n"
+                        "**Blocking**\n"
+                        "- **Location:** `src/lib/places.ts` line 1\n"
+                        "- **Issue:** Latitude values outside the valid range are accepted.\n"
+                        "- **Severity:** blocking\n"
+                        "- **Fix suggestion:** Reject latitude values outside `[-90, 90]`.\n"
+                    ),
+                    "### worker2_slot2\n\nLGTM — no issues found.",
+                ]
+            ),
+        )
+        instance.set_artifact(
+            "code_review",
+            "**Blocking**\n"
+            "- **Location:** `src/lib/places.ts` line 1\n"
+            "- **Issue:** Latitude values outside the valid range are accepted.\n"
+            "- **Severity:** blocking\n"
+            "- **Fix suggestion:** Reject latitude values outside `[-90, 90]`.\n",
+        )
+        instance.set_artifact("pr_number", "17")
+        instance.set_original_event(_issue_coding_event().to_dict())
+
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        orchestrator.process(_issue_coding_event())
+
+        resumed = store.pop()
+        assert resumed is not None
+        assert resumed.event_id.startswith("resume:")
+        assert resumed.event_id != "evt-issue-coding-1"
+        assert resumed.metadata["advance_to_phase"] == "fix_iteration"
+        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert final_instance.get_review_round() == 1
         assert final_instance.is_terminated() is False
 
 
@@ -1059,6 +1200,7 @@ def test_phase_gate_scanner_issue_gate_ignores_stale_comments_and_sets_execute_f
         ]
         resumed = store.pop()
         assert resumed is not None
+        assert resumed.event_id.startswith("resume:")
         assert resumed.metadata["advance_to_phase"] == "pm_decision"
         assert resumed.metadata["execute_gated_action"] is True
         assert resumed.metadata["gate_human_comment"] == "ok"

@@ -123,6 +123,7 @@ class EventEngine:
         role: str = "pm",
         variables: Optional[Dict[str, Any]] = None,
         session_key_suffix: str = "",
+        cwd: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run an AI prompt and return the raw text response without JSON parsing or action execution."""
         provider = self.ai_manager.default_provider()
@@ -142,6 +143,7 @@ class EventEngine:
             model=model,
             system_prompt_path=f"prompts/system/{role}.md",
             prompt_path=prompt_path,
+            cwd=cwd,
             variables=base_variables,
             memory_refs=[],
             skill_refs=[],

@@ -237,6 +237,31 @@ class CodingSessionTest(unittest.TestCase):
         self.assertEqual(result.exit_code, 1)
         self.assertIn("FAILED: 1 error", result.stdout)
 
+    def test_run_tests_success_with_buildkit_prefixed_logs(self) -> None:
+        """BuildKit prefixes still allow parsing a passing sentinel and output."""
+        session, client = self._make_session()
+        (session.work_dir / "README.md").write_text("test repo\n", encoding="utf-8")
+        plan = self._make_plan(files=[])
+        client.upload_context.return_value = "ctx-1"
+        client.build_image.return_value = "j-build"
+        client.wait_for_job.return_value = {"status": "done"}
+        build_logs = (
+            "#9 [5/5] RUN sh -c 'npm test'; echo __TEST_EXIT_CODE__:$?\n"
+            "#9 0.480 > test\n"
+            "#9 1.603 ✓ tests/weather-api.test.js (2 tests) 7ms\n"
+            "#9 2.697 Test Files  2 passed (2)\n"
+            "#9 2.746 __TEST_EXIT_CODE__:0\n"
+            "#9 DONE 2.8s\n"
+        )
+        client.get_logs.return_value = build_logs
+
+        result = session.run_tests(plan)
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("2 passed", result.stdout)
+        self.assertNotIn("__TEST_EXIT_CODE__:0", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

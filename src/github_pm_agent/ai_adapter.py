@@ -135,7 +135,7 @@ class AIAdapterManager:
             "--input-file",
             input_file,
             "--cwd",
-            str(self.project_root),
+            str(request.cwd or self.project_root),
         ]
         if request.session_key:
             command.extend(["--session-key", request.session_key])
@@ -151,7 +151,13 @@ class AIAdapterManager:
         if provider_config.get("reasoning_effort"):
             command.extend(["--reasoning-effort", provider_config["reasoning_effort"]])
 
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=str(request.cwd or self.project_root),
+        )
         raw = json.loads(result.stdout.strip()) if result.stdout.strip() else {}
         return AiResponse(
             provider=request.provider,

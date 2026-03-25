@@ -70,6 +70,12 @@ class PromptLibraryTest(unittest.TestCase):
             rendered,
         )
 
+    def test_coding_implement_prompt_is_repo_agnostic(self) -> None:
+        prompt = (PROJECT_ROOT / "prompts/coding/implement.md").read_text(encoding="utf-8")
+        self.assertNotIn("StudyGoal", prompt)
+        self.assertNotIn("getActiveStudyGoal", prompt)
+        self.assertNotIn("This repo already has Prisma set up", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

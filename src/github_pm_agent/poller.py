@@ -201,7 +201,6 @@ class GitHubPoller:
             {"state": "all", "since": since_iso},
         ):
             for item in items:
-                event_type = "pull_request_changed" if item.get("pull_request") else "issue_changed"
                 body = item.get("body") or ""
                 occurred_at = _first_timestamp(item.get("updated_at"), item.get("created_at"))
                 if not self._is_newer_than(occurred_at, since_dt):
@@ -209,6 +208,16 @@ class GitHubPoller:
                 target_kind = "pull_request" if item.get("pull_request") else "issue"
                 created_at = _first_timestamp(item.get("created_at"))
                 action = "opened" if self._is_newer_than(created_at, since_dt) else "edited"
+                labels = [(label or {}).get("name") for label in item.get("labels", [])]
+                is_ready_to_code = target_kind == "issue" and "ready-to-code" in labels
+                if item.get("pull_request"):
+                    event_type = "pull_request_changed"
+                elif is_ready_to_code and action == "opened":
+                    event_type = "issue_coding"
+                elif is_ready_to_code:
+                    continue
+                else:
+                    event_type = "issue_changed"
                 event = Event(
                     event_id=_event_id(event_type, item["id"], occurred_at),
                     event_type=event_type,
@@ -225,7 +234,7 @@ class GitHubPoller:
                         "action": action,
                         "state": item.get("state"),
                         "state_reason": item.get("state_reason"),
-                        "labels": [(label or {}).get("name") for label in item.get("labels", [])],
+                        "labels": labels,
                         "draft": item.get("draft", False),
                         "author": (item.get("user") or {}).get("login", ""),
                         "requested_reviewers": [(reviewer or {}).get("login") for reviewer in item.get("requested_reviewers", [])],

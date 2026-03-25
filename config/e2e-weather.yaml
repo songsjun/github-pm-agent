@@ -1,0 +1,52 @@
+github:
+  repos:
+    - sjunsong/weather-atlas-e2e
+  default_branch: main
+  owner: sjunsong
+  gh_path: gh
+
+agents:
+  - id: pm
+    role: pm
+    login: songsjun
+    token_env: GITHUB_TOKEN_PM
+    priority: 1
+    participates_in:
+      pull_request_changed: observe
+      issue_changed: respond
+
+  - id: kapy
+    role: worker
+    login: kapy9250
+    worker_index: 1
+    token_env: GITHUB_TOKEN_KAPY
+
+  - id: otter
+    role: worker
+    login: otter9527
+    worker_index: 2
+    token_env: GITHUB_TOKEN_OTTER
+
+engine:
+  dry_run: false
+  continue_on_error: true
+  supervisor_enabled: false
+
+ai:
+  default_provider: codex_cli
+  default_model: gpt-5.4
+  providers:
+    codex_cli:
+      type: cli_script
+      provider_name: codex
+      script: scripts/run_ai_cli.py
+      python_path: python3
+      codex_path: codex
+      default_model: gpt-5.4
+      reasoning_effort: medium
+
+devenv:
+  server_url: http://127.0.0.1:17070
+  base_image: node:20-slim
+
+runtime_dir: .runtime/e2e-weather

@@ -59,6 +59,7 @@ class AiRequest:
     model: str
     system_prompt_path: str
     prompt_path: str
+    cwd: Optional[str] = None
     variables: Dict[str, Any] = field(default_factory=dict)
     file_refs: List[str] = field(default_factory=list)
     memory_refs: List[str] = field(default_factory=list)
