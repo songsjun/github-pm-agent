@@ -60,7 +60,7 @@ class CodingSession:
         self.issue_number = issue_number
         self.github_token = github_token
         self.base_image = base_image
-        self.workspace_id = f"issue-{repo.replace('/', '-')}-{issue_number}-{int(time.time())}"
+        self.workspace_id = f"issue-{repo.replace('/', '-')}-{issue_number}"
         self.work_dir = Path(tempfile.mkdtemp(prefix=self._temp_dir_prefix()))
         self.job_id: str | None = None
         self.iteration = 1
@@ -69,23 +69,14 @@ class CodingSession:
 
     def setup(self) -> None:
         """
-        1. Validate GitHub token (fail fast before expensive work)
-        2. Create devenv workspace (idempotent: ok if already exists)
-        3. Create temp work_dir and git clone the repo into it
+        1. Create devenv workspace (idempotent: ok if already exists)
+        2. Create temp work_dir and git clone the repo into it
            - Use HTTPS with token if github_token provided: https://{token}@github.com/{repo}.git
            - Otherwise use git clone https://github.com/{repo}.git
-        4. Set up git user config in work_dir for later commits
+        3. Set up git user config in work_dir for later commits
         """
 
         logger.info("Setting up coding session for %s#%s", self.repo, self.issue_number)
-
-        # Fail fast: validate token before spending time on clone/workspace.
-        if not self.github_token or not self.github_token.strip():
-            raise RuntimeError(
-                f"github_token is empty for coding session {self.repo}#{self.issue_number}. "
-                "Push will fail later. Set the worker's token_env in config."
-            )
-        self._validate_github_token()
         if not self.work_dir.exists():
             self.work_dir = Path(tempfile.mkdtemp(prefix=self._temp_dir_prefix()))
 
@@ -151,15 +142,8 @@ class CodingSession:
         """
 
         self._ensure_repo_ready()
-        # Allow empty install_command for static projects (HTML/CSS/JS)
         if not plan.install_command.strip():
-            plan = CodingPlan(
-                files=plan.files,
-                test_command=plan.test_command,
-                install_command="echo 'no install required'",
-                branch_name=plan.branch_name,
-                commit_message=plan.commit_message,
-            )
+            raise RuntimeError("coding plan install_command is empty")
         if not plan.test_command.strip():
             raise RuntimeError("coding plan test_command is empty")
 
@@ -394,21 +378,10 @@ class CodingSession:
         Try: find JSON block in ```json...``` or raw JSON in the text.
         Return None if parsing fails.
         """
-        plan, _error = CodingSession.parse_plan_with_reason(ai_output)
-        return plan
-
-    @staticmethod
-    def parse_plan_with_reason(ai_output: str) -> tuple[CodingPlan | None, str]:
-        """
-        Extract CodingPlan from AI output, returning ``(plan, error)``
-        where *error* is an empty string on success or a diagnostic
-        message explaining why parsing failed.
-        """
 
         payload = extract_json_object(ai_output)
         if not isinstance(payload, dict):
-            snippet = (ai_output[:500] + "...") if len(ai_output) > 500 else ai_output
-            return None, f"no valid JSON object found in AI output. Raw output starts with: {snippet}"
+            return None
 
         files = payload.get("files")
         test_command = payload.get("test_command")
@@ -416,54 +389,36 @@ class CodingSession:
         branch_name = payload.get("branch_name")
         commit_message = payload.get("commit_message")
 
-        missing: list[str] = []
         if not isinstance(files, list):
-            missing.append("files (expected list)")
+            return None
         if not isinstance(test_command, str) or not test_command.strip():
-            missing.append("test_command (empty or missing)")
-        if not isinstance(install_command, str):
-            missing.append("install_command (missing)")
+            return None
+        if not isinstance(install_command, str) or not install_command.strip():
+            return None
         if not isinstance(branch_name, str) or not branch_name.strip():
-            missing.append("branch_name (empty or missing)")
+            return None
         if not isinstance(commit_message, str) or not commit_message.strip():
-            missing.append("commit_message (empty or missing)")
-        if missing:
-            present_keys = [k for k in payload if k in {"files", "test_command", "install_command", "branch_name", "commit_message"}]
-            return None, (
-                f"coding plan JSON is missing or has invalid fields: {', '.join(missing)}. "
-                f"Present keys: {present_keys}. "
-                f"All top-level keys: {list(payload.keys())}"
-            )
+            return None
 
-        # install_command may be empty for static projects (HTML/CSS/JS)
-        if isinstance(install_command, str) and not install_command.strip():
-            install_command = "echo 'no install required'"
-
-        assert isinstance(files, list)
         normalized_files: list[dict[str, str]] = []
-        for idx, item in enumerate(files):
+        for item in files:
             if not isinstance(item, dict):
-                return None, f"files[{idx}] is not a dict (got {type(item).__name__})"
+                return None
             path = item.get("path")
             content = item.get("content")
             if not isinstance(path, str) or not path.strip():
-                return None, f"files[{idx}].path is empty or missing"
+                return None
             if not isinstance(content, str):
-                return None, f"files[{idx}].content is not a string (got {type(content).__name__})"
+                return None
             normalized_files.append({"path": path, "content": content})
 
-        # All fields validated as non-None strings above; assert for type checker.
-        assert isinstance(test_command, str)
-        assert isinstance(install_command, str)
-        assert isinstance(branch_name, str)
-        assert isinstance(commit_message, str)
         return CodingPlan(
             files=normalized_files,
             test_command=test_command.strip(),
             install_command=install_command.strip(),
             branch_name=branch_name.strip(),
             commit_message=commit_message.strip(),
-        ), ""
+        )
 
     def _checkout_branch(self, branch_name: str) -> None:
         current_branch = self._run_command(
@@ -489,23 +444,6 @@ class CodingSession:
             raise RuntimeError("coding session work_dir has been removed; call setup() again")
         if not (self.work_dir / ".git").exists():
             raise RuntimeError("coding session repository is not initialized; call setup() first")
-
-    def _validate_github_token(self) -> None:
-        """Verify the token can authenticate against GitHub before doing expensive work."""
-        env = dict(os.environ)
-        env["GITHUB_TOKEN"] = self.github_token
-        try:
-            result = subprocess.run(
-                ["gh", "auth", "status"],
-                capture_output=True, text=True, timeout=15, env=env,
-            )
-            if result.returncode != 0:
-                logger.warning(
-                    "GitHub token validation returned non-zero for %s#%s: %s",
-                    self.repo, self.issue_number, result.stderr[:200],
-                )
-        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
-            logger.warning("GitHub token validation check skipped: %s", exc)
 
     def _git_clone_url(self) -> str:
         if not self.github_token:
@@ -637,7 +575,7 @@ class CodingSession:
         stdout = "\n".join(test_output_lines).strip()
         passed = exit_code == 0
         status_label = "PASSED" if passed else "FAILED"
-        summary = f"Tests {status_label} (exit code {exit_code}).\n\n{stdout[:6000]}" if stdout else f"Tests {status_label} (exit code {exit_code})."
+        summary = f"Tests {status_label} (exit code {exit_code}).\n\n{stdout[:2000]}" if stdout else f"Tests {status_label} (exit code {exit_code})."
         return TestResult(
             passed=passed,
             exit_code=exit_code,
@@ -694,7 +632,6 @@ class CodingSession:
         env: dict[str, str] | None = None,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
-        safe_cmd = self._sanitize_command_for_log(command)
         try:
             result = subprocess.run(
                 command,
@@ -705,23 +642,13 @@ class CodingSession:
                 text=True,
             )
         except OSError as exc:
-            raise RuntimeError(f"failed to execute {safe_cmd}: {exc}") from exc
+            raise RuntimeError(f"failed to execute {' '.join(command)}: {exc}") from exc
         if check and result.returncode != 0:
             details = result.stderr.strip() or result.stdout.strip() or "no output"
             raise RuntimeError(
-                f"command {safe_cmd!r} failed with exit code {result.returncode}: {details}"
+                f"command {' '.join(command)!r} failed with exit code {result.returncode}: {details}"
             )
         return result
-
-    def _sanitize_command_for_log(self, command: list[str]) -> str:
-        """Redact tokens from command strings before logging."""
-        parts = []
-        for arg in command:
-            if self.github_token and self.github_token in arg:
-                parts.append(arg.replace(self.github_token, "***"))
-            else:
-                parts.append(arg)
-        return " ".join(parts)
 
     def _command_env(self) -> dict[str, str] | None:
         if not self.github_token:

@@ -21,27 +21,16 @@ _REVISE_SIGNALS = re.compile(
     r"(另外|补充|还有|but also|also add|add|additionally|plus|however|but|不过|但是|需要加上|加上|修改|改一下|change|update)",
     re.IGNORECASE,
 )
-# "Skip to <phase>" pattern — allows human to jump directly to a named phase
-_SKIP_TO_RE = re.compile(
-    r"(?:skip\s+to|跳到|直接到|jump\s+to|go\s+to)\s+(\S+)",
-    re.IGNORECASE,
-)
 
 
 def classify_gate_response(text: str) -> str:
     """Classify an owner reply to a gate prompt.
 
-    Returns one of: 'confirm', 'confirm_revise', 'reject', 'skip_to:<phase>', 'unclear'
+    Returns one of: 'confirm', 'confirm_revise', 'reject', 'unclear'
     """
     t = text.strip()
     if not t:
         return "unclear"
-
-    # Check "skip to <phase>" first — highest priority
-    skip_match = _SKIP_TO_RE.search(t)
-    if skip_match:
-        return f"skip_to:{skip_match.group(1).strip()}"
-
     has_confirm = bool(_CONFIRM_WORDS.search(t))
     has_reject = bool(_REJECT_WORDS.search(t))
     has_revise = bool(_REVISE_SIGNALS.search(t))
@@ -180,17 +169,13 @@ class PhaseGateScanner:
     ) -> tuple:
         """Classify the gate response and return (response_type, target_phase).
 
-        - confirm         → advance to next_phase as planned
-        - confirm_revise  → accumulate supplement, re-run the *current* PM synthesis phase
-        - reject          → re-run the current PM synthesis phase with rejection reason
-        - skip_to:<phase> → jump directly to the named phase (skip intermediate phases)
-        - unclear         → advance anyway (treat as confirm) to avoid stalling
+        - confirm        → advance to next_phase as planned
+        - confirm_revise → accumulate supplement, re-run the *current* PM synthesis phase
+        - reject         → re-run the current PM synthesis phase with rejection reason
+        - unclear        → advance anyway (treat as confirm) to avoid stalling
         """
         response_type = classify_gate_response(human_comment)
         current_phase = instance.get_phase() or next_phase
-        if response_type.startswith("skip_to:"):
-            target = response_type.split(":", 1)[1]
-            return "skip_to", target
         if response_type == "confirm_revise":
             instance.add_user_supplement(current_phase, human_comment)
             return response_type, current_phase  # re-run current PM phase

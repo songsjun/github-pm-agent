@@ -177,8 +177,6 @@ class GitHubPMAgentApp:
 
     def drain_queue(self) -> List[Dict[str, Any]]:
         processed: List[Dict[str, Any]] = []
-        consecutive_failures = 0
-        failure_threshold = self.config.get("engine", {}).get("failure_alert_threshold", 5)
         while True:
             event = self.queue.pop()
             if event is None:
@@ -197,35 +195,11 @@ class GitHubPMAgentApp:
                 else:
                     self.queue.mark_done(event, result)
                 processed.append({"event_id": event.event_id, "repo": event.repo, "result": result})
-                consecutive_failures = 0
             except Exception as exc:  # noqa: BLE001
                 self.queue.mark_failed(event, str(exc))
-                consecutive_failures += 1
-                if consecutive_failures >= failure_threshold:
-                    self._alert_consecutive_failures(consecutive_failures, event, exc)
-                    break
                 if not self.config.get("engine", {}).get("continue_on_error", True):
                     raise
         return processed
-
-    def _alert_consecutive_failures(self, count: int, last_event: Event, last_error: Exception) -> None:
-        """Create an escalation issue when too many consecutive events fail."""
-        alert_body = (
-            f"**{count} consecutive events failed during queue drain.**\n\n"
-            f"Queue processing has been paused to prevent further waste.\n\n"
-            f"**Last failing event:** `{last_event.event_type}` "
-            f"(repo: `{last_event.repo}`, target: {last_event.target_kind} #{last_event.target_number or 'N/A'})\n\n"
-            f"**Last error:**\n```\n{str(last_error)[:1000]}\n```\n\n"
-            f"Please investigate the root cause before restarting the daemon."
-        )
-        try:
-            self.actions.create_issue(
-                title=f"[alert] {count} consecutive processing failures",
-                body=alert_body,
-                labels=["workflow-alert"],
-            )
-        except Exception:
-            pass  # best-effort; don't crash the alert itself
 
     def events_from_webhook(self, payload: Any, event_type: str = "") -> List[Event]:
         if isinstance(payload, list):

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import fnmatch
-import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -268,17 +267,6 @@ class WorkflowOrchestrator:
         if not steps:
             return {"error": "workflow has no steps", "escalation_refs": []}
 
-        # Dependency gate: for issue_coding workflows that haven't started yet,
-        # check whether all dependency issues are closed before starting.
-        if (
-            workflow.get("event_type") == "issue_coding"
-            and instance.get_phase() is None
-            and not meta.get("advance_to_phase")
-        ):
-            dep_result = self._check_issue_dependencies(event)
-            if dep_result is not None:
-                return dep_result
-
         advance_to = meta.get("advance_to_phase")
         if advance_to:
             instance.set_phase(advance_to)
@@ -482,17 +470,9 @@ class WorkflowOrchestrator:
                     from github_pm_agent.devenv_client import DevEnvClient
                     from github_pm_agent.utils import append_jsonl
 
-                    plan, parse_error = CodingSession.parse_plan_with_reason(last_content)
+                    plan = CodingSession.parse_plan(last_content)
                     if plan is None:
-                        ai_snippet = (last_content[:800] + "\n...truncated") if len(last_content) > 800 else last_content
-                        detail = (
-                            f"**Failed to parse coding plan from AI output**\n\n"
-                            f"**Reason:** {parse_error}\n\n"
-                            f"<details><summary>AI output (truncated)</summary>\n\n```\n{ai_snippet}\n```\n</details>"
-                        )
-                        self.actions.comment("issue", event.target_number, detail)
-                        instance.set_artifact("parse_error", parse_error)
-                        instance.set_artifact("raw_ai_output", last_content[:2000])
+                        self.actions.comment("issue", event.target_number, "Failed to parse coding plan from AI output")
                         break
 
                     devenv_cfg = self.config.get("devenv", {})
@@ -569,8 +549,8 @@ class WorkflowOrchestrator:
                             failure_context = (
                                 f"Iteration: {session.iteration}\n"
                                 f"Summary: {test_result.summary}\n\n"
-                                f"stdout:\n```\n{test_result.stdout[-6000:] if test_result.stdout else ''}\n```\n\n"
-                                f"stderr:\n```\n{test_result.stderr[-6000:] if test_result.stderr else ''}\n```"
+                                f"stdout:\n```\n{test_result.stdout[-3000:] if test_result.stdout else ''}\n```\n\n"
+                                f"stderr:\n```\n{test_result.stderr[-3000:] if test_result.stderr else ''}\n```"
                             )
                             instance.set_artifact("test_failure_context", failure_context)
                             original_event = instance.get_original_event() or event.to_dict()
@@ -663,25 +643,11 @@ class WorkflowOrchestrator:
                 original_event = instance.get_original_event() or event.to_dict()
 
                 def _has_blocking(text: str) -> bool:
-                    # Try structured JSON first (new format)
-                    from github_pm_agent.utils import extract_json_object
-                    parsed = extract_json_object(text)
-                    if isinstance(parsed, dict) and "has_blocking" in parsed:
-                        return bool(parsed["has_blocking"])
-                    if isinstance(parsed, dict) and "findings" in parsed:
-                        findings = parsed.get("findings", [])
-                        if isinstance(findings, list):
-                            return any(
-                                isinstance(f, dict) and f.get("severity", "").lower() == "blocking"
-                                for f in findings
-                            )
-                    # Fallback: free-text detection (legacy format)
                     lower = text.lower()
                     return (
                         "**blocking**" in lower
                         or "severity: blocking" in lower
                         or "severity**:** blocking" in lower
-                        or '"severity": "blocking"' in lower
                     )
 
                 _raw_pr = artifacts.get("pr_number", "")
@@ -740,15 +706,12 @@ class WorkflowOrchestrator:
                     from github_pm_agent.devenv_client import DevEnvClient
                     from github_pm_agent.utils import append_jsonl
 
-                    plan, parse_error = CodingSession.parse_plan_with_reason(last_content)
+                    plan = CodingSession.parse_plan(last_content)
                     if plan is None:
-                        ai_snippet = (last_content[:800] + "\n...truncated") if len(last_content) > 800 else last_content
-                        detail = (
-                            f"**Failed to parse fix plan from AI output**\n\n"
-                            f"**Reason:** {parse_error}\n\n"
-                            f"<details><summary>AI output (truncated)</summary>\n\n```\n{ai_snippet}\n```\n</details>"
+                        self.actions.comment(
+                            "issue", event.target_number,
+                            "Failed to parse fix plan from AI output — manual fix required."
                         )
-                        self.actions.comment("issue", event.target_number, detail)
                         instance.set_terminated("Fix plan parse failure")
                         break
 
@@ -826,7 +789,6 @@ class WorkflowOrchestrator:
                     break
             elif step.get("action") == "merge_or_reopen":
                 from github_pm_agent.utils import extract_json_object
-                import json as _json_merge
 
                 parsed = extract_json_object(last_content)
                 decision = "reopen"
@@ -841,36 +803,6 @@ class WorkflowOrchestrator:
                 _raw_pr = artifacts.get("pr_number", "")
                 pr_number: Optional[int] = int(str(_raw_pr)) if str(_raw_pr).strip().isdigit() else None
                 issue_number = event.target_number
-
-                # Evidence completeness check: refuse to merge if key artifacts are missing.
-                if decision == "merge":
-                    missing_evidence: List[str] = []
-                    test_result_raw = artifacts.get("test_result")
-                    if not test_result_raw:
-                        missing_evidence.append("test_result (no test outcome recorded)")
-                    else:
-                        try:
-                            tr = _json_merge.loads(test_result_raw) if isinstance(test_result_raw, str) else test_result_raw
-                            if isinstance(tr, dict) and not tr.get("passed"):
-                                missing_evidence.append("test_result shows tests did NOT pass")
-                        except (_json_merge.JSONDecodeError, ValueError):
-                            missing_evidence.append("test_result is not parseable")
-                    if not artifacts.get("code_review_combined") and not artifacts.get("code_review"):
-                        missing_evidence.append("code_review (no review output recorded)")
-                    if pr_number is None:
-                        missing_evidence.append("pr_number (no PR to merge)")
-                    if missing_evidence:
-                        evidence_list = "\n".join(f"- {e}" for e in missing_evidence)
-                        block_msg = (
-                            f"**Merge blocked: evidence incomplete**\n\n"
-                            f"The PM decided to merge, but required evidence is missing or invalid:\n"
-                            f"{evidence_list}\n\n"
-                            f"Falling back to **reopen**. Please resolve the gaps and retry."
-                        )
-                        self.actions.comment("issue", event.target_number, block_msg)
-                        decision = "reopen"
-                        reopen_comment = f"Evidence incomplete: {', '.join(missing_evidence)}"
-
                 if pr_number is None:
                     import logging
 
@@ -1139,72 +1071,6 @@ class WorkflowOrchestrator:
         # Legacy roles-based dispatch
         roles = step.get("roles", ["pm"])
         return [{"role": role, "agent_id": None, "label": role, "extra_vars": {}} for role in roles]
-
-    # ------------------------------------------------------------------
-    # Dependency checking for issue_coding workflows
-    # ------------------------------------------------------------------
-
-    _DEPENDENCY_RE = re.compile(
-        r"(?:Dependen(?:cies|cy)|Depends\s+on|Blocked\s+by|Requires)\s*:\s*(.+)",
-        re.IGNORECASE,
-    )
-    _ISSUE_REF_RE = re.compile(r"#(\d+)")
-
-    def _parse_dependency_numbers(self, text: str) -> List[int]:
-        """Extract dependency issue numbers from issue body text.
-
-        Looks for lines like ``Dependencies: #2, #3`` or ``Blocked by: #5``.
-        """
-        numbers: List[int] = []
-        for line in text.splitlines():
-            m = self._DEPENDENCY_RE.search(line)
-            if m:
-                for ref in self._ISSUE_REF_RE.finditer(m.group(1)):
-                    num = int(ref.group(1))
-                    if num not in numbers:
-                        numbers.append(num)
-        return numbers
-
-    def _check_issue_dependencies(self, event: Any) -> Optional[Dict[str, Any]]:
-        """Return a skip-result dict if the event's issue has unresolved dependencies.
-
-        Returns ``None`` when all dependencies are satisfied (or there are none).
-        """
-        body = event.body or ""
-        if not body:
-            # Try fetching the issue body from GitHub
-            try:
-                issue_data = self.client.api(f"/repos/{event.repo}/issues/{event.target_number}")
-                body = issue_data.get("body", "") if isinstance(issue_data, dict) else ""
-            except Exception:
-                return None
-
-        dep_numbers = self._parse_dependency_numbers(body)
-        if not dep_numbers:
-            return None
-
-        open_deps: List[int] = []
-        for num in dep_numbers:
-            try:
-                issue_data = self.client.api(f"/repos/{event.repo}/issues/{num}")
-                state = issue_data.get("state", "") if isinstance(issue_data, dict) else ""
-                if state != "closed":
-                    open_deps.append(num)
-            except Exception:
-                # If we can't check, assume it's not blocking
-                pass
-
-        if not open_deps:
-            return None
-
-        open_refs = ", ".join(f"#{n}" for n in open_deps)
-        return {
-            "phase": "implement",
-            "skipped": True,
-            "reason": f"dependency_not_resolved: waiting on {open_refs}",
-            "open_dependencies": open_deps,
-            "escalation_refs": [],
-        }
 
     def _get_worker_github_token(self, executors: List[Dict[str, Any]]) -> str:
         """Resolve the GitHub token for the first worker executor in the step.
