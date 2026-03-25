@@ -210,7 +210,11 @@ class CodingSession:
         branch_name = plan.branch_name
         logger.info("Applying fix on existing branch %s for %s#%s", branch_name, self.repo, self.issue_number)
 
-        self._run_command(["git", "fetch", "origin", branch_name], cwd=self.work_dir, env=self._git_command_env())
+        self._run_command(
+            ["git", "fetch", "origin", self._remote_branch_refspec(branch_name)],
+            cwd=self.work_dir,
+            env=self._git_command_env(),
+        )
 
         branch_exists_locally = (
             self._run_command(
@@ -449,6 +453,10 @@ class CodingSession:
 
     def _repo_clone_url(self) -> str:
         return f"https://github.com/{self.repo}.git"
+
+    @staticmethod
+    def _remote_branch_refspec(branch_name: str) -> str:
+        return f"{branch_name}:refs/remotes/origin/{branch_name}"
 
     def _build_context_archive(self, plan: "CodingPlan | None" = None) -> bytes:
         if plan is not None:

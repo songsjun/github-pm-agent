@@ -288,6 +288,12 @@ class CodingSessionTest(unittest.TestCase):
         self.assertEqual(clone_call["env"]["GIT_CONFIG_COUNT"], "1")
         self.assertIn("AUTHORIZATION: basic ", clone_call["env"]["GIT_CONFIG_VALUE_0"])
 
+    def test_remote_branch_refspec_tracks_origin_branch(self) -> None:
+        self.assertEqual(
+            CodingSession._remote_branch_refspec("feature/test-branch"),
+            "feature/test-branch:refs/remotes/origin/feature/test-branch",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

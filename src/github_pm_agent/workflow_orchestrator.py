@@ -560,6 +560,7 @@ class WorkflowOrchestrator:
                     plan = CodingSession.parse_plan(last_content)
                     if plan is None:
                         self.actions.comment("issue", event.target_number, "Failed to parse coding plan from AI output")
+                        instance.set_terminated("Coding plan parse failure")
                         break
 
                     devenv_cfg = self.config.get("devenv", {})
@@ -658,6 +659,7 @@ class WorkflowOrchestrator:
                                 f"Tests failed after {session.iteration} iteration(s).\n\n"
                                 f"{test_result.summary}"
                             )
+                            instance.set_terminated(f"Tests failed after {session.iteration} iteration(s)")
                             should_break = True
                     except Exception as exc:  # noqa: BLE001
                         error_message = str(exc)
@@ -675,6 +677,7 @@ class WorkflowOrchestrator:
 
                     if error_message:
                         self.actions.comment("issue", event.target_number, f"Coding session failed: {error_message}")
+                        instance.set_terminated(f"Coding session error: {error_message[:200]}")
                         break
 
                     if failure_comment:
@@ -694,6 +697,7 @@ class WorkflowOrchestrator:
                     step_succeeded = True
                 except Exception as exc:  # noqa: BLE001
                     self.actions.comment("issue", event.target_number, f"Coding session failed: {exc}")
+                    instance.set_terminated(f"Coding session error: {str(exc)[:200]}")
                     break
             elif step.get("action") == "run_tests":
                 artifacts = instance.get_artifacts()
@@ -1455,7 +1459,7 @@ class WorkflowOrchestrator:
             branch_name = str(artifacts.get("branch_name") or "").strip()
             if branch_name:
                 fetch_result = subprocess.run(
-                    ["git", "fetch", "origin", branch_name],
+                    ["git", "fetch", "origin", self._remote_branch_refspec(branch_name)],
                     cwd=str(context_dir),
                     capture_output=True,
                     text=True,
@@ -1493,6 +1497,10 @@ class WorkflowOrchestrator:
             raise
 
         return context_dir
+
+    @staticmethod
+    def _remote_branch_refspec(branch_name: str) -> str:
+        return f"{branch_name}:refs/remotes/origin/{branch_name}"
 
     def _collect_blocking_unknowns(self, ai_outputs: List[Dict[str, Any]], phase: str) -> List[str]:
         """Extract blocking_unknowns from worker outputs in the given phase.

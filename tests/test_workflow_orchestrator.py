@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import patch
 
+from github_pm_agent.coding_session import TestResult as CodingTestResult
 from github_pm_agent.models import Event
 from github_pm_agent.workflow_instance import WorkflowInstance
 from github_pm_agent.workflow_orchestrator import WorkflowOrchestrator
@@ -18,6 +19,7 @@ class RecordingActions:
         self.comment_calls: List[Dict[str, Any]] = []
         self.comment_on_discussion_calls: List[Dict[str, Any]] = []
         self.create_issue_calls: List[Dict[str, Any]] = []
+        self.coding_session_calls: List[Dict[str, Any]] = []
         self.submit_pr_review_calls: List[Dict[str, Any]] = []
         self.merge_or_reopen_calls: List[Dict[str, Any]] = []
 
@@ -51,6 +53,29 @@ class RecordingActions:
     def create_issue(self, title: str, body: str, labels: Optional[List[str]] = None) -> Dict[str, Any]:
         payload = {"title": title, "body": body, "labels": list(labels or []), "dry_run": self.dry_run}
         self.create_issue_calls.append(payload)
+        return payload
+
+    def coding_session(
+        self,
+        issue_number: int,
+        repo: str,
+        branch_name: str,
+        pr_title: str,
+        pr_body: str,
+        base_branch: str,
+        coding_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        payload = {
+            "issue_number": issue_number,
+            "repo": repo,
+            "branch_name": branch_name,
+            "pr_title": pr_title,
+            "pr_body": pr_body,
+            "base_branch": base_branch,
+            "coding_result": dict(coding_result),
+            "dry_run": self.dry_run,
+        }
+        self.coding_session_calls.append(payload)
         return payload
 
     def submit_pr_review(self, pr_number: int, event: str = "APPROVE", body: str = "") -> Dict[str, Any]:
@@ -928,6 +953,18 @@ def _issue_coding_event(**metadata: Any) -> Event:
     )
 
 
+def _valid_coding_plan_json() -> str:
+    return json.dumps(
+        {
+            "files": [{"path": "README.md", "content": "# test\n"}],
+            "test_command": "npm test",
+            "install_command": "npm install",
+            "branch_name": "ai/issue-42",
+            "commit_message": "feat: implement issue 42",
+        }
+    )
+
+
 def test_issue_coding_pm_decision_opens_issue_gate_before_merge() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         runtime_dir = Path(tmpdir)
@@ -1130,7 +1167,7 @@ def test_prepare_phase_ai_cwd_clones_with_auth_env_without_token_in_url() -> Non
                 _issue_coding_event(),
                 {"action": "coding_session"},
                 [],
-                {},
+                {"branch_name": "ai/issue-2-place-search-parser"},
             )
 
         assert ai_cwd is not None
@@ -1147,6 +1184,13 @@ def test_prepare_phase_ai_cwd_clones_with_auth_env_without_token_in_url() -> Non
         env = clone_call["kwargs"]["env"]
         assert env["GIT_CONFIG_COUNT"] == "1"
         assert "AUTHORIZATION: basic " in env["GIT_CONFIG_VALUE_0"]
+        fetch_call = recorded[1]
+        assert fetch_call["command"] == [
+            "git",
+            "fetch",
+            "origin",
+            "ai/issue-2-place-search-parser:refs/remotes/origin/ai/issue-2-place-search-parser",
+        ]
 
 
 def test_issue_coding_blocking_reviews_requeue_fix_iteration_with_new_event_id() -> None:
@@ -1198,6 +1242,87 @@ def test_issue_coding_blocking_reviews_requeue_fix_iteration_with_new_event_id()
         final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
         assert final_instance.get_review_round() == 1
         assert final_instance.is_terminated() is False
+
+
+def test_issue_coding_session_runtime_failure_terminates_workflow() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+
+        class FakeEngineImplement(FakeEngine):
+            def run_raw_text_handler(
+                self,
+                event: Any,
+                prompt_path: str,
+                role: str = "pm",
+                variables: Optional[Dict[str, Any]] = None,
+            ) -> Dict[str, Any]:
+                self.run_raw_text_handler_calls.append(
+                    {"event_id": event.event_id, "prompt_path": prompt_path, "role": role}
+                )
+                return {"raw_text": _valid_coding_plan_json()}
+
+        actions = RecordingActions()
+        engine = FakeEngineImplement(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        with (
+            patch.object(WorkflowOrchestrator, "_prepare_phase_ai_cwd", return_value=None),
+            patch("github_pm_agent.coding_session.CodingSession.setup", side_effect=RuntimeError("boom")),
+            patch("github_pm_agent.coding_session.CodingSession.cleanup", return_value=None),
+        ):
+            orchestrator.process(_issue_coding_event())
+
+        assert any("Coding session failed: boom" in call["message"] for call in actions.comment_calls)
+        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert final_instance.is_terminated() is True
+        assert "Coding session error" in final_instance.get_terminated_reason()
+
+
+def test_issue_coding_max_iteration_failure_terminates_workflow() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_artifact("coding_iteration", "2")
+
+        class FakeEngineImplement(FakeEngine):
+            def run_raw_text_handler(
+                self,
+                event: Any,
+                prompt_path: str,
+                role: str = "pm",
+                variables: Optional[Dict[str, Any]] = None,
+            ) -> Dict[str, Any]:
+                self.run_raw_text_handler_calls.append(
+                    {"event_id": event.event_id, "prompt_path": prompt_path, "role": role}
+                )
+                return {"raw_text": _valid_coding_plan_json()}
+
+        actions = RecordingActions()
+        engine = FakeEngineImplement(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        with (
+            patch.object(WorkflowOrchestrator, "_prepare_phase_ai_cwd", return_value=None),
+            patch("github_pm_agent.coding_session.CodingSession.setup", return_value=None),
+            patch("github_pm_agent.coding_session.CodingSession.apply_plan", return_value=None),
+            patch(
+                "github_pm_agent.coding_session.CodingSession.run_tests",
+                return_value=CodingTestResult(
+                    passed=False,
+                    exit_code=1,
+                    stdout="",
+                    stderr="",
+                    summary="1 failed",
+                ),
+            ),
+            patch("github_pm_agent.coding_session.CodingSession.cleanup", return_value=None),
+        ):
+            orchestrator.process(_issue_coding_event())
+
+        assert any("Tests failed after 3 iteration" in call["message"] for call in actions.comment_calls)
+        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert final_instance.is_terminated() is True
+        assert "Tests failed after 3 iteration" in final_instance.get_terminated_reason()
 
 
 def test_phase_gate_scanner_issue_gate_ignores_stale_comments_and_sets_execute_flag() -> None:
