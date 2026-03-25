@@ -142,8 +142,6 @@ class CodingSession:
         """
 
         self._ensure_repo_ready()
-        if not plan.install_command.strip():
-            raise RuntimeError("coding plan install_command is empty")
         if not plan.test_command.strip():
             raise RuntimeError("coding plan test_command is empty")
 
@@ -161,6 +159,7 @@ class CodingSession:
                 context_id=context_id,
                 tag=image_tag,
                 workspace=self.workspace_id,
+                build_args={"CACHE_BUST": str(int(time.time()))},
             )
             # Wait for build to reach terminal state (may succeed or fail)
             build_job: dict[str, Any] = {}
@@ -437,7 +436,7 @@ class CodingSession:
             return None
         if not isinstance(test_command, str) or not test_command.strip():
             return None
-        if not isinstance(install_command, str) or not install_command.strip():
+        if not isinstance(install_command, str):
             return None
         if not isinstance(branch_name, str) or not branch_name.strip():
             return None
@@ -495,25 +494,35 @@ class CodingSession:
         return f"https://{quote(self.github_token, safe='')}@github.com/{self.repo}.git"
 
     def _build_context_archive(self, plan: "CodingPlan | None" = None) -> bytes:
+        # test_script.sh and install_script.sh are written as separate files in the
+        # archive to avoid shell quoting issues (e.g. heredocs in test commands).
+        test_script: bytes | None = None
+        install_script: bytes | None = None
+
         if plan is not None:
-            # Bake install + test into RUN steps so build logs capture full output.
-            # The sentinel line lets us parse exit code without exec or artifact APIs.
-            install_cmd = plan.install_command.replace("'", "'\\''")
-            test_cmd = plan.test_command.replace("'", "'\\''")
+            # Write install and test commands as scripts; avoids sh -c '...' quoting issues.
+            if plan.install_command.strip():
+                install_script = (plan.install_command + "\n").encode("utf-8")
+            test_script = (plan.test_command + "\n").encode("utf-8")
+
+            install_copy_line = "COPY _install.sh /_install.sh\n" if install_script else ""
+            install_run_line = "RUN bash /_install.sh\n" if install_script else ""
             dockerfile = (
                 f"FROM {self.base_image}\n"
+                f"ARG CACHE_BUST\n"
                 f"COPY . {_CONTAINER_WORKDIR}\n"
                 f"WORKDIR {_CONTAINER_WORKDIR}\n"
-                f"RUN {install_cmd}\n"
-                f"RUN sh -c '{test_cmd}'; echo __TEST_EXIT_CODE__:$?\n"
+                f"{install_copy_line}"
+                f"COPY _test.sh /_test.sh\n"
+                f"{install_run_line}"
+                f"RUN bash /_test.sh; echo __TEST_EXIT_CODE__:$?\n"
             )
         else:
             dockerfile = f"FROM {self.base_image}\nCOPY . {_CONTAINER_WORKDIR}\nWORKDIR {_CONTAINER_WORKDIR}\n"
-        _SKIP_NAMES = {".git", "Dockerfile"}
+        _SKIP_NAMES = {".git", "Dockerfile", "_test.sh", "_install.sh"}
 
         def _filter(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
-            # Drop .git and any pre-existing Dockerfile at the root; they will be
-            # replaced by our generated Dockerfile below.
+            # Drop .git and any pre-existing Dockerfile/scripts at the root.
             name = Path(tarinfo.name).parts
             if name and name[-1] in _SKIP_NAMES:
                 return None
@@ -522,11 +531,18 @@ class CodingSession:
         buffer = io.BytesIO()
         with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
             archive.add(self.work_dir, arcname=".", filter=_filter)
-            docker_bytes = dockerfile.encode("utf-8")
-            docker_info = tarfile.TarInfo(name="Dockerfile")
-            docker_info.size = len(docker_bytes)
-            docker_info.mtime = int(time.time())
-            archive.addfile(docker_info, io.BytesIO(docker_bytes))
+
+            def _add_bytes(name: str, data: bytes) -> None:
+                info = tarfile.TarInfo(name=name)
+                info.size = len(data)
+                info.mtime = int(time.time())
+                info.mode = 0o755
+                archive.addfile(info, io.BytesIO(data))
+
+            _add_bytes("Dockerfile", dockerfile.encode("utf-8"))
+            _add_bytes("_test.sh", test_script if test_script is not None else b"#!/bin/bash\n")
+            if install_script is not None:
+                _add_bytes("_install.sh", install_script)
         return buffer.getvalue()
 
     def _wait_for_container_ready(self, job_id: str, timeout: float = 60.0, poll_interval: float = 1.0) -> None:

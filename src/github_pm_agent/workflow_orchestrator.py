@@ -1519,6 +1519,29 @@ class WorkflowOrchestrator:
                 token = os.environ.get(token_env, "")
                 if token:
                     return token
+        # Fall back to any worker agent token when executors is empty (e.g. cached artifact path)
+        for agent_cfg in self.agent_configs:
+            if not isinstance(agent_cfg, dict):
+                continue
+            if agent_cfg.get("role") == "worker":
+                token_env = agent_cfg.get("token_env")
+                if token_env:
+                    token = os.environ.get(token_env, "")
+                    if token:
+                        return token
+                gh_user = agent_cfg.get("gh_user", "").strip()
+                if gh_user:
+                    import subprocess
+                    try:
+                        result = subprocess.run(
+                            [self.config.get("github", {}).get("gh_path", "gh"), "auth", "token", "--user", gh_user],
+                            check=True, capture_output=True, text=True,
+                        )
+                        token = result.stdout.strip()
+                        if token:
+                            return token
+                    except subprocess.CalledProcessError:
+                        pass
         return self.config.get("github", {}).get("token", "")
 
     def _collect_blocking_unknowns(self, ai_outputs: List[Dict[str, Any]], phase: str) -> List[str]:
