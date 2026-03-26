@@ -224,6 +224,13 @@ class WorkflowInstance:
         self._save()
         return next_count
 
+    def get_last_merge_conflict_signature(self) -> str:
+        return str(self._state.get("last_merge_conflict_signature", "") or "")
+
+    def set_last_merge_conflict_signature(self, signature: str) -> None:
+        self._state["last_merge_conflict_signature"] = signature
+        self._save()
+
     def get_workflow_type(self) -> Optional[str]:
         return self._state.get("workflow_type") or None
 
