@@ -77,7 +77,7 @@ def test_merge_conflict_scanner_requeues_conflicting_pm_decision_gate() -> None:
                 "issue_number": 42,
                 "pr_number": 17,
                 "from_phase": "pm_decision",
-                "to_phase": "fix_iteration",
+                "to_phase": "merge_conflict_resolution",
                 "reason": "merge_conflict",
             }
         ]
@@ -88,7 +88,7 @@ def test_merge_conflict_scanner_requeues_conflicting_pm_decision_gate() -> None:
         resumed = queue.pop()
         assert resumed is not None
         assert resumed.event_type == "issue_coding"
-        assert resumed.metadata["advance_to_phase"] == "fix_iteration"
+        assert resumed.metadata["advance_to_phase"] == "merge_conflict_resolution"
         assert resumed.metadata["gate_response_type"] == "merge_conflict"
 
         reloaded = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
@@ -124,5 +124,36 @@ def test_merge_conflict_scanner_deduplicates_same_conflict_signature() -> None:
         results = scanner.scan_and_requeue()
 
         assert results == []
+        assert actions.comment_calls == []
+        assert queue.pop() is None
+
+
+def test_merge_conflict_scanner_does_not_retrigger_when_only_base_sha_changes() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        queue = QueueStore(runtime_dir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_workflow_type("issue_coding")
+        instance.set_phase("pm_decision")
+        instance.set_original_event(_issue_coding_event_dict())
+        instance.set_artifact("pr_number", "17")
+        instance.set_last_merge_conflict_signature("17:head-1:dirty")
+
+        actions = RecordingActions()
+        client = FakeClient(
+            {
+                "repos/songsjun/example/pulls/17": {
+                    "state": "open",
+                    "mergeable": False,
+                    "mergeable_state": "dirty",
+                    "head": {"sha": "head-1"},
+                    "base": {"sha": "base-2"},
+                }
+            }
+        )
+
+        scanner = MergeConflictScanner(queue, client, actions, {"github": {"default_branch": "main"}})
+
+        assert scanner.scan_and_requeue() == []
         assert actions.comment_calls == []
         assert queue.pop() is None

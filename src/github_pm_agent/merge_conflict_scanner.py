@@ -78,7 +78,7 @@ class MergeConflictScanner:
                     original_event,
                     metadata={
                         **dict(original_event.get("metadata", {})),
-                        "advance_to_phase": "fix_iteration",
+                        "advance_to_phase": "merge_conflict_resolution",
                         "artifacts": instance.get_artifacts(),
                         "gate_human_comment": conflict_reason,
                         "gate_response_type": "merge_conflict",
@@ -92,7 +92,7 @@ class MergeConflictScanner:
                     "issue_number": issue_number,
                     "pr_number": pr_number,
                     "from_phase": phase,
-                    "to_phase": "fix_iteration",
+                    "to_phase": "merge_conflict_resolution",
                     "reason": "merge_conflict",
                 }
             )

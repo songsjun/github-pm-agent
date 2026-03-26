@@ -410,7 +410,7 @@ class WorkflowOrchestrator:
             # Fetch live PR diff for code_review and fix_iteration phases
             _raw_pr_num = artifacts.get("pr_number", "")
             _pr_num_int = int(str(_raw_pr_num)) if str(_raw_pr_num).strip().isdigit() else None
-            if _pr_num_int and current_phase in ("code_review", "fix_iteration"):
+            if _pr_num_int and current_phase in ("code_review", "fix_iteration", "merge_conflict_resolution"):
                 try:
                     variables["pr_diff"] = self.client.get_pr_diff(_pr_num_int)
                 except Exception:
@@ -992,7 +992,7 @@ class WorkflowOrchestrator:
                             self._requeue_issue_coding_phase(
                                 instance,
                                 event,
-                                phase="fix_iteration",
+                                phase="merge_conflict_resolution",
                                 reason="merge_conflict",
                                 human_comment=conflict_reason,
                                 response_type="merge_conflict",
@@ -1022,7 +1022,7 @@ class WorkflowOrchestrator:
                                 self._requeue_issue_coding_phase(
                                     instance,
                                     event,
-                                    phase="fix_iteration",
+                                    phase="merge_conflict_resolution",
                                     reason="merge_conflict_retry",
                                     human_comment=conflict_reason,
                                     response_type="merge_conflict",

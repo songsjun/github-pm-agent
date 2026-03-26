@@ -30,7 +30,16 @@ steps:
     action: fix_coding_session
     gate: false
 
-  # Phase 4: PM makes the final merge / reopen decision (human-gated).
+  # Phase 4: Worker resolves pure merge conflicts after main moves ahead.
+  # Pushes a conflict-resolving commit to the existing PR branch, reruns tests,
+  # then returns to code_review on success.
+  - phase: merge_conflict_resolution
+    slots: 1
+    prompt_path: prompts/coding/merge_conflict_resolution.md
+    action: fix_coding_session
+    gate: false
+
+  # Phase 5: PM makes the final merge / reopen decision (human-gated).
   - phase: pm_decision
     roles: [pm]
     prompt_path: prompts/coding/pm_decision.md

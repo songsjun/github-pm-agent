@@ -1121,7 +1121,7 @@ def test_issue_coding_pm_decision_confirmation_executes_without_rerunning_ai() -
         assert final_instance.is_completed() is True
 
 
-def test_issue_coding_pm_decision_merge_conflict_requeues_fix_iteration() -> None:
+def test_issue_coding_pm_decision_merge_conflict_requeues_merge_conflict_resolution() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         runtime_dir = Path(tmpdir)
         instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
@@ -1167,7 +1167,7 @@ def test_issue_coding_pm_decision_merge_conflict_requeues_fix_iteration() -> Non
         pending = [json.loads(line) for line in (runtime_dir / "queue_pending.jsonl").read_text().splitlines()]
         assert len(pending) == 1
         resumed = pending[0]
-        assert resumed["metadata"]["advance_to_phase"] == "fix_iteration"
+        assert resumed["metadata"]["advance_to_phase"] == "merge_conflict_resolution"
         assert resumed["metadata"]["gate_response_type"] == "merge_conflict"
         assert "no longer merges cleanly" in resumed["metadata"]["gate_human_comment"]
         final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)

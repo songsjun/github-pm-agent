@@ -77,7 +77,7 @@ class IssueCodingRecoveryScanner:
         metadata = dict(original_event.get("metadata", {}))
         metadata["advance_to_phase"] = phase
         metadata["artifacts"] = artifacts
-        if phase == "fix_iteration":
+        if phase == "merge_conflict_resolution":
             metadata.setdefault(
                 "gate_human_comment",
                 (

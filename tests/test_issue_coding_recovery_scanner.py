@@ -52,8 +52,30 @@ def test_issue_coding_recovery_scanner_requeues_orphaned_active_workflow() -> No
         assert resumed.target_number == 42
         assert resumed.metadata["advance_to_phase"] == "fix_iteration"
         assert resumed.metadata["artifacts"]["pr_number"] == "17"
-        assert "no longer merges cleanly" in resumed.metadata["gate_human_comment"] or "out of date" in resumed.metadata["gate_human_comment"]
+        assert "gate_human_comment" not in resumed.metadata
         assert resumed.metadata["_queue"]["requeued_from"] == "workflow_recovery"
+
+
+def test_issue_coding_recovery_scanner_preserves_conflict_context_for_merge_conflict_resolution() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        queue = QueueStore(runtime_dir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_workflow_type("issue_coding")
+        instance.set_phase("merge_conflict_resolution")
+        instance.set_original_event(_issue_coding_event_dict())
+        instance.set_artifact("pr_number", "17")
+
+        scanner = IssueCodingRecoveryScanner(queue, default_branch="main")
+
+        results = scanner.scan_and_requeue()
+
+        assert len(results) == 1
+        resumed = queue.pop()
+        assert resumed is not None
+        assert resumed.metadata["advance_to_phase"] == "merge_conflict_resolution"
+        assert "out of date with `main`" in resumed.metadata["gate_human_comment"]
+        assert resumed.metadata["gate_response_type"] == "workflow_recovery"
 
 
 def test_issue_coding_recovery_scanner_skips_workflow_that_already_has_pending_issue_coding_event() -> None:
