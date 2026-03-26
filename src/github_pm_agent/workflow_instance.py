@@ -72,6 +72,8 @@ class WorkflowInstance:
             self._state["gate_next_phase"] = next_phase
         self._state["gate_posted_at"] = posted_at
         self._state["gate_resume_mode"] = resume_mode or "advance"
+        self._state["gate_last_response_at"] = ""
+        self._state["gate_unclear_count"] = 0
         self._save()
 
     def set_discussion_gate(
@@ -86,6 +88,8 @@ class WorkflowInstance:
         self._state["gate_posted_at"] = posted_at
         self._state["gate_next_phase"] = next_phase
         self._state["gate_resume_mode"] = resume_mode or "advance"
+        self._state["gate_last_response_at"] = ""
+        self._state["gate_unclear_count"] = 0
         self._save()
 
     def get_discussion_gate_node_id(self) -> Optional[str]:
@@ -100,6 +104,8 @@ class WorkflowInstance:
         self._state.pop("gate_discussion_node_id", None)
         self._state.pop("gate_posted_at", None)
         self._state.pop("gate_resume_mode", None)
+        self._state.pop("gate_last_response_at", None)
+        self._state.pop("gate_unclear_count", None)
         self._save()
 
     # --- Clarification (intra-phase suspension) ---
@@ -182,6 +188,41 @@ class WorkflowInstance:
     def set_review_round(self, round_num: int) -> None:
         self._state["review_round"] = round_num
         self._save()
+
+    def get_gate_open_count(self, phase: str) -> int:
+        return int((self._state.get("gate_open_counts", {}) or {}).get(phase, 0))
+
+    def increment_gate_open_count(self, phase: str) -> int:
+        counts = dict(self._state.get("gate_open_counts", {}) or {})
+        next_count = int(counts.get(phase, 0)) + 1
+        counts[phase] = next_count
+        self._state["gate_open_counts"] = counts
+        self._save()
+        return next_count
+
+    def get_clarification_round(self, phase: str) -> int:
+        return int((self._state.get("clarification_rounds", {}) or {}).get(phase, 0))
+
+    def increment_clarification_round(self, phase: str) -> int:
+        rounds = dict(self._state.get("clarification_rounds", {}) or {})
+        next_round = int(rounds.get(phase, 0)) + 1
+        rounds[phase] = next_round
+        self._state["clarification_rounds"] = rounds
+        self._save()
+        return next_round
+
+    def get_gate_last_response_at(self) -> str:
+        return str(self._state.get("gate_last_response_at", "") or "")
+
+    def get_gate_unclear_count(self) -> int:
+        return int(self._state.get("gate_unclear_count", 0))
+
+    def record_gate_unclear_response(self, responded_at: str) -> int:
+        self._state["gate_last_response_at"] = responded_at
+        next_count = self.get_gate_unclear_count() + 1
+        self._state["gate_unclear_count"] = next_count
+        self._save()
+        return next_count
 
     def get_workflow_type(self) -> Optional[str]:
         return self._state.get("workflow_type") or None

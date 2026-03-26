@@ -48,10 +48,13 @@ def classify_gate_response(text: str) -> str:
 class PhaseGateScanner:
     """Watches workflow-gate issues; re-queues discussion events when gates are resolved."""
 
-    def __init__(self, queue: Any, client: Any, owner_login: str) -> None:
+    MAX_EXECUTE_ACTION_UNCLEAR_RESPONSES = 2
+
+    def __init__(self, queue: Any, client: Any, owner_login: str, actions: Any = None) -> None:
         self.queue = queue
         self.client = client
         self.owner_login = owner_login
+        self.actions = actions
         self.advanced_path = queue.runtime_dir / "gate_advanced.jsonl"
 
     def scan_and_advance(self) -> List[Dict[str, Any]]:
@@ -136,12 +139,30 @@ class PhaseGateScanner:
                 if gate_key in already_advanced:
                     continue
                 owner, name = (repo.split("/", 1) + [""])[:2]
-                human_comment = self._check_discussion_gate_resolved(owner, name, number, gate_posted_at)
-                if human_comment is None:
+                since = max(gate_posted_at, instance.get_gate_last_response_at() or gate_posted_at)
+                response = self._check_discussion_gate_resolved(owner, name, number, since)
+                if response is None:
                     continue
+                human_comment, responded_at = response
                 response_type, target_phase = self._classify_and_route(
                     instance, next_phase, human_comment
                 )
+                if self._handle_execute_action_unclear_limit(
+                    instance,
+                    repo,
+                    number,
+                    human_comment,
+                    responded_at,
+                    response_type,
+                ):
+                    results.append({
+                        "repo": repo,
+                        "discussion_number": number,
+                        "from_phase": instance.get_phase(),
+                        "to_phase": instance.get_phase(),
+                        "response_type": "unclear_limit",
+                    })
+                    continue
                 if target_phase is None:
                     continue
                 self._advance(instance, repo, number, target_phase, human_comment, gate_key, response_type)
@@ -166,15 +187,33 @@ class PhaseGateScanner:
             )
             if gate_issue_number is None or gate_key in already_advanced or (repo, gate_issue_number) in already_advanced:
                 continue
-            human_comment = self._check_issue_gate_resolved(
+            since = max(gate_posted_at or "", instance.get_gate_last_response_at() or gate_posted_at or "")
+            response = self._check_issue_gate_resolved(
                 gate_issue_number,
                 repo,
-                gate_posted_at,
+                since,
                 allow_closed_without_comment=instance.get_gate_resume_mode() != "execute_action",
             )
-            if human_comment is None:
+            if response is None:
                 continue
+            human_comment, responded_at = response
             response_type, target_phase = self._classify_and_route(instance, next_phase, human_comment)
+            if self._handle_execute_action_unclear_limit(
+                instance,
+                repo,
+                number,
+                human_comment,
+                responded_at,
+                response_type,
+            ):
+                results.append({
+                    "repo": repo,
+                    "discussion_number": number,
+                    "from_phase": instance.get_phase(),
+                    "to_phase": instance.get_phase(),
+                    "response_type": "unclear_limit",
+                })
+                continue
             if target_phase is None:
                 continue
             self._advance(instance, repo, number, target_phase, human_comment, gate_key, response_type)
@@ -212,6 +251,51 @@ class PhaseGateScanner:
             return response_type, None
         # confirm or non-final unclear → advance
         return response_type, next_phase
+
+    def _handle_execute_action_unclear_limit(
+        self,
+        instance: WorkflowInstance,
+        repo: str,
+        number: int,
+        human_comment: str,
+        responded_at: str,
+        response_type: str,
+    ) -> bool:
+        if instance.get_gate_resume_mode() != "execute_action" or response_type != "unclear":
+            return False
+        unclear_count = instance.record_gate_unclear_response(responded_at)
+        if unclear_count < self.MAX_EXECUTE_ACTION_UNCLEAR_RESPONSES:
+            return False
+        phase = instance.get_phase() or instance.get_gate_next_phase() or "unknown"
+        reason = (
+            f"Gate for phase `{phase}` received {unclear_count} unclear confirmation response(s). "
+            "Workflow stopped without executing the pending action."
+        )
+        self._post_gate_limit_comment(instance, number, human_comment, reason)
+        instance.clear_gate()
+        instance.set_terminated(reason)
+        return True
+
+    def _post_gate_limit_comment(
+        self,
+        instance: WorkflowInstance,
+        target_number: int,
+        human_comment: str,
+        reason: str,
+    ) -> None:
+        if self.actions is None:
+            return
+        message = (
+            f"{reason}\n\n"
+            f"Latest owner reply:\n> {human_comment or '(empty comment)'}\n\n"
+            "_Manual intervention is required to continue._"
+        )
+        discussion_node_id = instance.get_discussion_gate_node_id()
+        if discussion_node_id:
+            self.actions.comment_on_discussion(discussion_node_id, target_number, message)
+            return
+        gate_issue_number = instance.get_gate_issue_number() or target_number
+        self.actions.comment("issue", gate_issue_number, message)
 
     def _advance(
         self,
@@ -309,21 +393,23 @@ class PhaseGateScanner:
 
     def _check_discussion_gate_resolved(
         self, owner: str, name: str, number: int, gate_posted_at: str
-    ) -> Optional[str]:
-        """Return owner's comment text if they replied after gate_posted_at, else None."""
+    ) -> Optional[Tuple[str, str]]:
+        """Return the latest owner comment text and timestamp after gate_posted_at, else None."""
         if not self.owner_login:
             return None
         try:
             comments = self.client.get_discussion_comments(owner, name, number)
         except Exception:
             return None
+        latest: Optional[Tuple[str, str]] = None
         for comment in comments:
-            if comment.get("createdAt", "") <= gate_posted_at:
+            created_at = comment.get("createdAt", "")
+            if created_at <= gate_posted_at:
                 continue
             login = (comment.get("author") or {}).get("login", "")
             if login == self.owner_login:
-                return comment.get("body") or ""
-        return None
+                latest = (comment.get("body") or "", created_at)
+        return latest
 
     def _check_issue_gate_resolved(
         self,
@@ -331,22 +417,26 @@ class PhaseGateScanner:
         repo: str,
         gate_posted_at: str = "",
         allow_closed_without_comment: bool = True,
-    ) -> Optional[str]:
-        """Return human comment text if gate issue is resolved, None if still open."""
+    ) -> Optional[Tuple[str, str]]:
+        """Return the latest owner comment text and timestamp if resolved, else None."""
         if self.owner_login:
             comments = self.client.api(f"repos/{repo}/issues/{issue_number}/comments", method="GET")
+            latest: Optional[Tuple[str, str]] = None
             if isinstance(comments, list):
                 for comment in comments:
-                    if gate_posted_at and comment.get("created_at", "") <= gate_posted_at:
+                    created_at = comment.get("created_at", "")
+                    if gate_posted_at and created_at <= gate_posted_at:
                         continue
                     login = (comment.get("user") or {}).get("login", "")
                     if login == self.owner_login:
-                        return comment.get("body") or ""
+                        latest = (comment.get("body") or "", created_at)
+            if latest is not None:
+                return latest
         if not allow_closed_without_comment:
             return None
         issue = self.client.api(f"repos/{repo}/issues/{issue_number}", method="GET")
         if isinstance(issue, dict) and issue.get("state") == "closed":
-            return ""
+            return ("", "")
         return None
 
     def _check_clarification_resolved(
@@ -359,10 +449,11 @@ class PhaseGateScanner:
             comments = self.client.get_discussion_comments(owner, name, number)
         except Exception:
             return None
+        latest: Optional[str] = None
         for comment in comments:
             if comment.get("createdAt", "") <= posted_at:
                 continue
             login = (comment.get("author") or {}).get("login", "")
             if login == self.owner_login:
-                return comment.get("body") or ""
-        return None
+                latest = comment.get("body") or ""
+        return latest

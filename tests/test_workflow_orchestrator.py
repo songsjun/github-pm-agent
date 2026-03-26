@@ -747,6 +747,67 @@ def test_gate_human_comment_placeholders_exist_in_resumed_prompts() -> None:
     assert "$human_comment" in (_project_root() / "prompts/discussion/issue_breakdown.md").read_text(encoding="utf-8")
 
 
+def test_phase_workflow_clarification_limit_terminates_phase() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        instance.set_phase("problem_framing")
+        instance.increment_clarification_round("problem_framing")
+        instance.increment_clarification_round("problem_framing")
+
+        class FakeEngineClarification(FakeEngine):
+            def run_raw_text_handler(
+                self,
+                event: Any,
+                prompt_path: str,
+                role: str = "pm",
+                variables: Optional[Dict[str, Any]] = None,
+            ) -> Dict[str, Any]:
+                self.run_raw_text_handler_calls.append(
+                    {"event_id": event.event_id, "prompt_path": prompt_path, "role": role}
+                )
+                return {"raw_text": 'blocking_unknowns: ["Which weather provider should we use?"]'}
+
+        actions = RecordingActions()
+        engine = FakeEngineClarification(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        result = orchestrator.process(_discussion_event(node_id="D_disc_5"))
+
+        assert result["terminated"] is True
+        assert "clarification limit" in result["terminated_reason"]
+        assert any(
+            "endless clarification loop" in call["message"]
+            for call in actions.comment_on_discussion_calls
+        )
+        reloaded = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        assert reloaded.is_terminated() is True
+        assert reloaded.is_awaiting_clarification() is False
+
+
+def test_phase_workflow_gate_limit_terminates_phase() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        instance.set_phase("problem_synthesis")
+        for _ in range(WorkflowOrchestrator.MAX_PHASE_GATE_OPENS):
+            instance.increment_gate_open_count("problem_synthesis")
+
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        result = orchestrator.process(_discussion_event(node_id="D_disc_5"))
+
+        assert result["terminated"] is True
+        assert "automatic gate limit" in result["terminated_reason"]
+        assert len(actions.comment_on_discussion_calls) == 1
+        assert "repeated human-confirmation loops" in actions.comment_on_discussion_calls[0]["message"]
+        reloaded = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        assert reloaded.is_terminated() is True
+        assert reloaded.get_discussion_gate_node_id() is None
+
+
 def test_phase_gate_scanner_skips_terminated_instance() -> None:
     """PhaseGateScanner must not re-queue events for terminated workflow instances."""
     from github_pm_agent.phase_gate_scanner import PhaseGateScanner
@@ -1058,6 +1119,118 @@ def test_issue_coding_pm_decision_confirmation_executes_without_rerunning_ai() -
         assert actions.merge_or_reopen_calls[0]["reopen_comment"] == ""
         final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
         assert final_instance.is_completed() is True
+
+
+def test_issue_coding_pm_decision_merge_conflict_requeues_fix_iteration() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_phase("pm_decision")
+        instance.set_artifact(
+            "pm_decision",
+            "```json\n"
+            '{"decision":"merge","reason":"tests and review passed"}\n'
+            "```\n"
+            "Merge is approved.",
+        )
+        instance.set_artifact("pr_number", "17")
+        instance.set_artifact("pr_url", "https://example.test/pr/17")
+        instance.set_artifact("code_review_combined", "LGTM — no issues found.")
+        instance.set_artifact("test_result", json.dumps({"passed": True, "summary": "3 passed"}))
+
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        client = FakeClient(
+            {
+                "repos/songsjun/example/pulls/17": {
+                    "mergeable": False,
+                    "mergeable_state": "dirty",
+                }
+            }
+        )
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, client, {})
+
+        orchestrator.process(
+            _issue_coding_event(
+                advance_to_phase="pm_decision",
+                execute_gated_action=True,
+                gate_human_comment="ok",
+            )
+        )
+
+        assert actions.merge_or_reopen_calls == []
+        assert any(
+            "no longer merges cleanly" in call["message"]
+            for call in actions.comment_calls
+            if call.get("target_kind") == "issue"
+        )
+        pending = [json.loads(line) for line in (runtime_dir / "queue_pending.jsonl").read_text().splitlines()]
+        assert len(pending) == 1
+        resumed = pending[0]
+        assert resumed["metadata"]["advance_to_phase"] == "fix_iteration"
+        assert resumed["metadata"]["gate_response_type"] == "merge_conflict"
+        assert "no longer merges cleanly" in resumed["metadata"]["gate_human_comment"]
+        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert final_instance.is_completed() is False
+        assert final_instance.is_terminated() is False
+
+
+def test_issue_coding_pm_decision_non_conflict_merge_failure_terminates() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_phase("pm_decision")
+        instance.set_artifact(
+            "pm_decision",
+            "```json\n"
+            '{"decision":"merge","reason":"tests and review passed"}\n'
+            "```\n"
+            "Merge is approved.",
+        )
+        instance.set_artifact("pr_number", "17")
+        instance.set_artifact("pr_url", "https://example.test/pr/17")
+        instance.set_artifact("code_review_combined", "LGTM — no issues found.")
+        instance.set_artifact("test_result", json.dumps({"passed": True, "summary": "3 passed"}))
+
+        class FailingMergeActions(RecordingActions):
+            def merge_or_reopen(
+                self,
+                pr_number: Optional[int],
+                issue_number: Optional[int],
+                decision: str,
+                reason: str,
+                reopen_comment: str = "",
+            ) -> Dict[str, Any]:
+                raise subprocess.CalledProcessError(1, ["gh", "api"])
+
+        actions = FailingMergeActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        client = FakeClient(
+            {
+                "repos/songsjun/example/pulls/17": {
+                    "mergeable": True,
+                    "mergeable_state": "clean",
+                }
+            }
+        )
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, client, {})
+
+        orchestrator.process(
+            _issue_coding_event(
+                advance_to_phase="pm_decision",
+                execute_gated_action=True,
+                gate_human_comment="ok",
+            )
+        )
+
+        assert any(
+            "Final `merge` action failed" in call["message"]
+            for call in actions.comment_calls
+            if call.get("target_kind") == "issue"
+        )
+        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert final_instance.is_terminated() is True
+        assert (runtime_dir / "queue_pending.jsonl").exists() is False
 
 
 def test_issue_coding_unparseable_review_output_terminates_workflow() -> None:
@@ -1439,6 +1612,140 @@ def test_phase_gate_scanner_execute_action_unclear_comment_keeps_gate_open() -> 
         reloaded = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
         assert reloaded.get_gate_issue_number() == 42
         assert reloaded.get_gate_resume_mode() == "execute_action"
+
+
+def test_phase_gate_scanner_execute_action_advances_after_later_confirm() -> None:
+    from github_pm_agent.phase_gate_scanner import PhaseGateScanner
+    from github_pm_agent.queue_store import QueueStore
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        store = QueueStore(runtime_dir)
+
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_phase("pm_decision")
+        instance.set_gate(
+            42,
+            "pm_decision",
+            posted_at="2026-03-20T12:00:00Z",
+            resume_mode="execute_action",
+        )
+        instance.set_original_event(_issue_coding_event().to_dict())
+
+        class FakeClientMutable:
+            def __init__(self) -> None:
+                self.comments = [
+                    {
+                        "created_at": "2026-03-20T12:05:00Z",
+                        "user": {"login": "owner"},
+                        "body": "thanks, looking",
+                    }
+                ]
+
+            def api(self, path: str, params: Any = None, method: str = "GET") -> Any:
+                if path == "repos/songsjun/example/issues/42/comments":
+                    return list(self.comments)
+                if path == "repos/songsjun/example/issues/42":
+                    return {"state": "open"}
+                return []
+
+        client = FakeClientMutable()
+        scanner = PhaseGateScanner(store, client, "owner")
+
+        assert scanner.scan_and_advance() == []
+        client.comments.append(
+            {
+                "created_at": "2026-03-20T12:06:00Z",
+                "user": {"login": "owner"},
+                "body": "ok",
+            }
+        )
+
+        advanced = scanner.scan_and_advance()
+
+        assert advanced == [
+            {
+                "repo": "songsjun/example",
+                "discussion_number": 42,
+                "from_phase": "pm_decision",
+                "to_phase": "pm_decision",
+                "response_type": "confirm",
+            }
+        ]
+        resumed = store.pop()
+        assert resumed is not None
+        assert resumed.metadata["execute_gated_action"] is True
+        assert resumed.metadata["gate_human_comment"] == "ok"
+
+
+def test_phase_gate_scanner_execute_action_unclear_limit_terminates_workflow() -> None:
+    from github_pm_agent.phase_gate_scanner import PhaseGateScanner
+    from github_pm_agent.queue_store import QueueStore
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        store = QueueStore(runtime_dir)
+
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_phase("pm_decision")
+        instance.set_gate(
+            42,
+            "pm_decision",
+            posted_at="2026-03-20T12:00:00Z",
+            resume_mode="execute_action",
+        )
+        instance.set_original_event(_issue_coding_event().to_dict())
+
+        class FakeClientMutable:
+            def __init__(self) -> None:
+                self.comments = [
+                    {
+                        "created_at": "2026-03-20T12:05:00Z",
+                        "user": {"login": "owner"},
+                        "body": "thanks, looking",
+                    }
+                ]
+
+            def api(self, path: str, params: Any = None, method: str = "GET") -> Any:
+                if path == "repos/songsjun/example/issues/42/comments":
+                    return list(self.comments)
+                if path == "repos/songsjun/example/issues/42":
+                    return {"state": "open"}
+                return []
+
+        actions = RecordingActions()
+        client = FakeClientMutable()
+        scanner = PhaseGateScanner(store, client, "owner", actions)
+
+        assert scanner.scan_and_advance() == []
+        client.comments.append(
+            {
+                "created_at": "2026-03-20T12:06:00Z",
+                "user": {"login": "owner"},
+                "body": "still reviewing",
+            }
+        )
+
+        advanced = scanner.scan_and_advance()
+
+        assert advanced == [
+            {
+                "repo": "songsjun/example",
+                "discussion_number": 42,
+                "from_phase": "pm_decision",
+                "to_phase": "pm_decision",
+                "response_type": "unclear_limit",
+            }
+        ]
+        assert store.pop() is None
+        reloaded = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert reloaded.is_terminated() is True
+        assert reloaded.get_gate_issue_number() is None
+        assert any(
+            "received 2 unclear confirmation response" in call["message"]
+            for call in actions.comment_calls
+            if call.get("target_kind") == "issue"
+        )
 
 
 def test_phase_gate_scanner_execute_action_does_not_treat_closed_issue_as_confirmation() -> None:

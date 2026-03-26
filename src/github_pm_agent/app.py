@@ -69,7 +69,7 @@ class GitHubPMAgentApp:
         )
         owner_login = config.get("github", {}).get("owner", "")
         self.scanner = SuspendedEventScanner(self.queue, self.client, owner_login)
-        self.gate_scanner = PhaseGateScanner(self.queue, self.client, owner_login)
+        self.gate_scanner = PhaseGateScanner(self.queue, self.client, owner_login, self.actions)
         self.cursors_path = self.runtime_dir / "cursors.json"
 
     def poll(self) -> Dict[str, Any]:

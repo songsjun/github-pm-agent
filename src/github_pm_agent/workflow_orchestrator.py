@@ -97,6 +97,9 @@ class _NoOpActions:
 
 
 class WorkflowOrchestrator:
+    MAX_CLARIFICATION_ROUNDS = 2
+    MAX_PHASE_GATE_OPENS = 3
+
     def __init__(
         self,
         project_root: Path,
@@ -144,6 +147,76 @@ class WorkflowOrchestrator:
         resumed["event_id"] = f"resume:{hashlib.sha1(seed.encode('utf-8')).hexdigest()}"
         resumed["metadata"] = resumed_metadata
         return resumed
+
+    def _requeue_issue_coding_phase(
+        self,
+        instance: Any,
+        event: Any,
+        *,
+        phase: str,
+        reason: str,
+        human_comment: str = "",
+        response_type: str = "",
+    ) -> None:
+        from github_pm_agent.utils import append_jsonl
+
+        original_event = instance.get_original_event() or event.to_dict()
+        resumed_metadata = dict(original_event.get("metadata", {}))
+        resumed_metadata["advance_to_phase"] = phase
+        resumed_metadata["artifacts"] = instance.get_artifacts()
+        if human_comment:
+            resumed_metadata["gate_human_comment"] = human_comment
+        if response_type:
+            resumed_metadata["gate_response_type"] = response_type
+        append_jsonl(
+            self.engine.runtime_dir / "queue_pending.jsonl",
+            self._build_requeued_event(
+                original_event,
+                metadata=resumed_metadata,
+                reason=reason,
+            ),
+        )
+
+    def _load_pull_request_state(self, repo: str, pr_number: int) -> Dict[str, Any]:
+        try:
+            payload = self.client.api(f"repos/{repo}/pulls/{pr_number}", method="GET")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to load PR state for %s#%s: %s", repo, pr_number, exc)
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _pull_request_has_merge_conflict(self, pr_state: Dict[str, Any]) -> bool:
+        mergeable_state = str(pr_state.get("mergeable_state") or "").strip().lower()
+        mergeable = pr_state.get("mergeable")
+        return mergeable_state == "dirty" or mergeable is False
+
+    def _terminate_phase_limit(
+        self,
+        event: Any,
+        instance: Any,
+        *,
+        phase: str,
+        node_id: str,
+        limit_kind: str,
+        limit: int,
+    ) -> None:
+        if limit_kind == "clarification":
+            reason = (
+                f"Phase `{phase}` exceeded the automatic clarification limit ({limit} round(s)). "
+                "Workflow stopped to avoid an endless clarification loop."
+            )
+        else:
+            reason = (
+                f"Phase `{phase}` exceeded the automatic gate limit ({limit} attempt(s)). "
+                "Workflow stopped to avoid repeated human-confirmation loops."
+            )
+        self._post_output_comment(
+            event,
+            self.actions,
+            f"{reason}\n\n_Manual intervention is required to continue._",
+            node_id,
+        )
+        instance.set_terminated(reason)
 
     def process(self, event: Any) -> Dict[str, Any]:
         if event.event_type == "discussion_comment":
@@ -499,7 +572,18 @@ class WorkflowOrchestrator:
             if step.get("slots"):
                 questions = self._collect_blocking_unknowns(all_ai_outputs, current_phase)
                 if questions:
-                    self._post_clarification(questions, event, instance, node_id, current_phase)
+                    if instance.get_clarification_round(current_phase) >= self.MAX_CLARIFICATION_ROUNDS:
+                        self._terminate_phase_limit(
+                            event,
+                            instance,
+                            phase=current_phase,
+                            node_id=node_id,
+                            limit_kind="clarification",
+                            limit=self.MAX_CLARIFICATION_ROUNDS,
+                        )
+                    else:
+                        self._post_clarification(questions, event, instance, node_id, current_phase)
+                        instance.increment_clarification_round(current_phase)
                     break  # suspend — wait for owner reply before continuing
 
             step_succeeded = False
@@ -930,19 +1014,79 @@ class WorkflowOrchestrator:
                     )
                     step_succeeded = True
                 else:
-                    self.actions.merge_or_reopen(
-                        pr_number=pr_number,
-                        issue_number=issue_number,
-                        decision=decision,
-                        reason=reason,
-                        reopen_comment=(reopen_comment or reason) if decision == "reopen" else "",
-                    )
-                    step_succeeded = True
+                    if decision == "merge":
+                        pr_state = self._load_pull_request_state(event.repo, pr_number)
+                        if self._pull_request_has_merge_conflict(pr_state):
+                            conflict_reason = (
+                                f"PR #{pr_number} no longer merges cleanly against `{self.config.get('github', {}).get('default_branch', 'main')}`. "
+                                "Rebase or update the branch on the latest main, resolve conflicts, rerun tests, and send it back through review."
+                            )
+                            self.actions.comment("issue", issue_number, conflict_reason)
+                            if pending:
+                                instance.clear_pending_comments()
+                            self._requeue_issue_coding_phase(
+                                instance,
+                                event,
+                                phase="fix_iteration",
+                                reason="merge_conflict",
+                                human_comment=conflict_reason,
+                                response_type="merge_conflict",
+                            )
+                            step_succeeded = True
+                            break
+                    try:
+                        self.actions.merge_or_reopen(
+                            pr_number=pr_number,
+                            issue_number=issue_number,
+                            decision=decision,
+                            reason=reason,
+                            reopen_comment=(reopen_comment or reason) if decision == "reopen" else "",
+                        )
+                        step_succeeded = True
+                    except Exception as exc:  # noqa: BLE001
+                        if decision == "merge":
+                            pr_state = self._load_pull_request_state(event.repo, pr_number)
+                            if self._pull_request_has_merge_conflict(pr_state):
+                                conflict_reason = (
+                                    f"Merge of PR #{pr_number} failed because the branch is out of date with `{self.config.get('github', {}).get('default_branch', 'main')}`. "
+                                    "Rebase or update the branch, resolve conflicts, rerun tests, and return to review."
+                                )
+                                self.actions.comment("issue", issue_number, conflict_reason)
+                                if pending:
+                                    instance.clear_pending_comments()
+                                self._requeue_issue_coding_phase(
+                                    instance,
+                                    event,
+                                    phase="fix_iteration",
+                                    reason="merge_conflict_retry",
+                                    human_comment=conflict_reason,
+                                    response_type="merge_conflict",
+                                )
+                                step_succeeded = True
+                                break
+                        failure_comment = f"Final `{decision}` action failed: {exc}"
+                        self.actions.comment("issue", issue_number, failure_comment)
+                        instance.set_terminated(failure_comment[:200])
+                        break
             else:
                 step_succeeded = True
 
             if step.get("gate") and not meta.get("execute_gated_action"):
                 from github_pm_agent.utils import utc_now_iso
+                owner = self.config.get("github", {}).get("owner", "")
+                node_id = meta.get("node_id") or (
+                    instance.get_original_event() or {}
+                ).get("metadata", {}).get("node_id", "")
+                if instance.get_gate_open_count(current_phase) >= self.MAX_PHASE_GATE_OPENS:
+                    self._terminate_phase_limit(
+                        event,
+                        instance,
+                        phase=current_phase,
+                        node_id=node_id,
+                        limit_kind="gate",
+                        limit=self.MAX_PHASE_GATE_OPENS,
+                    )
+                    break
                 idx = next((i for i, s in enumerate(steps) if s.get("phase") == current_phase), -1)
                 next_step = steps[idx + 1] if 0 <= idx < len(steps) - 1 else None
                 next_phase = next_step["phase"] if next_step else None
@@ -951,11 +1095,6 @@ class WorkflowOrchestrator:
                 if step.get("gate_before_action") and step.get("action"):
                     gate_next_phase = current_phase
                     gate_resume_mode = "execute_action"
-
-                owner = self.config.get("github", {}).get("owner", "")
-                node_id = meta.get("node_id") or (
-                    instance.get_original_event() or {}
-                ).get("metadata", {}).get("node_id", "")
 
                 # For evaluate_design phases, post the human-readable final_design
                 # instead of the raw JSON that the AI produced.
@@ -980,6 +1119,7 @@ class WorkflowOrchestrator:
 
                 posted_at = utc_now_iso()
                 self._post_output_comment(event, self.actions, gate_body, node_id)
+                instance.increment_gate_open_count(current_phase)
                 if event.target_kind == "discussion" and node_id:
                     instance.set_discussion_gate(
                         node_id,
@@ -1037,6 +1177,8 @@ class WorkflowOrchestrator:
             "artifacts": instance.get_artifacts(),
             "created_issues": created_issues,
             "issue_creation_error": issue_creation_error,
+            "terminated": instance.is_terminated(),
+            "terminated_reason": instance.get_terminated_reason(),
             "escalation_refs": [],
         }
 
