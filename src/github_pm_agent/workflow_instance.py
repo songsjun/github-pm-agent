@@ -28,6 +28,9 @@ class WorkflowInstance:
         return self._state.get("phase")
 
     def set_phase(self, phase: str) -> None:
+        previous_phase = str(self._state.get("phase") or "")
+        if previous_phase and previous_phase != phase:
+            self._reset_phase_loop_counters(previous_phase)
         self._state["phase"] = phase
         self._save()
 
@@ -175,6 +178,11 @@ class WorkflowInstance:
             self._state["terminated_reason"] = reason
         self._save()
 
+    def clear_terminated(self) -> None:
+        self._state.pop("terminated", None)
+        self._state.pop("terminated_reason", None)
+        self._save()
+
     def is_terminated(self) -> bool:
         return bool(self._state.get("terminated"))
 
@@ -200,6 +208,16 @@ class WorkflowInstance:
         self._save()
         return next_count
 
+    def reset_gate_open_count(self, phase: str) -> None:
+        counts = dict(self._state.get("gate_open_counts", {}) or {})
+        if phase in counts:
+            counts.pop(phase, None)
+            if counts:
+                self._state["gate_open_counts"] = counts
+            else:
+                self._state.pop("gate_open_counts", None)
+            self._save()
+
     def get_clarification_round(self, phase: str) -> int:
         return int((self._state.get("clarification_rounds", {}) or {}).get(phase, 0))
 
@@ -210,6 +228,16 @@ class WorkflowInstance:
         self._state["clarification_rounds"] = rounds
         self._save()
         return next_round
+
+    def reset_clarification_round(self, phase: str) -> None:
+        rounds = dict(self._state.get("clarification_rounds", {}) or {})
+        if phase in rounds:
+            rounds.pop(phase, None)
+            if rounds:
+                self._state["clarification_rounds"] = rounds
+            else:
+                self._state.pop("clarification_rounds", None)
+            self._save()
 
     def get_gate_last_response_at(self) -> str:
         return str(self._state.get("gate_last_response_at", "") or "")
@@ -230,6 +258,27 @@ class WorkflowInstance:
     def set_last_merge_conflict_signature(self, signature: str) -> None:
         self._state["last_merge_conflict_signature"] = signature
         self._save()
+
+    def _reset_phase_loop_counters(self, phase: str) -> None:
+        counts = dict(self._state.get("gate_open_counts", {}) or {})
+        rounds = dict(self._state.get("clarification_rounds", {}) or {})
+        changed = False
+        if phase in counts:
+            counts.pop(phase, None)
+            changed = True
+        if phase in rounds:
+            rounds.pop(phase, None)
+            changed = True
+        if not changed:
+            return
+        if counts:
+            self._state["gate_open_counts"] = counts
+        else:
+            self._state.pop("gate_open_counts", None)
+        if rounds:
+            self._state["clarification_rounds"] = rounds
+        else:
+            self._state.pop("clarification_rounds", None)
 
     def get_workflow_type(self) -> Optional[str]:
         return self._state.get("workflow_type") or None
