@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import hashlib
 from typing import Any, Dict, List, Optional
 
-from github_pm_agent.utils import append_jsonl, utc_now_iso
+from github_pm_agent.queue_store import enqueue_pending_payload
+from github_pm_agent.utils import build_requeued_event
 from github_pm_agent.workflow_instance import WorkflowInstance
 
 
@@ -72,14 +72,18 @@ class MergeConflictScanner:
                 instance.set_terminated("Missing original event for merge conflict recovery")
                 continue
 
-            append_jsonl(
-                self.queue.pending_path,
-                self._build_requeued_event(
+            enqueue_pending_payload(
+                self.queue.runtime_dir,
+                build_requeued_event(
                     original_event,
-                    instance.get_artifacts(),
+                    metadata={
+                        **dict(original_event.get("metadata", {})),
+                        "advance_to_phase": "fix_iteration",
+                        "artifacts": instance.get_artifacts(),
+                        "gate_human_comment": conflict_reason,
+                        "gate_response_type": "merge_conflict",
+                    },
                     reason="merge_conflict_scan",
-                    human_comment=conflict_reason,
-                    response_type="merge_conflict",
                 ),
             )
             results.append(
@@ -118,40 +122,5 @@ class MergeConflictScanner:
     @staticmethod
     def _conflict_signature(pr_number: int, pr_state: Dict[str, Any]) -> str:
         head_sha = ((pr_state.get("head") or {}).get("sha") or "").strip()
-        base_sha = ((pr_state.get("base") or {}).get("sha") or "").strip()
         mergeable_state = str(pr_state.get("mergeable_state") or "").strip().lower()
-        return f"{pr_number}:{head_sha}:{base_sha}:{mergeable_state}"
-
-    def _build_requeued_event(
-        self,
-        original_event: Dict[str, Any],
-        artifacts: Dict[str, Any],
-        *,
-        reason: str,
-        human_comment: str,
-        response_type: str,
-    ) -> Dict[str, Any]:
-        resumed = dict(original_event)
-        resumed_metadata = dict(original_event.get("metadata", {}))
-        resumed_metadata["advance_to_phase"] = "fix_iteration"
-        resumed_metadata["artifacts"] = artifacts
-        resumed_metadata["gate_human_comment"] = human_comment
-        resumed_metadata["gate_response_type"] = response_type
-
-        queue_meta = dict(resumed_metadata.get("_queue", {}))
-        previous_attempt = queue_meta.get("attempt", 1)
-        if not isinstance(previous_attempt, int) or previous_attempt < 1:
-            previous_attempt = 1
-        queue_meta["attempt"] = previous_attempt + 1
-        queue_meta["requeued_from"] = reason
-        queue_meta["requeued_at"] = utc_now_iso()
-        resumed_metadata["_queue"] = queue_meta
-
-        original_event_id = str(original_event.get("event_id", "resume"))
-        seed = (
-            f"{original_event_id}:{reason}:fix_iteration:"
-            f"{queue_meta['attempt']}:{queue_meta['requeued_at']}"
-        )
-        resumed["event_id"] = f"resume:{hashlib.sha1(seed.encode('utf-8')).hexdigest()}"
-        resumed["metadata"] = resumed_metadata
-        return resumed
+        return f"{pr_number}:{head_sha}:{mergeable_state}"

@@ -1,10 +1,60 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import fcntl
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 from github_pm_agent.models import Event
-from github_pm_agent.utils import append_jsonl, read_json, read_jsonl, utc_now_iso, write_json, write_jsonl
+from github_pm_agent.utils import (
+    append_jsonl,
+    ensure_dir,
+    read_json,
+    read_jsonl,
+    utc_now_iso,
+    write_json,
+    write_jsonl,
+)
+
+
+def _pending_lock_path(runtime_dir: Path) -> Path:
+    return runtime_dir / "queue_pending.lock"
+
+
+@contextmanager
+def pending_queue_lock(runtime_dir: Path):
+    ensure_dir(runtime_dir)
+    lock_path = _pending_lock_path(runtime_dir)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def enqueue_pending_payload(
+    runtime_dir: Path,
+    payload: Dict[str, Any],
+    *,
+    remember_seen: bool = False,
+) -> bool:
+    event_id = str(payload.get("event_id", "") or "").strip()
+    pending_path = runtime_dir / "queue_pending.jsonl"
+    seen_path = runtime_dir / "seen_ids.json"
+
+    with pending_queue_lock(runtime_dir):
+        pending = read_jsonl(pending_path)
+        if event_id and any(item.get("event_id") == event_id for item in pending if isinstance(item, dict)):
+            return False
+        if remember_seen and event_id:
+            seen = read_json(seen_path, [])
+            if event_id in seen:
+                return False
+            seen.append(event_id)
+            write_json(seen_path, seen)
+        append_jsonl(pending_path, payload)
+        return True
 
 
 class QueueStore:
@@ -123,37 +173,38 @@ class QueueStore:
         elif limit is not None:
             matching_indexes = matching_indexes[-limit:]
         selected_indexes = set(matching_indexes)
-        pending_ids = self._pending_event_ids()
         retained: List[Dict[str, Any]] = []
         requeued_event_ids: List[str] = []
         requeued = 0
         skipped = 0
-        for index, record in enumerate(records):
-            if index not in selected_indexes:
-                retained.append(record)
-                continue
-            event_payload = record.get("event") if isinstance(record, dict) else None
-            if not isinstance(event_payload, dict):
-                retained.append(record)
-                skipped += 1
-                continue
-            event = Event.from_dict(event_payload)
-            if event.event_id in pending_ids:
-                retained.append(record)
-                skipped += 1
-                continue
-            next_attempt = self._event_attempt(event_payload) + 1
-            append_jsonl(
-                self.pending_path,
-                self._event_with_queue_metadata(
-                    event,
-                    attempt=next_attempt,
-                    requeued_from=source_name,
-                ),
-            )
-            pending_ids.add(event.event_id)
-            requeued += 1
-            requeued_event_ids.append(event.event_id)
+        with pending_queue_lock(self.runtime_dir):
+            pending_ids = self._pending_event_ids()
+            for index, record in enumerate(records):
+                if index not in selected_indexes:
+                    retained.append(record)
+                    continue
+                event_payload = record.get("event") if isinstance(record, dict) else None
+                if not isinstance(event_payload, dict):
+                    retained.append(record)
+                    skipped += 1
+                    continue
+                event = Event.from_dict(event_payload)
+                if event.event_id in pending_ids:
+                    retained.append(record)
+                    skipped += 1
+                    continue
+                next_attempt = self._event_attempt(event_payload) + 1
+                append_jsonl(
+                    self.pending_path,
+                    self._event_with_queue_metadata(
+                        event,
+                        attempt=next_attempt,
+                        requeued_from=source_name,
+                    ),
+                )
+                pending_ids.add(event.event_id)
+                requeued += 1
+                requeued_event_ids.append(event.event_id)
         self._write_terminal(path, retained)
         return {
             "source": source_name,
@@ -175,18 +226,17 @@ class QueueStore:
     def enqueue(self, events: Iterable[Event]) -> int:
         count = 0
         for event in events:
-            if self.has_seen(event.event_id):
-                continue
-            append_jsonl(
-                self.pending_path,
+            if enqueue_pending_payload(
+                self.runtime_dir,
                 self._event_with_queue_metadata(event, attempt=1),
-            )
-            self.remember(event.event_id)
-            count += 1
+                remember_seen=True,
+            ):
+                count += 1
         return count
 
     def list_pending(self, limit: Optional[int] = None, event_id: Optional[str] = None) -> List[Event]:
-        raw = self._read_pending()
+        with pending_queue_lock(self.runtime_dir):
+            raw = self._read_pending()
         if event_id is not None:
             raw = [item for item in raw if item.get("event_id") == event_id]
         if limit is not None:
@@ -203,12 +253,13 @@ class QueueStore:
         return self._terminal_records(self.dead_path, limit=limit, event_id=event_id)
 
     def pop(self) -> Optional[Event]:
-        raw = self._read_pending()
-        if not raw:
-            return None
-        first = raw[0]
-        self._write_pending(raw[1:])
-        return Event.from_dict(first)
+        with pending_queue_lock(self.runtime_dir):
+            raw = self._read_pending()
+            if not raw:
+                return None
+            first = raw[0]
+            self._write_pending(raw[1:])
+            return Event.from_dict(first)
 
     def mark_done(self, event: Event, result: Dict) -> None:
         append_jsonl(
@@ -306,7 +357,7 @@ class SuspendedEventScanner:
             new_metadata["human_decision"] = human_decision
             resumed_event_dict = {**event_dict, "metadata": new_metadata}
 
-            append_jsonl(self.queue.pending_path, resumed_event_dict)
+            enqueue_pending_payload(self.queue.runtime_dir, resumed_event_dict)
             append_jsonl(
                 self.queue.resumed_path,
                 {

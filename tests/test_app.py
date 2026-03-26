@@ -70,6 +70,7 @@ class GitHubPMAgentAppTest(unittest.TestCase):
             patch("github_pm_agent.app.PhaseGateScanner", return_value=Mock()),
             patch("github_pm_agent.app.IssueCodingSyncScanner", return_value=Mock()),
             patch("github_pm_agent.app.MergeConflictScanner", return_value=Mock()),
+            patch("github_pm_agent.app.IssueCodingRecoveryScanner", return_value=Mock()),
             patch("github_pm_agent.app.RoleRegistry", return_value=Mock()),
         ):
             return GitHubPMAgentApp(self.config, self.project_root)
@@ -117,6 +118,7 @@ class GitHubPMAgentAppTest(unittest.TestCase):
         app.scanner.scan_and_resume = Mock(return_value=[])
         app.issue_coding_sync_scanner.scan_and_sync = Mock(return_value=[])
         app.merge_conflict_scanner.scan_and_requeue = Mock(return_value=[])
+        app.issue_coding_recovery_scanner.scan_and_requeue = Mock(return_value=[])
         app.gate_scanner.scan_and_advance = Mock(return_value=[])
 
         result = app.cycle()
@@ -124,9 +126,11 @@ class GitHubPMAgentAppTest(unittest.TestCase):
         self.assertEqual(result["poll"], {"events_enqueued": 2})
         self.assertEqual(result["workflow_sync"], [])
         self.assertEqual(result["merge_conflicts"], [])
+        self.assertEqual(result["workflow_recovery"], [])
         self.assertEqual(len(result["processed"]), 1)
         app.issue_coding_sync_scanner.scan_and_sync.assert_called_once()
         app.merge_conflict_scanner.scan_and_requeue.assert_called_once()
+        app.issue_coding_recovery_scanner.scan_and_requeue.assert_called_once()
         queue.mark_done.assert_called_once()
         queue.mark_failed.assert_called_once_with(event_two, "boom")
         # Verify both drain_queue() calls ran (cycle design: poll → drain → gate_scan → drain).
@@ -144,6 +148,7 @@ class GitHubPMAgentAppTest(unittest.TestCase):
         app.scanner.scan_and_resume = Mock(return_value=[])
         app.issue_coding_sync_scanner.scan_and_sync = Mock(return_value=[])
         app.merge_conflict_scanner.scan_and_requeue = Mock(return_value=[])
+        app.issue_coding_recovery_scanner.scan_and_requeue = Mock(return_value=[])
         app.gate_scanner.scan_and_advance = Mock(return_value=[])
 
         with self.assertRaisesRegex(RuntimeError, "boom"):
@@ -193,6 +198,7 @@ class GitHubPMAgentAppTest(unittest.TestCase):
             patch("github_pm_agent.app.PhaseGateScanner", return_value=Mock()),
             patch("github_pm_agent.app.IssueCodingSyncScanner", return_value=Mock()),
             patch("github_pm_agent.app.MergeConflictScanner", return_value=Mock()),
+            patch("github_pm_agent.app.IssueCodingRecoveryScanner", return_value=Mock()),
             patch("github_pm_agent.app.RoleRegistry", return_value=Mock()),
             patch("github_pm_agent.app.utc_now_iso", return_value="2026-03-19T12:00:00Z"),
         ):

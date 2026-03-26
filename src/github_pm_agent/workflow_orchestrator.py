@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import fnmatch
-import hashlib
 import inspect
 import logging
 import os
@@ -12,7 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
-from github_pm_agent.utils import git_auth_env
+from github_pm_agent.queue_store import enqueue_pending_payload
+from github_pm_agent.utils import build_requeued_event, git_auth_env
 
 
 logger = logging.getLogger(__name__)
@@ -119,35 +119,6 @@ class WorkflowOrchestrator:
         self.agent_toolkits = agent_toolkits or {}
         self.workflows_dir = self.project_root / "workflows"
 
-    def _build_requeued_event(
-        self,
-        original_event: Dict[str, Any],
-        *,
-        metadata: Dict[str, Any],
-        reason: str,
-    ) -> Dict[str, Any]:
-        from github_pm_agent.utils import utc_now_iso
-
-        resumed = dict(original_event)
-        resumed_metadata = dict(metadata)
-        queue_meta = dict(resumed_metadata.get("_queue", {}))
-        previous_attempt = queue_meta.get("attempt", 1)
-        if not isinstance(previous_attempt, int) or previous_attempt < 1:
-            previous_attempt = 1
-        queue_meta["attempt"] = previous_attempt + 1
-        queue_meta["requeued_from"] = reason
-        queue_meta["requeued_at"] = utc_now_iso()
-        resumed_metadata["_queue"] = queue_meta
-
-        original_event_id = str(original_event.get("event_id", "resume"))
-        seed = (
-            f"{original_event_id}:{reason}:{resumed_metadata.get('advance_to_phase', '')}:"
-            f"{queue_meta['attempt']}:{queue_meta['requeued_at']}"
-        )
-        resumed["event_id"] = f"resume:{hashlib.sha1(seed.encode('utf-8')).hexdigest()}"
-        resumed["metadata"] = resumed_metadata
-        return resumed
-
     def _requeue_issue_coding_phase(
         self,
         instance: Any,
@@ -158,8 +129,6 @@ class WorkflowOrchestrator:
         human_comment: str = "",
         response_type: str = "",
     ) -> None:
-        from github_pm_agent.utils import append_jsonl
-
         original_event = instance.get_original_event() or event.to_dict()
         resumed_metadata = dict(original_event.get("metadata", {}))
         resumed_metadata["advance_to_phase"] = phase
@@ -168,9 +137,9 @@ class WorkflowOrchestrator:
             resumed_metadata["gate_human_comment"] = human_comment
         if response_type:
             resumed_metadata["gate_response_type"] = response_type
-        append_jsonl(
-            self.engine.runtime_dir / "queue_pending.jsonl",
-            self._build_requeued_event(
+        enqueue_pending_payload(
+            self.engine.runtime_dir,
+            build_requeued_event(
                 original_event,
                 metadata=resumed_metadata,
                 reason=reason,
@@ -639,7 +608,6 @@ class WorkflowOrchestrator:
                 try:
                     from github_pm_agent.coding_session import CodingSession
                     from github_pm_agent.devenv_client import DevEnvClient
-                    from github_pm_agent.utils import append_jsonl
 
                     plan = CodingSession.parse_plan(last_content)
                     if plan is None:
@@ -729,9 +697,9 @@ class WorkflowOrchestrator:
                             resumed_metadata = dict(original_event.get("metadata", {}))
                             resumed_metadata["advance_to_phase"] = "implement"
                             resumed_metadata["artifacts"] = instance.get_artifacts()
-                            append_jsonl(
-                                self.engine.runtime_dir / "queue_pending.jsonl",
-                                self._build_requeued_event(
+                            enqueue_pending_payload(
+                                self.engine.runtime_dir,
+                                build_requeued_event(
                                     original_event,
                                     metadata=resumed_metadata,
                                     reason="implement_retry",
@@ -810,8 +778,6 @@ class WorkflowOrchestrator:
                     step_succeeded = True
             elif step.get("action") == "check_review_result":
                 # Decide whether to approve/advance or loop back for fixes.
-                from github_pm_agent.utils import append_jsonl
-
                 artifacts = instance.get_artifacts()
                 combined_review = (
                     artifacts.get("code_review_combined")
@@ -845,9 +811,9 @@ class WorkflowOrchestrator:
                     resumed_metadata = dict(original_event.get("metadata", {}))
                     resumed_metadata["advance_to_phase"] = "pm_decision"
                     resumed_metadata["artifacts"] = instance.get_artifacts()
-                    append_jsonl(
-                        self.engine.runtime_dir / "queue_pending.jsonl",
-                        self._build_requeued_event(
+                    enqueue_pending_payload(
+                        self.engine.runtime_dir,
+                        build_requeued_event(
                             original_event,
                             metadata=resumed_metadata,
                             reason="review_approved",
@@ -877,9 +843,9 @@ class WorkflowOrchestrator:
                     resumed_metadata = dict(original_event.get("metadata", {}))
                     resumed_metadata["advance_to_phase"] = "fix_iteration"
                     resumed_metadata["artifacts"] = instance.get_artifacts()
-                    append_jsonl(
-                        self.engine.runtime_dir / "queue_pending.jsonl",
-                        self._build_requeued_event(
+                    enqueue_pending_payload(
+                        self.engine.runtime_dir,
+                        build_requeued_event(
                             original_event,
                             metadata=resumed_metadata,
                             reason="review_blocking",
@@ -891,7 +857,6 @@ class WorkflowOrchestrator:
                 try:
                     from github_pm_agent.coding_session import CodingSession
                     from github_pm_agent.devenv_client import DevEnvClient
-                    from github_pm_agent.utils import append_jsonl
 
                     plan = CodingSession.parse_plan(last_content)
                     if plan is None:
@@ -936,9 +901,9 @@ class WorkflowOrchestrator:
                             instance.set_artifact("test_failure_context", "")
                             resumed_metadata["advance_to_phase"] = "code_review"
                             resumed_metadata["artifacts"] = instance.get_artifacts()
-                            append_jsonl(
-                                self.engine.runtime_dir / "queue_pending.jsonl",
-                                self._build_requeued_event(
+                            enqueue_pending_payload(
+                                self.engine.runtime_dir,
+                                build_requeued_event(
                                     original_event,
                                     metadata=resumed_metadata,
                                     reason="fix_review_retry",

@@ -20,6 +20,7 @@ from github_pm_agent.status_probe import StatusProbe
 from github_pm_agent.models import Event
 from github_pm_agent.utils import read_json, read_jsonl, utc_now_iso, write_json
 from github_pm_agent.phase_gate_scanner import PhaseGateScanner
+from github_pm_agent.issue_coding_recovery_scanner import IssueCodingRecoveryScanner
 from github_pm_agent.issue_coding_sync_scanner import IssueCodingSyncScanner
 from github_pm_agent.merge_conflict_scanner import MergeConflictScanner
 from github_pm_agent.workflow_orchestrator import WorkflowOrchestrator
@@ -74,6 +75,10 @@ class GitHubPMAgentApp:
         self.gate_scanner = PhaseGateScanner(self.queue, self.client, owner_login, self.actions)
         self.issue_coding_sync_scanner = IssueCodingSyncScanner(self.queue, self.client, self.actions)
         self.merge_conflict_scanner = MergeConflictScanner(self.queue, self.client, self.actions, config)
+        self.issue_coding_recovery_scanner = IssueCodingRecoveryScanner(
+            self.queue,
+            self.config.get("github", {}).get("default_branch", "main"),
+        )
         self.cursors_path = self.runtime_dir / "cursors.json"
 
     def poll(self) -> Dict[str, Any]:
@@ -122,6 +127,7 @@ class GitHubPMAgentApp:
         processed = self.drain_queue()
         workflow_sync_result = self.issue_coding_sync_scanner.scan_and_sync()
         merge_conflict_result = self.merge_conflict_scanner.scan_and_requeue()
+        workflow_recovery_result = self.issue_coding_recovery_scanner.scan_and_requeue()
         gate_advance_result = self.gate_scanner.scan_and_advance()
         # Drain the conflict/gate advance events produced after the main queue pass.
         processed = processed + self.drain_queue()
@@ -130,6 +136,7 @@ class GitHubPMAgentApp:
             "resume": resume_result,
             "workflow_sync": workflow_sync_result,
             "merge_conflicts": merge_conflict_result,
+            "workflow_recovery": workflow_recovery_result,
             "gate_advance": gate_advance_result,
             "processed": processed,
         }

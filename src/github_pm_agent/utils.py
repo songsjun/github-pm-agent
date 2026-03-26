@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -57,6 +58,33 @@ def write_jsonl(path: Path, items: Iterable[Any]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for item in items:
             handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+
+def build_requeued_event(
+    original_event: dict[str, Any],
+    *,
+    metadata: dict[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    resumed = dict(original_event)
+    resumed_metadata = dict(metadata)
+    queue_meta = dict(resumed_metadata.get("_queue", {}))
+    previous_attempt = queue_meta.get("attempt", 1)
+    if not isinstance(previous_attempt, int) or previous_attempt < 1:
+        previous_attempt = 1
+    queue_meta["attempt"] = previous_attempt + 1
+    queue_meta["requeued_from"] = reason
+    queue_meta["requeued_at"] = utc_now_iso()
+    resumed_metadata["_queue"] = queue_meta
+
+    original_event_id = str(original_event.get("event_id", "resume"))
+    seed = (
+        f"{original_event_id}:{reason}:{resumed_metadata.get('advance_to_phase', '')}:"
+        f"{queue_meta['attempt']}:{queue_meta['requeued_at']}"
+    )
+    resumed["event_id"] = f"resume:{hashlib.sha1(seed.encode('utf-8')).hexdigest()}"
+    resumed["metadata"] = resumed_metadata
+    return resumed
 
 
 def load_text(path: Optional[Path]) -> str:

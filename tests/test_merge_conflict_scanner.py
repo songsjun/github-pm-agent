@@ -93,7 +93,7 @@ def test_merge_conflict_scanner_requeues_conflicting_pm_decision_gate() -> None:
 
         reloaded = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
         assert reloaded.get_gate_issue_number() is None
-        assert reloaded.get_last_merge_conflict_signature() == "17:head-1:base-1:dirty"
+        assert reloaded.get_last_merge_conflict_signature() == "17:head-1:dirty"
 
 
 def test_merge_conflict_scanner_deduplicates_same_conflict_signature() -> None:
@@ -105,7 +105,7 @@ def test_merge_conflict_scanner_deduplicates_same_conflict_signature() -> None:
         instance.set_phase("code_review")
         instance.set_original_event(_issue_coding_event_dict())
         instance.set_artifact("pr_number", "17")
-        instance.set_last_merge_conflict_signature("17:head-1:base-1:dirty")
+        instance.set_last_merge_conflict_signature("17:head-1:dirty")
 
         actions = RecordingActions()
         client = FakeClient(

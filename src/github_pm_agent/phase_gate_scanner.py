@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import hashlib
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from github_pm_agent.utils import append_jsonl, read_jsonl, utc_now_iso
+from github_pm_agent.queue_store import enqueue_pending_payload
+from github_pm_agent.utils import append_jsonl, build_requeued_event, read_jsonl, utc_now_iso
 from github_pm_agent.workflow_instance import WorkflowInstance
 
 # Keywords that indicate a pure confirmation (case-insensitive, matched anywhere in reply)
@@ -87,9 +87,9 @@ class PhaseGateScanner:
                             new_meta["advance_to_phase"] = clarification["phase"]
                             new_meta["artifacts"] = instance_check.get_artifacts()
                             new_meta["gate_human_comment"] = answer
-                            append_jsonl(
-                                self.queue.pending_path,
-                                self._resumed_event_payload(
+                            enqueue_pending_payload(
+                                self.queue.runtime_dir,
+                                build_requeued_event(
                                     original_event,
                                     metadata=new_meta,
                                     reason="clarification_resume",
@@ -328,7 +328,7 @@ class PhaseGateScanner:
             metadata=new_metadata,
             reason=response_type or "gate_resume",
         )
-        append_jsonl(self.queue.pending_path, resumed_event_dict)
+        enqueue_pending_payload(self.queue.runtime_dir, resumed_event_dict)
         append_jsonl(
             self.advanced_path,
             {
@@ -361,22 +361,11 @@ class PhaseGateScanner:
         metadata: Dict[str, Any],
         reason: str,
     ) -> Dict[str, Any]:
-        resumed = dict(original_event)
-        resumed_metadata = dict(metadata)
-        queue_meta = dict(resumed_metadata.get("_queue", {}))
-        previous_attempt = queue_meta.get("attempt", 1)
-        if not isinstance(previous_attempt, int) or previous_attempt < 1:
-            previous_attempt = 1
-        queue_meta["attempt"] = previous_attempt + 1
-        queue_meta["requeued_from"] = reason
-        queue_meta["requeued_at"] = utc_now_iso()
-        resumed_metadata["_queue"] = queue_meta
-
-        original_event_id = str(original_event.get("event_id", "resume"))
-        seed = f"{original_event_id}:{reason}:{resumed_metadata.get('advance_to_phase', '')}:{queue_meta['attempt']}:{queue_meta['requeued_at']}"
-        resumed["event_id"] = f"resume:{hashlib.sha1(seed.encode('utf-8')).hexdigest()}"
-        resumed["metadata"] = resumed_metadata
-        return resumed
+        return build_requeued_event(
+            original_event,
+            metadata=metadata,
+            reason=reason,
+        )
 
     def _already_advanced(self) -> Set[Any]:
         result = set()

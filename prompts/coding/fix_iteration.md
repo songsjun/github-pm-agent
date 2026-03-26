@@ -18,9 +18,13 @@ $artifact_implement
 
 $test_failure_context
 
+## Additional workflow feedback
+
+$human_comment
+
 ---
 
-Fix ONLY the blocking issues identified in the code review above. Do not change unrelated code.
+Fix ONLY the blocking issues identified in the code review above. If the workflow feedback says the PR branch no longer merges cleanly with the base branch, update the branch on the latest base branch, resolve the merge conflict, and keep the code review findings satisfied. Do not change unrelated code.
 
 If the project is missing setup files required to run tests (package.json, tsconfig.json, pyproject.toml, etc.), include them.
 
