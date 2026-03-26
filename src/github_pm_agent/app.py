@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from github_pm_agent.active_phase_recovery_scanner import ActivePhaseRecoveryScanner
 from github_pm_agent.actions import GitHubActionToolkit
 from github_pm_agent.ai_adapter import AIAdapterManager
 from github_pm_agent.config import gh_path, repo_names, runtime_dir
+from github_pm_agent.created_issue_fanout_scanner import CreatedIssueFanoutScanner
 from github_pm_agent.engine import EventEngine
 from github_pm_agent.github_client import GitHubClient
 from github_pm_agent.poller import GitHubPoller
@@ -34,6 +38,22 @@ class RepoRuntime:
     probe: StatusProbe
     actions: GitHubActionToolkit
     engine: EventEngine
+
+
+@contextlib.contextmanager
+def cycle_lock(runtime_dir: Path):
+    lock_path = runtime_dir / "cycle.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 class GitHubPMAgentApp:
@@ -73,6 +93,8 @@ class GitHubPMAgentApp:
         owner_login = config.get("github", {}).get("owner", "")
         self.scanner = SuspendedEventScanner(self.queue, self.client, owner_login)
         self.gate_scanner = PhaseGateScanner(self.queue, self.client, owner_login, self.actions)
+        self.active_phase_recovery_scanner = ActivePhaseRecoveryScanner(self.queue)
+        self.created_issue_fanout_scanner = CreatedIssueFanoutScanner(self.queue, self.client)
         self.issue_coding_sync_scanner = IssueCodingSyncScanner(self.queue, self.client, self.actions)
         self.merge_conflict_scanner = MergeConflictScanner(self.queue, self.client, self.actions, config)
         self.issue_coding_recovery_scanner = IssueCodingRecoveryScanner(
@@ -118,28 +140,35 @@ class GitHubPMAgentApp:
         }
 
     def cycle(self) -> Dict[str, Any]:
-        poll_result = self.poll()
-        resume_result = self.scanner.scan_and_resume()
-        # Drain regular poll events first while gate/clarification state is still intact.
-        # gate_scanner runs afterward and clears gate/clarification only after poll events
-        # have already been blocked, preventing the race where a poll event bypasses the
-        # gate/clarification check because the scanner cleared it in the same cycle.
-        processed = self.drain_queue()
-        workflow_sync_result = self.issue_coding_sync_scanner.scan_and_sync()
-        merge_conflict_result = self.merge_conflict_scanner.scan_and_requeue()
-        workflow_recovery_result = self.issue_coding_recovery_scanner.scan_and_requeue()
-        gate_advance_result = self.gate_scanner.scan_and_advance()
-        # Drain the conflict/gate advance events produced after the main queue pass.
-        processed = processed + self.drain_queue()
-        return {
-            "poll": poll_result,
-            "resume": resume_result,
-            "workflow_sync": workflow_sync_result,
-            "merge_conflicts": merge_conflict_result,
-            "workflow_recovery": workflow_recovery_result,
-            "gate_advance": gate_advance_result,
-            "processed": processed,
-        }
+        with cycle_lock(self.runtime_dir) as acquired:
+            if not acquired:
+                return {"skipped": True, "reason": "cycle_locked"}
+            poll_result = self.poll()
+            resume_result = self.scanner.scan_and_resume()
+            # Drain regular poll events first while gate/clarification state is still intact.
+            # gate_scanner runs afterward and clears gate/clarification only after poll events
+            # have already been blocked, preventing the race where a poll event bypasses the
+            # gate/clarification check because the scanner cleared it in the same cycle.
+            processed = self.drain_queue()
+            workflow_sync_result = self.issue_coding_sync_scanner.scan_and_sync()
+            merge_conflict_result = self.merge_conflict_scanner.scan_and_requeue()
+            active_phase_recovery_result = self.active_phase_recovery_scanner.scan_and_requeue()
+            created_issue_fanout_result = self.created_issue_fanout_scanner.scan_and_enqueue()
+            workflow_recovery_result = self.issue_coding_recovery_scanner.scan_and_requeue()
+            gate_advance_result = self.gate_scanner.scan_and_advance()
+            # Drain the conflict/gate advance events produced after the main queue pass.
+            processed = processed + self.drain_queue()
+            return {
+                "poll": poll_result,
+                "resume": resume_result,
+                "workflow_sync": workflow_sync_result,
+                "merge_conflicts": merge_conflict_result,
+                "active_phase_recovery": active_phase_recovery_result,
+                "created_issue_fanout": created_issue_fanout_result,
+                "workflow_recovery": workflow_recovery_result,
+                "gate_advance": gate_advance_result,
+                "processed": processed,
+            }
 
     def reconcile(self) -> Dict[str, Any]:
         followup_events = self._followup_events(now_iso=utc_now_iso())

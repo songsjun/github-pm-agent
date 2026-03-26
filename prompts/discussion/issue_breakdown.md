@@ -49,6 +49,10 @@ Output ONLY a JSON array. No prose, no markdown fences, no explanation. Each ite
 - "body": structured markdown using the template below
 - "labels": array of label strings (use: "enhancement", "bug", "documentation", "backend", "frontend", "infrastructure", "content", "test" as appropriate)
 
+Label rule:
+- Use `"test"` only for a dedicated test-only issue such as repo-wide integration/E2E coverage.
+- Do not add the `"test"` label to a normal implementation slice just because that slice includes unit tests.
+
 **Body template** (use this exact structure for every issue):
 ```
 ## What to change
@@ -77,9 +81,12 @@ Example:
   }
 ]
 
-Extract 6–12 issues, ordered by implementation dependency (foundational first). Issues must include **both implementation and test tasks**:
-- Implementation issues: concrete feature or infrastructure changes (labeled "backend", "frontend", etc.)
-- Test issues: one test issue per functional module (labeled "test"), covering unit tests, integration tests, or end-to-end flows
+Extract 4–8 issues, ordered by implementation dependency (foundational first).
+
+Prefer **vertical slices** over implementation/test pairs:
+- Each implementation issue should include the code change **and the unit tests needed to prove it**.
+- Create a dedicated `"test"` issue only for repo-wide integration or end-to-end coverage that truly depends on several earlier slices.
+- Do **not** create a separate unit-test issue for the same module immediately after its implementation issue. That pattern causes parallel branches to fight over the same files.
 
 Checklist before outputting:
 - [ ] Every issue body uses the required 5-section template
@@ -89,5 +96,6 @@ Checklist before outputting:
 - [ ] No forbidden verbs ("improve", "optimize", "refactor", "enhance", "consider") appear in titles or What-to-change lines
 - [ ] At least 1/3 of issues cover domain/functional features (not just setup)
 - [ ] At least 1 issue covers the primary user-facing feature from the PRD user stories
-- [ ] At least 2 issues are test issues (labeled "test") covering key modules or flows
-- [ ] Issues are ordered so that dependencies come before dependents (test issues after their implementation counterparts)
+- [ ] `"test"` label appears only on dedicated test-only issues, not on normal implementation slices that happen to include unit tests
+- [ ] If a dedicated `"test"` issue exists, it is an integration/E2E flow, not a duplicate unit-test task for a single module
+- [ ] Issues are ordered so that dependencies come before dependents

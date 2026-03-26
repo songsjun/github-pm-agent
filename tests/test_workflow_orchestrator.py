@@ -150,6 +150,26 @@ class FakeEngine:
         return {"raw_text": f"output for {role}"}
 
 
+def test_apply_retry_branch_suffix_appends_once() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=Path(tmpdir))
+        orchestrator = WorkflowOrchestrator(
+            project_root=Path("/data/workspaces/github-pm-agent"),
+            engine=engine,
+            actions=actions,
+            client=object(),
+            config={},
+        )
+
+        assert orchestrator._apply_retry_branch_suffix("ai/issue-5-city-search-hook", "-retry-1") == (
+            "ai/issue-5-city-search-hook-retry-1"
+        )
+        assert orchestrator._apply_retry_branch_suffix("ai/issue-5-city-search-hook-retry-1", "-retry-1") == (
+            "ai/issue-5-city-search-hook-retry-1"
+        )
+
+
 class FakeClient:
     def __init__(self, responses: Dict[str, Any]) -> None:
         self.responses = responses
@@ -480,6 +500,39 @@ def test_create_issues_from_artifact_adds_ready_to_code_label() -> None:
     assert actions.create_issue_calls[0]["labels"] == ["frontend", "enhancement", "ready-to-code"]
 
 
+def test_issue_breakdown_does_not_create_duplicate_issues_when_refs_exist() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        instance.set_phase("issue_breakdown")
+        instance.set_artifact(
+            "issue_breakdown",
+            json.dumps(
+                [
+                    {
+                        "title": "Create app shell",
+                        "body": "body",
+                        "labels": ["frontend", "enhancement"],
+                    }
+                ]
+            ),
+        )
+        instance.set_created_issue_refs([{"number": 101, "title": "Create app shell"}])
+
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        result = orchestrator.process(_discussion_event(node_id="D_disc_5"))
+
+        assert result["created_issues"] == [
+            {"title": "Create app shell", "number": 101, "result": {"number": 101}}
+        ]
+        assert actions.create_issue_calls == []
+        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        assert final_instance.is_completed() is True
+
+
 def test_phase_workflow_skips_when_gate_already_open() -> None:
     """Re-polling a discussion with an open gate must not re-run the phase or create a new gate issue."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -742,6 +795,42 @@ def test_evaluate_design_proceeds_and_opens_gate_to_issue_breakdown() -> None:
         assert final_instance.is_completed() is False
 
 
+def test_evaluate_design_escalation_sets_issue_gate_posted_at() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        instance.set_phase("tech_review")
+        instance.set_artifact("requirements", "some requirements text")
+        instance.set_artifact("tech_proposal_engineer", "some proposal text")
+
+        escalate_json = (
+            '{"decision": "escalate", "docker_compatible": true, '
+            '"evaluation_summary": "Need human input before issue breakdown.", "problem_coverage": []}'
+        )
+
+        class FakeEngineEscalate(FakeEngine):
+            def run_raw_text_handler(self, event: Any, prompt_path: str, role: str = "pm", variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                self.run_raw_text_handler_calls.append({"event_id": event.event_id, "prompt_path": prompt_path, "role": role})
+                if "tech_review" in prompt_path:
+                    return {"raw_text": escalate_json}
+                return {"raw_text": f"output for {role}"}
+
+        actions = NumberedRecordingActions()
+        engine = FakeEngineEscalate(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        result = orchestrator.process(_discussion_event())
+
+        gate = result["gate"]
+        assert gate["gate_issue_number"] == 100
+        assert gate["next_phase"] == "tech_review"
+        assert gate["gate_posted_at"]
+        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        assert final_instance.get_gate_issue_number() == 100
+        assert final_instance.get_gate_posted_at() == gate["gate_posted_at"]
+
+
 def test_gate_human_comment_is_passed_to_resumed_prompt_variables() -> None:
     """Gate resolution comments must be available to resumed tech_proposal and issue_breakdown prompts."""
     cases = [
@@ -801,7 +890,7 @@ def test_gate_human_comment_placeholders_exist_in_resumed_prompts() -> None:
     assert "$human_comment" in (_project_root() / "prompts/discussion/issue_breakdown.md").read_text(encoding="utf-8")
 
 
-def test_phase_workflow_clarification_limit_terminates_phase() -> None:
+def test_discussion_clarification_limit_opens_gate_instead_of_terminating() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         runtime_dir = Path(tmpdir)
         instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
@@ -828,15 +917,52 @@ def test_phase_workflow_clarification_limit_terminates_phase() -> None:
 
         result = orchestrator.process(_discussion_event(node_id="D_disc_5"))
 
-        assert result["terminated"] is True
-        assert "clarification limit" in result["terminated_reason"]
+        assert result["terminated"] is False
+        assert result["gate"]["gate_discussion_node_id"] == "D_disc_5"
+        assert result["gate"]["next_phase"] == "problem_synthesis"
         assert any(
-            "endless clarification loop" in call["message"]
+            "automatic clarification limit" in call["message"]
             for call in actions.comment_on_discussion_calls
         )
         reloaded = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
-        assert reloaded.is_terminated() is True
+        assert reloaded.is_terminated() is False
         assert reloaded.is_awaiting_clarification() is False
+        assert reloaded.get_discussion_gate_node_id() == "D_disc_5"
+
+
+def test_issue_coding_clarification_limit_still_terminates_phase() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.reset_for_workflow_type("issue_coding")
+        instance.set_phase("implement")
+        instance.increment_clarification_round("implement")
+        instance.increment_clarification_round("implement")
+
+        class FakeEngineClarification(FakeEngine):
+            def run_raw_text_handler(
+                self,
+                event: Any,
+                prompt_path: str,
+                role: str = "pm",
+                variables: Optional[Dict[str, Any]] = None,
+            ) -> Dict[str, Any]:
+                self.run_raw_text_handler_calls.append(
+                    {"event_id": event.event_id, "prompt_path": prompt_path, "role": role}
+                )
+                return {"raw_text": 'blocking_unknowns: ["Which API should the implementation call?"]'}
+
+        actions = RecordingActions()
+        engine = FakeEngineClarification(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+        orchestrator._prepare_phase_ai_cwd = lambda *args, **kwargs: None  # type: ignore[method-assign]
+
+        result = orchestrator.process(_issue_coding_event())
+
+        assert result["terminated"] is True
+        assert "clarification limit" in result["terminated_reason"]
+        reloaded = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert reloaded.is_terminated() is True
 
 
 def test_phase_workflow_gate_limit_terminates_phase() -> None:
@@ -1034,7 +1160,7 @@ def test_phase_gate_scanner_clarification_resume_uses_new_event_id() -> None:
         assert resumed.metadata["gate_human_comment"] == "Here are the answers"
 
 
-def _issue_event(action: str = "opened", **metadata: Any) -> Event:
+def _issue_event(action: str = "opened", title: str = "Implement login page", body: str = "Users need to log in with email and password.", **metadata: Any) -> Event:
     return Event(
         event_id="evt-issue-1",
         event_type="issue_changed",
@@ -1043,15 +1169,15 @@ def _issue_event(action: str = "opened", **metadata: Any) -> Event:
         repo="songsjun/example",
         actor="alice",
         url="https://example.test/issues/42",
-        title="Implement login page",
-        body="Users need to log in with email and password.",
+        title=title,
+        body=body,
         target_kind="issue",
         target_number=42,
         metadata={"action": action, **metadata},
     )
 
 
-def _issue_coding_event(**metadata: Any) -> Event:
+def _issue_coding_event(title: str = "Implement login page", body: str = "Users need to log in with email and password.", **metadata: Any) -> Event:
     return Event(
         event_id="evt-issue-coding-1",
         event_type="issue_coding",
@@ -1060,8 +1186,8 @@ def _issue_coding_event(**metadata: Any) -> Event:
         repo="songsjun/example",
         actor="alice",
         url="https://example.test/issues/42",
-        title="Implement login page",
-        body="Users need to log in with email and password.",
+        title=title,
+        body=body,
         target_kind="issue",
         target_number=42,
         metadata=dict(metadata),
@@ -1416,6 +1542,144 @@ def test_issue_coding_context_prep_failure_terminates_workflow() -> None:
         assert final_instance.is_terminated() is True
 
 
+def test_test_labeled_issue_scope_violation_terminates_before_coding_session() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+
+        class FakeEngineScopeViolation(FakeEngine):
+            def run_raw_text_handler(
+                self,
+                event: Any,
+                prompt_path: str,
+                role: str = "pm",
+                variables: Optional[Dict[str, Any]] = None,
+            ) -> Dict[str, Any]:
+                return {
+                    "raw_text": json.dumps(
+                        {
+                            "files": [
+                                {
+                                    "path": "src/stores/shortlist.ts",
+                                    "content": "export const x = 1;\n",
+                                }
+                            ],
+                            "test_command": "npm test",
+                            "install_command": "npm install",
+                            "branch_name": "ai/issue-42-shortlist-tests",
+                            "commit_message": "test: add shortlist reducer coverage for issue #42",
+                        }
+                    )
+                }
+
+        actions = RecordingActions()
+        engine = FakeEngineScopeViolation(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        issue_body = (
+            "## What to change\n"
+            "Create `src/stores/shortlist.test.ts`.\n\n"
+            "## Location\n"
+            "- File: `src/stores/shortlist.test.ts`\n"
+            "- Function: `describe('shortlistReducer')`\n"
+        )
+
+        with patch.object(WorkflowOrchestrator, "_prepare_phase_ai_cwd", return_value=Path(tmpdir)):
+            result = orchestrator.process(
+                _issue_coding_event(
+                    title="Add unit tests for shortlist reducer",
+                    body=issue_body,
+                    labels=["test", "frontend", "ready-to-code"],
+                )
+            )
+
+        assert result["terminated"] is True
+        assert any("violated the issue scope" in call["message"] for call in actions.comment_calls)
+        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert final_instance.is_terminated() is True
+        assert actions.coding_session_calls == []
+
+
+def test_test_labeled_issue_allows_test_files_and_test_config() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+
+        class FakeEngineTestScoped(FakeEngine):
+            def run_raw_text_handler(
+                self,
+                event: Any,
+                prompt_path: str,
+                role: str = "pm",
+                variables: Optional[Dict[str, Any]] = None,
+            ) -> Dict[str, Any]:
+                if "code_review" in prompt_path:
+                    return {"raw_text": "LGTM — no issues found."}
+                return {
+                    "raw_text": json.dumps(
+                        {
+                            "files": [
+                                {
+                                    "path": "src/stores/shortlist.test.ts",
+                                    "content": "describe('shortlistReducer', () => {});\n",
+                                },
+                                {
+                                    "path": "vitest.config.ts",
+                                    "content": "export default {};\n",
+                                },
+                            ],
+                            "test_command": "npm test",
+                            "install_command": "npm install",
+                            "branch_name": "ai/issue-42-shortlist-tests",
+                            "commit_message": "test: add shortlist reducer coverage for issue #42",
+                        }
+                    )
+                }
+
+        actions = RecordingActions()
+        engine = FakeEngineTestScoped(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        issue_body = (
+            "## What to change\n"
+            "Create `src/stores/shortlist.test.ts`.\n\n"
+            "## Location\n"
+            "- File: `src/stores/shortlist.test.ts`\n"
+            "- Function: `describe('shortlistReducer')`\n"
+        )
+
+        with (
+            patch.object(WorkflowOrchestrator, "_prepare_phase_ai_cwd", return_value=Path(tmpdir)),
+            patch("github_pm_agent.coding_session.CodingSession.setup", return_value=None),
+            patch("github_pm_agent.coding_session.CodingSession.apply_plan", return_value=None),
+            patch(
+                "github_pm_agent.coding_session.CodingSession.run_tests",
+                return_value=CodingTestResult(
+                    passed=True,
+                    exit_code=0,
+                    stdout="ok",
+                    stderr="",
+                    summary="Tests PASSED (exit code 0).",
+                ),
+            ),
+            patch("github_pm_agent.coding_session.CodingSession.push_branch", return_value="ai/issue-42-shortlist-tests"),
+            patch(
+                "github_pm_agent.coding_session.CodingSession.create_pr",
+                return_value={"number": 17, "url": "https://example.test/pr/17"},
+            ),
+            patch("github_pm_agent.coding_session.CodingSession.cleanup", return_value=None),
+        ):
+            result = orchestrator.process(
+                _issue_coding_event(
+                    title="Add unit tests for shortlist reducer",
+                    body=issue_body,
+                    labels=["test", "frontend", "ready-to-code"],
+                )
+            )
+
+        assert result["terminated"] is False
+        assert actions.coding_session_calls
+        assert not any("violated the issue scope" in call["message"] for call in actions.comment_calls)
+
+
 def test_prepare_phase_ai_cwd_clones_with_auth_env_without_token_in_url() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         runtime_dir = Path(tmpdir)
@@ -1657,6 +1921,73 @@ def test_issue_coding_max_iteration_failure_terminates_workflow() -> None:
         final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
         assert final_instance.is_terminated() is True
         assert "Tests failed after 3 iteration" in final_instance.get_terminated_reason()
+
+
+def test_issue_coding_retry_preserves_retry_branch_suffix_and_updates_plan_artifact() -> None:
+    from github_pm_agent.queue_store import QueueStore
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        store = QueueStore(runtime_dir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_phase("implement")
+        instance.set_original_event(_issue_coding_event().to_dict())
+
+        class FakeEngineRetry(FakeEngine):
+            def run_raw_text_handler(
+                self,
+                event: Any,
+                prompt_path: str,
+                role: str = "pm",
+                variables: Optional[Dict[str, Any]] = None,
+            ) -> Dict[str, Any]:
+                return {
+                    "raw_text": json.dumps(
+                        {
+                            "files": [{"path": "README.md", "content": "# test\n"}],
+                            "test_command": "npm test",
+                            "install_command": "npm install",
+                            "branch_name": "ai/issue-42",
+                            "commit_message": "feat: implement issue 42",
+                        }
+                    )
+                }
+
+        actions = RecordingActions()
+        engine = FakeEngineRetry(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+        resume_event = _issue_coding_event(
+            advance_to_phase="implement",
+            retry_branch_suffix="-retry-1",
+            _queue={"attempt": 3},
+        )
+
+        with (
+            patch.object(WorkflowOrchestrator, "_prepare_phase_ai_cwd", return_value=None),
+            patch("github_pm_agent.coding_session.CodingSession.setup", return_value=None),
+            patch("github_pm_agent.coding_session.CodingSession.apply_plan", return_value=None),
+            patch(
+                "github_pm_agent.coding_session.CodingSession.run_tests",
+                return_value=CodingTestResult(
+                    passed=False,
+                    exit_code=1,
+                    stdout="nope",
+                    stderr="",
+                    summary="1 failed",
+                ),
+            ),
+            patch("github_pm_agent.coding_session.CodingSession.cleanup", return_value=None),
+        ):
+            orchestrator.process(resume_event)
+
+        pending = store.list_pending()
+        assert len(pending) == 1
+        assert pending[0].metadata["retry_branch_suffix"] == "-retry-1"
+        assert pending[0].metadata["_queue"]["attempt"] == 4
+
+        reloaded = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        implement_artifact = str(reloaded.get_artifacts().get("implement") or "")
+        assert '"branch_name": "ai/issue-42-retry-1"' in implement_artifact
 
 
 def test_phase_gate_scanner_issue_gate_ignores_stale_comments_and_sets_execute_flag() -> None:

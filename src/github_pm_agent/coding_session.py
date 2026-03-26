@@ -10,7 +10,7 @@ import subprocess
 import tarfile
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,7 @@ class CodingPlan:
     install_command: str
     branch_name: str
     commit_message: str
+    delete_files: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -121,10 +122,7 @@ class CodingSession:
 
         logger.info("Applying coding plan on branch %s (iteration %s)", plan.branch_name, self.iteration)
         self._checkout_branch(plan.branch_name)
-        for file_spec in plan.files:
-            destination = self._resolve_repo_path(file_spec["path"])
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(file_spec["content"], encoding="utf-8")
+        self._apply_plan_changes(plan)
 
         self._run_command(["git", "add", "-A"], cwd=self.work_dir)
         diff_check = self._run_command(["git", "diff", "--cached", "--quiet"], cwd=self.work_dir, check=False)
@@ -236,10 +234,7 @@ class CodingSession:
                 cwd=self.work_dir,
             )
 
-        for file_spec in plan.files:
-            destination = self._resolve_repo_path(file_spec["path"])
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(file_spec["content"], encoding="utf-8")
+        self._apply_plan_changes(plan)
 
         self._run_command(["git", "add", "-A"], cwd=self.work_dir)
         diff_check = self._run_command(
@@ -302,10 +297,7 @@ class CodingSession:
         )
 
         try:
-            for file_spec in plan.files:
-                destination = self._resolve_repo_path(file_spec["path"])
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_text(file_spec["content"], encoding="utf-8")
+            self._apply_plan_changes(plan)
 
             self._run_command(["git", "add", "-A"], cwd=self.work_dir)
             unresolved = self._run_command(
@@ -454,6 +446,7 @@ class CodingSession:
             return None
 
         files = payload.get("files")
+        delete_files = payload.get("delete_files", [])
         test_command = payload.get("test_command")
         install_command = payload.get("install_command")
         branch_name = payload.get("branch_name")
@@ -469,6 +462,8 @@ class CodingSession:
             return None
         if not isinstance(commit_message, str) or not commit_message.strip():
             return None
+        if not isinstance(delete_files, list):
+            return None
 
         normalized_files: list[dict[str, str]] = []
         for item in files:
@@ -482,13 +477,33 @@ class CodingSession:
                 return None
             normalized_files.append({"path": path, "content": content})
 
+        normalized_delete_files: list[str] = []
+        for item in delete_files:
+            if not isinstance(item, str) or not item.strip():
+                return None
+            normalized_delete_files.append(item.strip())
+
         return CodingPlan(
             files=normalized_files,
             test_command=test_command.strip(),
             install_command=install_command.strip(),
             branch_name=branch_name.strip(),
             commit_message=commit_message.strip(),
+            delete_files=normalized_delete_files,
         )
+
+    def _apply_plan_changes(self, plan: CodingPlan) -> None:
+        for relative_path in plan.delete_files:
+            destination = self._resolve_repo_path(relative_path)
+            if destination.is_dir():
+                shutil.rmtree(destination)
+            elif destination.exists():
+                destination.unlink()
+
+        for file_spec in plan.files:
+            destination = self._resolve_repo_path(file_spec["path"])
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(file_spec["content"], encoding="utf-8")
 
     def _checkout_branch(self, branch_name: str) -> None:
         current_branch = self._run_command(
@@ -650,6 +665,10 @@ class CodingSession:
             test_output_lines = lines
         stdout = "\n".join(test_output_lines).strip()
         passed = exit_code == 0
+        if not passed:
+            failure_excerpt = self._extract_failure_excerpt(build_logs)
+            if failure_excerpt and failure_excerpt not in stdout:
+                stdout = f"{stdout}\n\n{failure_excerpt}".strip() if stdout else failure_excerpt
         status_label = "PASSED" if passed else "FAILED"
         summary = f"Tests {status_label} (exit code {exit_code}).\n\n{stdout[:2000]}" if stdout else f"Tests {status_label} (exit code {exit_code})."
         return TestResult(
@@ -756,6 +775,44 @@ class CodingSession:
         if status_text:
             details.append("Git status:\n" + status_text[:800])
         return "\n\n".join(details)[:4000]
+
+    def _extract_failure_excerpt(self, build_logs: str, *, max_lines: int = 40) -> str:
+        patterns = (
+            " FAIL ",
+            "Error:",
+            "TypeError",
+            "ReferenceError",
+            "SyntaxError",
+            "Expected:",
+            "Received:",
+            "Cannot find",
+            "TS",
+            "timed out",
+            "timeout",
+            "Unhandled",
+        )
+        lines = build_logs.splitlines()
+        matched_indexes = [
+            index
+            for index, line in enumerate(lines)
+            if any(pattern in line for pattern in patterns)
+        ]
+        if not matched_indexes:
+            return ""
+
+        excerpt: list[str] = []
+        seen: set[int] = set()
+        for index in matched_indexes[:8]:
+            start = max(0, index - 2)
+            end = min(len(lines), index + 3)
+            for current in range(start, end):
+                if current in seen:
+                    continue
+                seen.add(current)
+                excerpt.append(lines[current])
+                if len(excerpt) >= max_lines:
+                    return "\n".join(excerpt).strip()
+        return "\n".join(excerpt).strip()
 
     def _conflict_snippets(self, paths: list[str], *, max_files: int = 3, context_lines: int = 3) -> list[str]:
         snippets: list[str] = []

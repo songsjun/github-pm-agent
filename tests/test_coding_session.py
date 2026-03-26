@@ -30,6 +30,7 @@ class CodingSessionTest(unittest.TestCase):
         self,
         *,
         files: list[dict[str, str]] | None = None,
+        delete_files: list[str] | None = None,
         test_command: str = "pytest -q",
         install_command: str = "pip install -r requirements.txt",
         branch_name: str = "feature/test-plan",
@@ -41,6 +42,7 @@ class CodingSessionTest(unittest.TestCase):
             install_command=install_command,
             branch_name=branch_name,
             commit_message=commit_message,
+            delete_files=delete_files or [],
         )
 
     def _apply_plan_run_command(self, command, *, cwd=None, env=None, check=True):
@@ -90,6 +92,22 @@ class CodingSessionTest(unittest.TestCase):
         self.assertIsInstance(plan, CodingPlan)
         assert plan is not None
         self.assertEqual(plan.branch_name, "feature/raw-json")
+
+    def test_parse_plan_with_delete_files(self) -> None:
+        payload = {
+            "files": [{"path": "README.md", "content": "hello\n"}],
+            "delete_files": ["jest.config.js"],
+            "test_command": "pytest -q",
+            "install_command": "pip install -r requirements.txt",
+            "branch_name": "feature/raw-json",
+            "commit_message": "Update readme",
+        }
+
+        plan = CodingSession.parse_plan(json.dumps(payload))
+
+        self.assertIsInstance(plan, CodingPlan)
+        assert plan is not None
+        self.assertEqual(plan.delete_files, ["jest.config.js"])
 
     def test_parse_plan_missing_files_returns_none(self) -> None:
         payload = {
@@ -146,6 +164,20 @@ class CodingSessionTest(unittest.TestCase):
             (session.work_dir / "tests/test_module.py").read_text(encoding="utf-8"),
             "assert True\n",
         )
+
+    def test_apply_plan_deletes_files_listed_in_delete_files(self) -> None:
+        session, _client = self._make_session()
+        doomed = session.work_dir / "jest.config.js"
+        doomed.write_text("module.exports = {};\n", encoding="utf-8")
+        plan = self._make_plan(
+            files=[{"path": "src/module.py", "content": "value = 1\n"}],
+            delete_files=["jest.config.js"],
+        )
+
+        with patch.object(session, "_run_command", side_effect=self._apply_plan_run_command):
+            session.apply_plan(plan)
+
+        self.assertFalse(doomed.exists())
 
     def test_apply_plan_path_traversal_raises(self) -> None:
         session, _client = self._make_session()
@@ -261,6 +293,30 @@ class CodingSessionTest(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertIn("2 passed", result.stdout)
         self.assertNotIn("__TEST_EXIT_CODE__:0", result.stdout)
+
+    def test_run_tests_failure_appends_failure_excerpt_from_full_logs(self) -> None:
+        session, client = self._make_session()
+        (session.work_dir / "README.md").write_text("test repo\n", encoding="utf-8")
+        plan = self._make_plan(files=[])
+        client.upload_context.return_value = "ctx-1"
+        client.build_image.return_value = "j-build"
+        client.wait_for_job.return_value = {"status": "done"}
+        build_logs = (
+            "#9 [5/5] RUN sh -c 'npm test'; echo __TEST_EXIT_CODE__:$?\n"
+            "#9 CACHED\n"
+            "#8 14.75  FAIL  tests/useCitySearch.test.ts > useCitySearch > rejects blank input and debounces search calls\n"
+            "#8 14.75 Error: Test timed out in 5000ms.\n"
+            "#8 14.76 If this is a long-running test, pass a timeout value as the last argument.\n"
+            "#9 2.746 __TEST_EXIT_CODE__:1\n"
+            "#10 exporting to image\n"
+        )
+        client.get_logs.return_value = build_logs
+
+        result = session.run_tests(plan)
+
+        self.assertFalse(result.passed)
+        self.assertIn("FAIL  tests/useCitySearch.test.ts", result.stdout)
+        self.assertIn("Test timed out in 5000ms", result.summary)
 
     def test_setup_clones_with_auth_env_without_embedding_token_in_url(self) -> None:
         client = MagicMock()
@@ -444,12 +500,14 @@ class CodingSessionTest(unittest.TestCase):
     def test_resolve_merge_conflict_commits_resolution_without_pushing(self) -> None:
         session, _client = self._make_session()
         (session.work_dir / "src").mkdir(parents=True, exist_ok=True)
+        (session.work_dir / "jest.config.js").write_text("module.exports = {};\n", encoding="utf-8")
         (session.work_dir / "src/conflicted.ts").write_text(
             "<<<<<<< HEAD\nbranch\n=======\nmain\n>>>>>>> origin/main\n",
             encoding="utf-8",
         )
         plan = self._make_plan(
             files=[{"path": "src/conflicted.ts", "content": "resolved\n"}],
+            delete_files=["jest.config.js"],
             branch_name="feature/test-plan",
             commit_message="Resolve merge conflict",
         )
@@ -484,6 +542,7 @@ class CodingSessionTest(unittest.TestCase):
 
         self.assertFalse(any(command[:3] == ["git", "push", "origin"] for command in commands))
         self.assertEqual((session.work_dir / "src/conflicted.ts").read_text(encoding="utf-8"), "resolved\n")
+        self.assertFalse((session.work_dir / "jest.config.js").exists())
 
 
 if __name__ == "__main__":

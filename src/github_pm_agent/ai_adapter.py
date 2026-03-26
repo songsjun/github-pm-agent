@@ -124,6 +124,7 @@ class AIAdapterManager:
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
             handle.write(rendered)
             input_file = handle.name
+        timeout_seconds = int(provider_config.get("timeout_seconds", 600))
 
         command = [
             provider_config.get("python_path", "python3"),
@@ -150,6 +151,7 @@ class AIAdapterManager:
             command.extend(["--gemini-path", provider_config["gemini_path"]])
         if provider_config.get("reasoning_effort"):
             command.extend(["--reasoning-effort", provider_config["reasoning_effort"]])
+        command.extend(["--timeout-seconds", str(timeout_seconds)])
 
         result = subprocess.run(
             command,
@@ -157,6 +159,7 @@ class AIAdapterManager:
             capture_output=True,
             text=True,
             cwd=str(request.cwd or self.project_root),
+            timeout=timeout_seconds + 30,
         )
         raw = json.loads(result.stdout.strip()) if result.stdout.strip() else {}
         return AiResponse(

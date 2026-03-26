@@ -118,5 +118,48 @@ class DevEnvCapsProviderTest(unittest.TestCase):
                     adapter.generate(_make_request())
 
 
+class CliScriptProviderTest(unittest.TestCase):
+    def test_cli_script_passes_timeout_to_wrapper_and_subprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            (root / "prompts").mkdir()
+            (root / "prompts" / "task.md").write_text("task", encoding="utf-8")
+            (root / "runtime").mkdir()
+            manager = AIAdapterManager(
+                root,
+                {
+                    "ai": {
+                        "providers": {
+                            "cli": {
+                                "type": "cli_script",
+                                "provider_name": "codex",
+                                "script": "scripts/run_ai_cli.py",
+                                "python_path": "python3",
+                                "codex_path": "codex",
+                                "default_model": "gpt-5.4",
+                                "timeout_seconds": 42,
+                            }
+                        }
+                    }
+                },
+                PromptLibrary(root),
+                SessionStore(root / "runtime"),
+            )
+            manager._render_request = MagicMock(return_value="stubbed prompt")  # type: ignore[method-assign]
+            request = AiRequest(provider="cli", model="gpt-5.4", system_prompt_path="", prompt_path="prompts/task.md")
+
+            fake_result = MagicMock()
+            fake_result.stdout = '{"output":"ok","session_key":"sess"}'
+
+            with patch("github_pm_agent.ai_adapter.subprocess.run", return_value=fake_result) as run_mock:
+                response = manager.generate(request)
+
+            self.assertEqual(response.content, "ok")
+            command = run_mock.call_args.args[0]
+            self.assertIn("--timeout-seconds", command)
+            self.assertIn("42", command)
+            self.assertEqual(run_mock.call_args.kwargs["timeout"], 72)
+
+
 if __name__ == "__main__":
     unittest.main()

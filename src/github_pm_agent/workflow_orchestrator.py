@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import inspect
+import json
 import logging
 import os
 import re
@@ -99,6 +100,26 @@ class _NoOpActions:
 class WorkflowOrchestrator:
     MAX_CLARIFICATION_ROUNDS = 2
     MAX_PHASE_GATE_OPENS = 3
+    _TEST_SUPPORT_PATTERNS = (
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "tsconfig.json",
+        "tsconfig.*.json",
+        "jest.config.*",
+        "vitest.config.*",
+        "babel.config.*",
+        "tests/**",
+        "test/**",
+        "src/test/**",
+        "**/__tests__/**",
+        "**/*.test.*",
+        "**/*.spec.*",
+        "**/setupTests.*",
+        "**/test-utils.*",
+        "**/testUtils.*",
+    )
 
     def __init__(
         self,
@@ -130,13 +151,16 @@ class WorkflowOrchestrator:
         response_type: str = "",
     ) -> None:
         original_event = instance.get_original_event() or event.to_dict()
-        resumed_metadata = dict(original_event.get("metadata", {}))
-        resumed_metadata["advance_to_phase"] = phase
-        resumed_metadata["artifacts"] = instance.get_artifacts()
-        if human_comment:
-            resumed_metadata["gate_human_comment"] = human_comment
-        if response_type:
-            resumed_metadata["gate_response_type"] = response_type
+        resumed_metadata = self._resume_issue_coding_metadata(
+            instance,
+            original_event,
+            event.metadata if hasattr(event, "metadata") else {},
+            advance_to_phase=phase,
+            extra={
+                "gate_human_comment": human_comment,
+                "gate_response_type": response_type,
+            },
+        )
         enqueue_pending_payload(
             self.engine.runtime_dir,
             build_requeued_event(
@@ -159,6 +183,136 @@ class WorkflowOrchestrator:
         mergeable = pr_state.get("mergeable")
         return mergeable_state == "dirty" or mergeable is False
 
+    def _extract_issue_location_files(self, body: str) -> List[str]:
+        matches = re.findall(r"^- File:\s*`([^`]+)`", body or "", flags=re.MULTILINE)
+        files: List[str] = []
+        for match in matches:
+            path = self._normalize_repo_path(match)
+            if path and path not in files:
+                files.append(path)
+        return files
+
+    def _normalize_repo_path(self, path: str) -> str:
+        normalized = Path(str(path).strip()).as_posix()
+        if normalized.startswith("./"):
+            normalized = normalized[2:]
+        return normalized
+
+    def _is_test_support_path(self, path: str) -> bool:
+        normalized = self._normalize_repo_path(path)
+        return any(fnmatch.fnmatch(normalized, pattern) for pattern in self._TEST_SUPPORT_PATTERNS)
+
+    def _issue_scope_details(self, event: Any, instance: Any) -> Tuple[List[str], List[str]]:
+        source_event = instance.get_original_event() or event.to_dict()
+        metadata = source_event.get("metadata", {}) if isinstance(source_event, dict) else {}
+        labels = self._normalize_labels(metadata.get("labels", []))
+        body = str((source_event.get("body") if isinstance(source_event, dict) else "") or event.body or "")
+        return labels, self._extract_issue_location_files(body)
+
+    def _build_issue_scope_guard(self, labels: List[str], location_files: List[str]) -> str:
+        if "test" in labels:
+            if location_files:
+                listed = ", ".join(f"`{path}`" for path in location_files)
+                return (
+                    f"This is a test-scoped issue. Only modify the declared test file(s) {listed} "
+                    "plus minimal test-support/config files needed to run those tests. "
+                    "Do not change production runtime modules."
+                )
+            return (
+                "This is a test-scoped issue. Only modify test files and minimal test-support/config files. "
+                "Do not change production runtime modules."
+            )
+        if location_files:
+            listed = ", ".join(f"`{path}`" for path in location_files)
+            return (
+                f"Stay inside the declared issue file(s): {listed}. "
+                "Only add a directly related companion file when the acceptance test clearly requires it."
+            )
+        return "Stay inside the issue's declared scope and avoid unrelated files."
+
+    def _validate_coding_plan_scope(self, plan: Any, event: Any, instance: Any) -> str:
+        labels, location_files = self._issue_scope_details(event, instance)
+        if "test" not in labels:
+            return ""
+        if not location_files:
+            return ""
+
+        violations: List[str] = []
+        for file_spec in getattr(plan, "files", []) or []:
+            if not isinstance(file_spec, dict):
+                continue
+            path = self._normalize_repo_path(str(file_spec.get("path", "") or ""))
+            if not path:
+                continue
+            if path in location_files or self._is_test_support_path(path):
+                continue
+            violations.append(path)
+
+        if not violations:
+            return ""
+
+        listed = ", ".join(f"`{path}`" for path in location_files)
+        changed = ", ".join(f"`{path}`" for path in violations)
+        return (
+            "Coding plan violated the issue scope for a test-labeled task. "
+            f"Disallowed file(s): {changed}. "
+            f"Allowed declared test file(s): {listed}. "
+            "Only test files and minimal test-support/config files may change."
+        )
+
+    def _apply_retry_branch_suffix(self, branch_name: str, suffix: str) -> str:
+        normalized_branch = str(branch_name or "").strip()
+        normalized_suffix = str(suffix or "").strip()
+        if not normalized_branch or not normalized_suffix:
+            return normalized_branch
+        if normalized_branch.endswith(normalized_suffix):
+            return normalized_branch
+        return f"{normalized_branch}{normalized_suffix}"
+
+    def _resume_issue_coding_metadata(
+        self,
+        instance: Any,
+        original_event: Dict[str, Any],
+        current_metadata: Dict[str, Any],
+        *,
+        advance_to_phase: str | None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        resumed_metadata: Dict[str, Any] = {}
+        original_metadata = original_event.get("metadata", {})
+        if isinstance(original_metadata, dict):
+            resumed_metadata.update(original_metadata)
+        if isinstance(current_metadata, dict):
+            resumed_metadata.update(current_metadata)
+
+        # These keys are phase-local and should only carry forward when explicitly set.
+        resumed_metadata.pop("advance_to_phase", None)
+        resumed_metadata.pop("gate_human_comment", None)
+        resumed_metadata.pop("gate_response_type", None)
+
+        resumed_metadata["artifacts"] = instance.get_artifacts()
+        if advance_to_phase:
+            resumed_metadata["advance_to_phase"] = advance_to_phase
+        if extra:
+            for key, value in extra.items():
+                if value:
+                    resumed_metadata[key] = value
+        return resumed_metadata
+
+    @staticmethod
+    def _render_coding_plan_artifact(plan: Any) -> str:
+        payload: Dict[str, Any] = {
+            "files": list(getattr(plan, "files", []) or []),
+            "test_command": str(getattr(plan, "test_command", "") or ""),
+            "install_command": str(getattr(plan, "install_command", "") or ""),
+            "branch_name": str(getattr(plan, "branch_name", "") or ""),
+            "commit_message": str(getattr(plan, "commit_message", "") or ""),
+        }
+        delete_files = list(getattr(plan, "delete_files", []) or [])
+        if delete_files:
+            payload["delete_files"] = delete_files
+        return f"```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```"
+
     def _terminate_phase_limit(
         self,
         event: Any,
@@ -178,7 +332,7 @@ class WorkflowOrchestrator:
             reason = (
                 f"Phase `{phase}` exceeded the automatic gate limit ({limit} attempt(s)). "
                 "Workflow stopped to avoid repeated human-confirmation loops."
-            )
+        )
         self._post_output_comment(
             event,
             self.actions,
@@ -186,6 +340,58 @@ class WorkflowOrchestrator:
             node_id,
         )
         instance.set_terminated(reason)
+
+    def _open_clarification_limit_gate(
+        self,
+        event: Any,
+        instance: Any,
+        *,
+        phase: str,
+        questions: List[str],
+        node_id: str,
+        target_number: Optional[int],
+        next_phase: str,
+    ) -> Dict[str, Any]:
+        from github_pm_agent.utils import utc_now_iso
+
+        if instance.get_gate_open_count(phase) >= self.MAX_PHASE_GATE_OPENS:
+            self._terminate_phase_limit(
+                event,
+                instance,
+                phase=phase,
+                node_id=node_id,
+                limit_kind="gate",
+                limit=self.MAX_PHASE_GATE_OPENS,
+            )
+            return {"terminated": True}
+
+        numbered = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(questions))
+        body = (
+            f"**Phase `{phase}` hit the automatic clarification limit.**\n\n"
+            "The workers still have open questions, but the system will not keep asking indefinitely.\n\n"
+            f"Outstanding questions:\n{numbered}\n\n"
+            f"---\n_Comment to confirm and continue to **{next_phase}** with explicit assumptions, "
+            "or reply with corrections and the phase will be rerun once._"
+        )
+
+        posted_at = utc_now_iso()
+        self._post_output_comment(event, self.actions, body, node_id)
+        instance.increment_gate_open_count(phase)
+        if event.target_kind == "discussion" and node_id:
+            instance.set_discussion_gate(node_id, posted_at, next_phase, resume_mode="advance")
+            return {
+                "gate_discussion_node_id": node_id,
+                "gate_posted_at": posted_at,
+                "next_phase": next_phase,
+            }
+        if event.target_kind in ("issue", "pull_request") and target_number:
+            instance.set_gate(target_number, next_phase, posted_at=posted_at, resume_mode="advance")
+            return {
+                "gate_issue_number": target_number,
+                "gate_posted_at": posted_at,
+                "next_phase": next_phase,
+            }
+        return {"gate_posted_at": posted_at, "next_phase": next_phase}
 
     def process(self, event: Any) -> Dict[str, Any]:
         if event.event_type == "discussion_comment":
@@ -386,6 +592,14 @@ class WorkflowOrchestrator:
                 "default_branch": self.config.get("github", {}).get("default_branch", "main"),
                 "base_branch": self.config.get("github", {}).get("default_branch", "main"),
             }
+            issue_labels, issue_location_files = self._issue_scope_details(event, instance)
+            variables["issue_labels"] = ", ".join(issue_labels) if issue_labels else "(none)"
+            variables["issue_location_files"] = (
+                "\n".join(f"- `{path}`" for path in issue_location_files)
+                if issue_location_files
+                else "- (not specified)"
+            )
+            variables["issue_scope_guard"] = self._build_issue_scope_guard(issue_labels, issue_location_files)
             for phase_name, artifact_text in artifacts.items():
                 if not phase_name.startswith("_"):
                     variables[f"artifact_{phase_name}"] = artifact_text
@@ -551,6 +765,34 @@ class WorkflowOrchestrator:
                 questions = self._collect_blocking_unknowns(all_ai_outputs, current_phase)
                 if questions:
                     if instance.get_clarification_round(current_phase) >= self.MAX_CLARIFICATION_ROUNDS:
+                        idx = next((i for i, s in enumerate(steps) if s.get("phase") == current_phase), -1)
+                        next_step = steps[idx + 1] if 0 <= idx < len(steps) - 1 else None
+                        next_phase = next_step["phase"] if next_step else ""
+                        if event.target_kind == "discussion" and next_phase:
+                            gate_result = self._open_clarification_limit_gate(
+                                event,
+                                instance,
+                                phase=current_phase,
+                                questions=questions,
+                                node_id=node_id,
+                                target_number=target_number,
+                                next_phase=next_phase,
+                            )
+                            if gate_result.get("terminated"):
+                                return {
+                                    "phase": current_phase,
+                                    "ai_outputs": all_ai_outputs,
+                                    "gate": {},
+                                    "artifacts": instance.get_artifacts(),
+                                    "created_issues": created_issues,
+                                    "issue_creation_error": issue_creation_error,
+                                    "terminated": True,
+                                    "terminated_reason": instance.get_terminated_reason(),
+                                    "escalation_refs": [],
+                                }
+                            if pending:
+                                instance.clear_pending_comments()
+                            break
                         self._terminate_phase_limit(
                             event,
                             instance,
@@ -576,16 +818,27 @@ class WorkflowOrchestrator:
             if defer_gated_action:
                 step_succeeded = True
             elif step.get("action") == "create_issues":
-                created_issues, issue_creation_error = self._create_issues_from_artifact(last_content, event)
-                issue_refs = []
-                for item in created_issues:
-                    number = (item.get("result") or {}).get("number") or item.get("number")
-                    title = item.get("title", "")
-                    issue_refs.append({"number": number, "title": title})
-                if issue_refs:
-                    instance.set_created_issue_refs(issue_refs)
-                if issue_creation_error:
-                    break
+                existing_refs = instance.get_created_issue_refs()
+                if existing_refs:
+                    created_issues = [
+                        {
+                            "title": ref.get("title", ""),
+                            "number": ref.get("number"),
+                            "result": {"number": ref.get("number")},
+                        }
+                        for ref in existing_refs
+                    ]
+                else:
+                    created_issues, issue_creation_error = self._create_issues_from_artifact(last_content, event)
+                    issue_refs = []
+                    for item in created_issues:
+                        number = (item.get("result") or {}).get("number") or item.get("number")
+                        title = item.get("title", "")
+                        issue_refs.append({"number": number, "title": title})
+                    if issue_refs:
+                        instance.set_created_issue_refs(issue_refs)
+                    if issue_creation_error:
+                        break
                 step_succeeded = True
             elif step.get("action") == "evaluate_design":
                 eval_result = self._evaluate_design(last_content, event, instance, steps, current_phase)
@@ -623,6 +876,15 @@ class WorkflowOrchestrator:
                         self.actions.comment("issue", event.target_number, "Failed to parse coding plan from AI output")
                         instance.set_terminated("Coding plan parse failure")
                         break
+                    scope_error = self._validate_coding_plan_scope(plan, event, instance)
+                    if scope_error:
+                        self.actions.comment("issue", event.target_number, scope_error)
+                        instance.set_terminated(scope_error[:200])
+                        break
+                    retry_branch_suffix = str(meta.get("retry_branch_suffix") or "").strip()
+                    if retry_branch_suffix:
+                        plan.branch_name = self._apply_retry_branch_suffix(plan.branch_name, retry_branch_suffix)
+                    instance.set_artifact(current_phase, self._render_coding_plan_artifact(plan))
 
                     devenv_cfg = self.config.get("devenv", {})
                     server_url = devenv_cfg.get("server_url", "")
@@ -703,17 +965,11 @@ class WorkflowOrchestrator:
                                 f"stderr:\n```\n{test_result.stderr[-3000:] if test_result.stderr else ''}\n```"
                             )
                             instance.set_artifact("test_failure_context", failure_context)
-                            original_event = instance.get_original_event() or event.to_dict()
-                            resumed_metadata = dict(original_event.get("metadata", {}))
-                            resumed_metadata["advance_to_phase"] = "implement"
-                            resumed_metadata["artifacts"] = instance.get_artifacts()
-                            enqueue_pending_payload(
-                                self.engine.runtime_dir,
-                                build_requeued_event(
-                                    original_event,
-                                    metadata=resumed_metadata,
-                                    reason="implement_retry",
-                                ),
+                            self._requeue_issue_coding_phase(
+                                instance,
+                                event,
+                                phase="implement",
+                                reason="implement_retry",
                             )
                             should_break = True
                         else:
@@ -837,16 +1093,11 @@ class WorkflowOrchestrator:
                             )
                         except Exception:
                             pass  # best-effort; branch protection may still block merge
-                    resumed_metadata = dict(original_event.get("metadata", {}))
-                    resumed_metadata["advance_to_phase"] = "pm_decision"
-                    resumed_metadata["artifacts"] = instance.get_artifacts()
-                    enqueue_pending_payload(
-                        self.engine.runtime_dir,
-                        build_requeued_event(
-                            original_event,
-                            metadata=resumed_metadata,
-                            reason="review_approved",
-                        ),
+                    self._requeue_issue_coding_phase(
+                        instance,
+                        event,
+                        phase="pm_decision",
+                        reason="review_approved",
                     )
                 elif review_round >= MAX_REVIEW_ROUNDS:
                     # Too many rounds — close PR, terminate, flag for human
@@ -869,16 +1120,11 @@ class WorkflowOrchestrator:
                 else:
                     # Blocking issues remain — go to fix_iteration
                     instance.set_review_round(review_round + 1)
-                    resumed_metadata = dict(original_event.get("metadata", {}))
-                    resumed_metadata["advance_to_phase"] = "fix_iteration"
-                    resumed_metadata["artifacts"] = instance.get_artifacts()
-                    enqueue_pending_payload(
-                        self.engine.runtime_dir,
-                        build_requeued_event(
-                            original_event,
-                            metadata=resumed_metadata,
-                            reason="review_blocking",
-                        ),
+                    self._requeue_issue_coding_phase(
+                        instance,
+                        event,
+                        phase="fix_iteration",
+                        reason="review_blocking",
                     )
                 step_succeeded = True
                 break  # always stop current loop; re-queue handles continuation
@@ -895,6 +1141,15 @@ class WorkflowOrchestrator:
                         )
                         instance.set_terminated("Fix plan parse failure")
                         break
+                    scope_error = self._validate_coding_plan_scope(plan, event, instance)
+                    if scope_error:
+                        self.actions.comment("issue", event.target_number, scope_error)
+                        instance.set_terminated(scope_error[:200])
+                        break
+                    retry_branch_suffix = str(meta.get("retry_branch_suffix") or "").strip()
+                    if retry_branch_suffix:
+                        plan.branch_name = self._apply_retry_branch_suffix(plan.branch_name, retry_branch_suffix)
+                    instance.set_artifact(current_phase, self._render_coding_plan_artifact(plan))
 
                     devenv_cfg = self.config.get("devenv", {})
                     server_url = devenv_cfg.get("server_url", "")
@@ -935,18 +1190,13 @@ class WorkflowOrchestrator:
                             "stderr": test_result.stderr,
                         }))
 
-                        resumed_metadata = dict(original_event.get("metadata", {}))
                         if test_result.passed:
                             instance.set_artifact("test_failure_context", "")
-                            resumed_metadata["advance_to_phase"] = "code_review"
-                            resumed_metadata["artifacts"] = instance.get_artifacts()
-                            enqueue_pending_payload(
-                                self.engine.runtime_dir,
-                                build_requeued_event(
-                                    original_event,
-                                    metadata=resumed_metadata,
-                                    reason="fix_review_retry",
-                                ),
+                            self._requeue_issue_coding_phase(
+                                instance,
+                                event,
+                                phase="code_review",
+                                reason="fix_review_retry",
                             )
                         else:
                             # Fix did not make tests pass — escalate
@@ -1410,6 +1660,8 @@ class WorkflowOrchestrator:
             return {"terminated": True, "reason": reason}
 
         if decision == "escalate":
+            from github_pm_agent.utils import utc_now_iso
+
             owner = self.config.get("github", {}).get("owner", "")
             evaluation = parsed.get("evaluation_summary", content[:500])
             gate_title = f"[workflow-gate] {event.repo} Discussion #{event.target_number} phase={current_phase}"
@@ -1423,12 +1675,20 @@ class WorkflowOrchestrator:
                 title=gate_title, body=gate_body, labels=["workflow-gate"]
             )
             gate_number: Optional[int] = None
+            posted_at = utc_now_iso()
             if isinstance(gate_issue, dict):
                 gate_number = gate_issue.get("number") or (gate_issue.get("result") or {}).get("number")
             # Self-loop: gate advances back to the same phase
             if gate_number:
-                instance.set_gate(gate_number, current_phase)
-            return {"escalated": True, "gate": {"gate_issue_number": gate_number, "next_phase": current_phase}}
+                instance.set_gate(gate_number, current_phase, posted_at=posted_at)
+            return {
+                "escalated": True,
+                "gate": {
+                    "gate_issue_number": gate_number,
+                    "next_phase": current_phase,
+                    "gate_posted_at": posted_at,
+                },
+            }
 
         # proceed or merge: save final design
         final_design = parsed.get("final_design", "")
@@ -1759,6 +2019,9 @@ class WorkflowOrchestrator:
             summary_lines.append("Conflicted files:\n" + "\n".join(f"- `{path}`" for path in unmerged_files[:8]))
         else:
             summary_lines.append("Git did not report unmerged files after the local replay.")
+        duplicate_config_alert = self._duplicate_test_config_alert(context_dir, base_ref)
+        if duplicate_config_alert:
+            summary_lines.append(duplicate_config_alert)
         if status_text:
             summary_lines.append("Git status after replay:\n" + status_text[:1200])
         if snippets:
@@ -1811,6 +2074,46 @@ class WorkflowOrchestrator:
                 snippets.append(f"`{relative_path}`\n```text\n{excerpt}\n```")
                 break
         return snippets
+
+    def _duplicate_test_config_alert(self, context_dir: Path, base_ref: str) -> str:
+        jest_configs = [
+            name
+            for name in (
+                "jest.config.js",
+                "jest.config.cjs",
+                "jest.config.mjs",
+                "jest.config.ts",
+                "jest.config.json",
+            )
+            if (context_dir / name).exists()
+        ]
+        if len(jest_configs) <= 1:
+            return ""
+
+        tracked_on_base: List[str] = []
+        ls_tree = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", base_ref],
+            cwd=str(context_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if ls_tree.returncode == 0:
+            base_paths = {line.strip() for line in ls_tree.stdout.splitlines() if line.strip()}
+            tracked_on_base = [path for path in jest_configs if path in base_paths]
+
+        config_list = ", ".join(f"`{path}`" for path in jest_configs)
+        if len(tracked_on_base) == 1:
+            keep = tracked_on_base[0]
+            return (
+                "Repository state alert: multiple Jest config files are present "
+                f"({config_list}). Base branch `{base_ref}` already tracks `{keep}`. "
+                "Keep the tracked config and remove duplicate Jest config files if they are obsolete."
+            )
+        return (
+            "Repository state alert: multiple Jest config files are present "
+            f"({config_list}). Jest will fail until only one config remains, or the test command selects one explicitly."
+        )
 
     @staticmethod
     def _cleanup_merge_probe(context_dir: Path) -> None:

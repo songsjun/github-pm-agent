@@ -146,6 +146,25 @@ class GitHubPollerTest(unittest.TestCase):
 
         self.assertEqual(poller.poll(since), [])
 
+    def test_poll_notifications_ignores_timeout(self) -> None:
+        since = "2026-03-19T10:00:00Z"
+
+        class TimeoutClient(FakeClient):
+            def iter_api_pages(self, path, params=None, method="GET", list_key=None, per_page=100):
+                if path.endswith("/notifications"):
+                    raise subprocess.TimeoutExpired(["gh", "api", path], timeout=30)
+                return super().iter_api_pages(
+                    path,
+                    params=params,
+                    method=method,
+                    list_key=list_key,
+                    per_page=per_page,
+                )
+
+        poller = GitHubPoller(TimeoutClient(), "acme/widgets", "main", [])
+
+        self.assertEqual(poller._poll_notifications(since), [])
+
     def test_ready_to_code_issue_opening_routes_to_issue_coding(self) -> None:
         since = "2026-03-19T10:00:00Z"
         client = FakeClient(

@@ -21,6 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--codex-path", default="/opt/homebrew/bin/codex")
     parser.add_argument("--gemini-path", default="/opt/homebrew/bin/gemini")
     parser.add_argument("--reasoning-effort", default="", help="low/medium/high/xhigh")
+    parser.add_argument("--timeout-seconds", type=int, default=600)
     return parser
 
 
@@ -52,6 +53,7 @@ def run_codex(args: argparse.Namespace, prompt: str) -> Dict[str, Any]:
         capture_output=True,
         cwd=args.cwd,
         check=False,
+        timeout=args.timeout_seconds,
     )
     output = Path(output_file).read_text(encoding="utf-8").strip() if Path(output_file).exists() else ""
     if result.returncode != 0:
@@ -86,6 +88,7 @@ def run_gemini(args: argparse.Namespace, prompt: str) -> Dict[str, Any]:
         capture_output=True,
         cwd=args.cwd,
         check=False,
+        timeout=args.timeout_seconds,
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -110,10 +113,15 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     prompt = Path(args.input_file).read_text(encoding="utf-8")
-    if args.provider == "codex":
-        payload = run_codex(args, prompt)
-    else:
-        payload = run_gemini(args, prompt)
+    try:
+        if args.provider == "codex":
+            payload = run_codex(args, prompt)
+        else:
+            payload = run_gemini(args, prompt)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"{args.provider} cli timed out after {args.timeout_seconds}s"
+        ) from exc
     json.dump(payload, sys.stdout, ensure_ascii=False)
     sys.stdout.write("\n")
     return 0

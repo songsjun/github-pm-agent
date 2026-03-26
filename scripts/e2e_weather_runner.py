@@ -154,12 +154,23 @@ def show_status() -> int:
     prs = list_pull_requests(repo, pm_token)
     issue_prs = prs_by_closing_issue(prs)
     issues = list_repo_issues(repo, pm_token)
+    config_path = Path(str(run_info.get("config_path") or CONFIG_PATH))
+    server_pid = resolve_live_pid(
+        SERVER_PID_PATH,
+        ["scripts/local_devenv_server.py", "--port", "17070"],
+    )
+    daemon_pid = resolve_live_pid(
+        DAEMON_PID_PATH,
+        ["github-pm-agent", "--config", str(config_path), "daemon"],
+    )
 
     payload = {
         "repo": repo,
         "requirement_path": run_info.get("requirement_path", ""),
-        "server_running": pid_is_running(read_pid(SERVER_PID_PATH)),
-        "daemon_running": pid_is_running(read_pid(DAEMON_PID_PATH)),
+        "server_running": server_pid is not None,
+        "daemon_running": daemon_pid is not None,
+        "server_pid": server_pid,
+        "daemon_pid": daemon_pid,
         "discussion": {
             "number": run_info["discussion_number"],
             "url": run_info["discussion_url"],
@@ -840,6 +851,50 @@ def pid_is_running(pid: int | None) -> bool:
     except OSError:
         return False
     return True
+
+
+def resolve_live_pid(path: Path, required_terms: list[str]) -> int | None:
+    pid = read_pid(path)
+    if pid and pid_is_running(pid) and process_matches(pid, required_terms):
+        return pid
+
+    result = subprocess.run(
+        ["ps", "-eo", "pid=,args="],
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return pid if pid and pid_is_running(pid) else None
+
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split(maxsplit=1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        candidate_pid = int(parts[0])
+        command = parts[1]
+        if all(term in command for term in required_terms):
+            path.write_text(str(candidate_pid), encoding="utf-8")
+            return candidate_pid
+    return pid if pid and pid_is_running(pid) else None
+
+
+def process_matches(pid: int, required_terms: list[str]) -> bool:
+    result = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "args="],
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    command = result.stdout.strip()
+    return bool(command) and all(term in command for term in required_terms)
 
 
 def stop_pid_file(path: Path) -> None:

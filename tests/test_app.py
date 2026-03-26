@@ -68,6 +68,8 @@ class GitHubPMAgentAppTest(unittest.TestCase):
             patch("github_pm_agent.app.WorkflowOrchestrator", return_value=Mock()),
             patch("github_pm_agent.app.SuspendedEventScanner", return_value=Mock()),
             patch("github_pm_agent.app.PhaseGateScanner", return_value=Mock()),
+            patch("github_pm_agent.app.ActivePhaseRecoveryScanner", return_value=Mock()),
+            patch("github_pm_agent.app.CreatedIssueFanoutScanner", return_value=Mock()),
             patch("github_pm_agent.app.IssueCodingSyncScanner", return_value=Mock()),
             patch("github_pm_agent.app.MergeConflictScanner", return_value=Mock()),
             patch("github_pm_agent.app.IssueCodingRecoveryScanner", return_value=Mock()),
@@ -116,6 +118,8 @@ class GitHubPMAgentAppTest(unittest.TestCase):
         ]
         app.poll = Mock(return_value={"events_enqueued": 2})
         app.scanner.scan_and_resume = Mock(return_value=[])
+        app.active_phase_recovery_scanner.scan_and_requeue = Mock(return_value=[])
+        app.created_issue_fanout_scanner.scan_and_enqueue = Mock(return_value=[])
         app.issue_coding_sync_scanner.scan_and_sync = Mock(return_value=[])
         app.merge_conflict_scanner.scan_and_requeue = Mock(return_value=[])
         app.issue_coding_recovery_scanner.scan_and_requeue = Mock(return_value=[])
@@ -126,8 +130,12 @@ class GitHubPMAgentAppTest(unittest.TestCase):
         self.assertEqual(result["poll"], {"events_enqueued": 2})
         self.assertEqual(result["workflow_sync"], [])
         self.assertEqual(result["merge_conflicts"], [])
+        self.assertEqual(result["active_phase_recovery"], [])
+        self.assertEqual(result["created_issue_fanout"], [])
         self.assertEqual(result["workflow_recovery"], [])
         self.assertEqual(len(result["processed"]), 1)
+        app.active_phase_recovery_scanner.scan_and_requeue.assert_called_once()
+        app.created_issue_fanout_scanner.scan_and_enqueue.assert_called_once()
         app.issue_coding_sync_scanner.scan_and_sync.assert_called_once()
         app.merge_conflict_scanner.scan_and_requeue.assert_called_once()
         app.issue_coding_recovery_scanner.scan_and_requeue.assert_called_once()
@@ -146,6 +154,8 @@ class GitHubPMAgentAppTest(unittest.TestCase):
         app.orchestrator.process.side_effect = RuntimeError("boom")
         app.poll = Mock(return_value={"events_enqueued": 1})
         app.scanner.scan_and_resume = Mock(return_value=[])
+        app.active_phase_recovery_scanner.scan_and_requeue = Mock(return_value=[])
+        app.created_issue_fanout_scanner.scan_and_enqueue = Mock(return_value=[])
         app.issue_coding_sync_scanner.scan_and_sync = Mock(return_value=[])
         app.merge_conflict_scanner.scan_and_requeue = Mock(return_value=[])
         app.issue_coding_recovery_scanner.scan_and_requeue = Mock(return_value=[])
@@ -196,6 +206,8 @@ class GitHubPMAgentAppTest(unittest.TestCase):
             patch("github_pm_agent.app.WorkflowOrchestrator", return_value=Mock()),
             patch("github_pm_agent.app.SuspendedEventScanner", return_value=Mock()),
             patch("github_pm_agent.app.PhaseGateScanner", return_value=Mock()),
+            patch("github_pm_agent.app.ActivePhaseRecoveryScanner", return_value=Mock()),
+            patch("github_pm_agent.app.CreatedIssueFanoutScanner", return_value=Mock()),
             patch("github_pm_agent.app.IssueCodingSyncScanner", return_value=Mock()),
             patch("github_pm_agent.app.MergeConflictScanner", return_value=Mock()),
             patch("github_pm_agent.app.IssueCodingRecoveryScanner", return_value=Mock()),
@@ -240,6 +252,24 @@ class GitHubPMAgentAppTest(unittest.TestCase):
         self.assertEqual(event.url, "")
         self.assertEqual(event.metadata["label"], "ready-to-code")
         self.assertEqual(event.metadata["labels"], ["frontend", "ready-to-code"])
+
+    def test_cycle_returns_skipped_when_cycle_lock_is_held(self) -> None:
+        app = self._build_app()
+
+        @patch("github_pm_agent.app.cycle_lock")
+        def _run(lock_mock: Mock) -> None:
+            class _Ctx:
+                def __enter__(self_inner):
+                    return False
+
+                def __exit__(self_inner, exc_type, exc, tb):
+                    return False
+
+            lock_mock.return_value = _Ctx()
+            result = app.cycle()
+            self.assertEqual(result, {"skipped": True, "reason": "cycle_locked"})
+
+        _run()
 
     def test_ready_to_code_label_on_closed_issue_stays_issue_event(self) -> None:
         app = self._build_app()

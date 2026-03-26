@@ -41,6 +41,10 @@ class WorkflowInstance:
         self._state.setdefault("artifacts", {})[phase] = text
         self._save()
 
+    def replace_artifacts(self, artifacts: Dict[str, Any]) -> None:
+        self._state["artifacts"] = dict(artifacts)
+        self._save()
+
     def get_original_event(self) -> Optional[Dict[str, Any]]:
         raw = self._state.get("original_event")
         if isinstance(raw, str):
@@ -258,6 +262,28 @@ class WorkflowInstance:
     def set_last_merge_conflict_signature(self, signature: str) -> None:
         self._state["last_merge_conflict_signature"] = signature
         self._save()
+
+    def clear_last_merge_conflict_signature(self) -> None:
+        self._state.pop("last_merge_conflict_signature", None)
+        self._save()
+
+    def get_auto_restart_count(self) -> int:
+        return int(self._state.get("auto_restart_count", 0))
+
+    def increment_auto_restart_count(self) -> int:
+        next_count = self.get_auto_restart_count() + 1
+        self._state["auto_restart_count"] = next_count
+        self._save()
+        return next_count
+
+    def get_open_pr_recovery_count(self) -> int:
+        return int(self._state.get("open_pr_recovery_count", 0))
+
+    def increment_open_pr_recovery_count(self) -> int:
+        next_count = self.get_open_pr_recovery_count() + 1
+        self._state["open_pr_recovery_count"] = next_count
+        self._save()
+        return next_count
 
     def _reset_phase_loop_counters(self, phase: str) -> None:
         counts = dict(self._state.get("gate_open_counts", {}) or {})

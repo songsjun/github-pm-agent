@@ -124,40 +124,43 @@ class GitHubPoller:
     def _poll_notifications(self, since_iso: str) -> List[Event]:
         since_dt = parse_iso8601(since_iso)
         events: List[Event] = []
-        for items in self._pages(
-            f"repos/{self.repo}/notifications",
-            {"since": since_iso, "all": True, "participating": False, "per_page": 100},
-        ):
-            for item in items:
-                occurred_at = _first_timestamp(item.get("updated_at"), item.get("last_read_at"))
-                if not self._is_newer_than(occurred_at, since_dt):
-                    continue
-                reason = (item.get("reason") or "").lower()
-                if reason != "mention":
-                    continue
-                subject = item.get("subject") or {}
-                target_kind, target_number = self._notification_target(subject)
-                events.append(
-                    Event(
-                        event_id=_event_id("notification_mention", item.get("id") or subject.get("url", ""), occurred_at, reason),
-                        event_type="mention",
-                        source="notifications",
-                        occurred_at=occurred_at,
-                        repo=self.repo,
-                        actor="github",
-                        url=subject.get("latest_comment_url") or subject.get("url") or "",
-                        title=subject.get("title") or "mention",
-                        body=subject.get("title") or "notification mention",
-                        target_kind=target_kind,
-                        target_number=target_number,
-                        metadata={
-                            "reason": reason,
-                            "notification_id": item.get("id"),
-                            "subject_type": subject.get("type"),
-                            "unread": item.get("unread", False),
-                        },
+        try:
+            for items in self._pages(
+                f"repos/{self.repo}/notifications",
+                {"since": since_iso, "all": True, "participating": False, "per_page": 100},
+            ):
+                for item in items:
+                    occurred_at = _first_timestamp(item.get("updated_at"), item.get("last_read_at"))
+                    if not self._is_newer_than(occurred_at, since_dt):
+                        continue
+                    reason = (item.get("reason") or "").lower()
+                    if reason != "mention":
+                        continue
+                    subject = item.get("subject") or {}
+                    target_kind, target_number = self._notification_target(subject)
+                    events.append(
+                        Event(
+                            event_id=_event_id("notification_mention", item.get("id") or subject.get("url", ""), occurred_at, reason),
+                            event_type="mention",
+                            source="notifications",
+                            occurred_at=occurred_at,
+                            repo=self.repo,
+                            actor="github",
+                            url=subject.get("latest_comment_url") or subject.get("url") or "",
+                            title=subject.get("title") or "mention",
+                            body=subject.get("title") or "notification mention",
+                            target_kind=target_kind,
+                            target_number=target_number,
+                            metadata={
+                                "reason": reason,
+                                "notification_id": item.get("id"),
+                                "subject_type": subject.get("type"),
+                                "unread": item.get("unread", False),
+                            },
+                        )
                     )
-                )
+        except (RuntimeError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
+            return events
         return events
 
     def _poll_repo_events(self, since_iso: str) -> List[Event]:

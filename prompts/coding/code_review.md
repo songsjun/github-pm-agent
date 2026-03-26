@@ -28,4 +28,6 @@ Rules:
 - If no issues are found, output only: `LGTM — no issues found.`
 - Base your review on the diff above.
 - Be specific and actionable.
+- List the **complete set of remaining blocking issues in one pass**. Do not drip-feed one new blocker per round if you can already see several in the current diff.
+- Do not label a finding as blocking unless it would fail the stated issue behavior, break existing behavior, or make the tests unreliable.
 - Do not add any text before, after, or between findings outside the required format.

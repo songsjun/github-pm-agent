@@ -1,9 +1,20 @@
 import unittest
+from unittest.mock import patch
 
 from github_pm_agent.github_client import GitHubClient
 
 
 class GitHubClientMethodTest(unittest.TestCase):
+    def test_run_uses_bounded_subprocess_timeout(self) -> None:
+        client = GitHubClient("gh", "acme/widgets")
+
+        with patch("github_pm_agent.github_client.subprocess.run") as run_mock:
+            run_mock.return_value.stdout = "{}"
+            run_mock.return_value.stderr = ""
+            client.api("repos/acme/widgets")
+
+        self.assertEqual(run_mock.call_args.kwargs["timeout"], GitHubClient.COMMAND_TIMEOUT_SECONDS)
+
     def test_issue_assignees_add_uses_issue_assignees_endpoint(self) -> None:
         client = GitHubClient("gh", "acme/widgets")
         calls = []

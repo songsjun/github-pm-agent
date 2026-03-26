@@ -10,6 +10,8 @@ logger = logging.getLogger(__name__)
 
 
 class GitHubClient:
+    COMMAND_TIMEOUT_SECONDS = 30
+
     def __init__(
         self,
         gh_path: str,
@@ -41,22 +43,29 @@ class GitHubClient:
                     check=True,
                     capture_output=True,
                     text=True,
+                    timeout=self.COMMAND_TIMEOUT_SECONDS,
                 )
                 token = result.stdout.strip()
                 if token:
                     return token
-            except subprocess.CalledProcessError:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 pass
         return None
 
     def _run(self, args: List[str]) -> str:
         command = [self.gh_path] + args
         token = self._resolve_token()
+        kwargs = {
+            "check": True,
+            "capture_output": True,
+            "text": True,
+            "timeout": self.COMMAND_TIMEOUT_SECONDS,
+        }
         if token:
             env = {**os.environ, "GITHUB_TOKEN": token}
-            result = subprocess.run(command, check=True, capture_output=True, text=True, env=env)
+            result = subprocess.run(command, env=env, **kwargs)
         else:
-            result = subprocess.run(command, check=True, capture_output=True, text=True)
+            result = subprocess.run(command, **kwargs)
         return result.stdout.strip()
 
     def api(self, path: str, params: Optional[Dict[str, Any]] = None, method: str = "GET") -> Any:

@@ -8,6 +8,9 @@ $issue_body
 Repository context:
 - Default branch: $default_branch
 - Base branch: $base_branch
+- Issue labels: $issue_labels
+- Declared location files:
+$issue_location_files
 
 Additional context:
 - Previous worker analysis comments, if any:
@@ -20,12 +23,16 @@ If `$human_comment` is provided, follow it unless it conflicts with the issue re
 If `$test_failure_context` is set, analyze the failure details below, fix the underlying issue, and update any affected files or commands as needed:
 $test_failure_context
 
+Scope guard:
+$issue_scope_guard
+
 Return a single JSON block in ```json ... ``` with this exact schema:
 ```json
 {
   "files": [
     {"path": "relative/path/to/file.py", "content": "...complete file content..."}
   ],
+  "delete_files": ["relative/path/to/obsolete-file.py"],
   "test_command": "pytest tests/ -v",
   "install_command": "pip install -e .",
   "branch_name": "ai/issue-{number}-{short-slug}",
@@ -35,6 +42,7 @@ Return a single JSON block in ```json ... ``` with this exact schema:
 
 Requirements:
 - Include ALL files that need to change, whether new or modified.
+- If a file must be removed to satisfy the issue or keep the repo valid, list it in `delete_files`.
 - For every entry in `files`, provide the FULL file content, not diffs.
 - Use repository-relative file paths.
 - Choose a `test_command` that validates the change.
@@ -50,5 +58,7 @@ Requirements:
 - **Single test config per tool**: Do NOT create duplicate test configs for the same toolchain (for example both `jest.config.js` and `jest.config.cjs`) unless the repo already uses both and the issue requires it.
 - **Prefer the repo's existing stack**: If the repository already uses a framework, package manager, database, or test runner, extend that setup instead of introducing a parallel stack.
 - **Do not invent extra infrastructure**: Only add databases, ORMs, background workers, or deployment tooling when the issue or the current repository clearly requires them.
+- **Respect issue boundaries**: Stay inside the files named in the issue body unless the acceptance test clearly requires a directly related companion file.
+- **Test-labeled issues are test-scoped**: If the issue labels include `test`, treat production runtime code as read-only. Only modify the declared test file(s) plus test-support/config files required to run those tests.
 
 Output ONLY the JSON block. No explanation before or after.
