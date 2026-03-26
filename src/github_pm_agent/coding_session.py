@@ -43,6 +43,10 @@ class TestResult:
     summary: str
 
 
+class BranchSyncError(RuntimeError):
+    """Raised when a branch cannot be merged cleanly onto the latest base branch."""
+
+
 class CodingSession:
     MAX_ITERATIONS = 3
 
@@ -53,12 +57,14 @@ class CodingSession:
         issue_number: int,
         github_token: str = "",
         base_image: str = "python:3.12-slim",
+        base_branch: str = "main",
     ) -> None:
         self.devenv_client = devenv_client
         self.repo = repo
         self.issue_number = issue_number
         self.github_token = github_token
         self.base_image = base_image
+        self.base_branch = base_branch.strip() or "main"
         self.workspace_id = f"issue-{repo.replace('/', '-')}-{issue_number}"
         self.work_dir = Path(tempfile.mkdtemp(prefix=self._temp_dir_prefix()))
         self.job_id: str | None = None
@@ -244,44 +250,102 @@ class CodingSession:
 
         self._branch_name = branch_name
 
-        # Rebase on the latest main so the PR stays conflict-free for merge.
-        logger.info("Rebasing fix branch %s on origin/main for %s#%s", branch_name, self.repo, self.issue_number)
-        self._run_command(["git", "fetch", "origin", "main"], cwd=self.work_dir, env=self._git_command_env())
-        rebase_result = self._run_command(
-            ["git", "rebase", "origin/main"], cwd=self.work_dir, check=False
+        self._merge_base_branch_and_push(branch_name)
+
+    def resolve_merge_conflict(self, plan: CodingPlan, base_branch: str = "main") -> None:
+        """Apply an explicit merge-conflict resolution on the existing PR branch.
+
+        Unlike a normal fix iteration, this starts a real `git merge --no-commit`
+        against the latest base branch, writes the AI-provided resolution files into
+        the conflicted worktree, stages them, and commits the merge locally. The
+        caller is responsible for running tests and pushing only after the resolved
+        merge commit passes.
+        """
+        self._ensure_repo_ready()
+        branch_name = plan.branch_name
+        logger.info("Resolving merge conflict on branch %s for %s#%s", branch_name, self.repo, self.issue_number)
+
+        self._run_command(
+            ["git", "fetch", "origin", self._remote_branch_refspec(branch_name)],
+            cwd=self.work_dir,
+            env=self._git_command_env(),
         )
-        if rebase_result.returncode != 0:
-            logger.warning("Rebase failed for fix branch %s — aborting and pushing as-is", branch_name)
-            self._run_command(["git", "rebase", "--abort"], cwd=self.work_dir, check=False)
-            self._run_command(["git", "push", "origin", branch_name], cwd=self.work_dir, env=self._git_command_env())
+        branch_exists_locally = (
+            self._run_command(
+                ["git", "rev-parse", "--verify", branch_name], cwd=self.work_dir, check=False
+            ).returncode == 0
+        )
+        if branch_exists_locally:
+            self._run_command(["git", "checkout", branch_name], cwd=self.work_dir)
+            self._run_command(["git", "reset", "--hard", f"origin/{branch_name}"], cwd=self.work_dir)
         else:
             self._run_command(
-                ["git", "push", "origin", branch_name, "--force-with-lease"], cwd=self.work_dir, env=self._git_command_env()
+                ["git", "checkout", "-b", branch_name, f"origin/{branch_name}"],
+                cwd=self.work_dir,
             )
+
+        self._run_command(["git", "fetch", "origin", base_branch], cwd=self.work_dir, env=self._git_command_env())
+        merge_result = self._run_command(
+            [
+                "git",
+                "-c",
+                f"user.name={_GIT_USER_NAME}",
+                "-c",
+                f"user.email={_GIT_USER_EMAIL}",
+                "merge",
+                "--no-commit",
+                "--no-ff",
+                f"origin/{base_branch}",
+            ],
+            cwd=self.work_dir,
+            check=False,
+        )
+
+        try:
+            for file_spec in plan.files:
+                destination = self._resolve_repo_path(file_spec["path"])
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(file_spec["content"], encoding="utf-8")
+
+            self._run_command(["git", "add", "-A"], cwd=self.work_dir)
+            unresolved = self._run_command(
+                ["git", "diff", "--name-only", "--diff-filter=U"],
+                cwd=self.work_dir,
+                check=False,
+            )
+            unresolved_files = [line.strip() for line in unresolved.stdout.splitlines() if line.strip()]
+            if merge_result.returncode != 0 and unresolved_files:
+                raise BranchSyncError(self._summarize_branch_sync_failure(branch_name, merge_result))
+
+            diff_check = self._run_command(
+                ["git", "diff", "--cached", "--quiet"], cwd=self.work_dir, check=False
+            )
+            if diff_check.returncode == 0:
+                raise RuntimeError("merge conflict resolution produced no staged changes to commit")
+            if diff_check.returncode != 1:
+                raise RuntimeError(f"failed to inspect staged diff for {self.work_dir}")
+
+            self._run_command(["git", "commit", "-m", plan.commit_message], cwd=self.work_dir)
+        except Exception:
+            self._run_command(["git", "merge", "--abort"], cwd=self.work_dir, check=False)
+            raise
+
+        self._branch_name = branch_name
 
     def push_branch(self) -> str:
         """
-        Rebase the branch on the latest origin/main, then push.
-        Rebasing keeps the PR conflict-free so the PM can merge cleanly.
+        Merge the latest base branch into the branch, then push.
+        This keeps the branch synchronized in the same way GitHub evaluates mergeability.
         Returns the branch name.
         """
 
         branch_name = self._current_branch_name()
-        logger.info("Rebasing branch %s on origin/main for %s#%s", branch_name, self.repo, self.issue_number)
-        self._run_command(["git", "fetch", "origin", "main"], cwd=self.work_dir, env=self._git_command_env())
-        rebase_result = self._run_command(
-            ["git", "rebase", "origin/main"], cwd=self.work_dir, check=False
-        )
-        if rebase_result.returncode != 0:
-            logger.warning("Rebase failed for %s — aborting rebase and pushing as-is", branch_name)
-            self._run_command(["git", "rebase", "--abort"], cwd=self.work_dir, check=False)
-            self._run_command(["git", "push", "origin", branch_name], cwd=self.work_dir, env=self._git_command_env())
-        else:
-            # Force push after rebase to update the remote branch.
-            self._run_command(
-                ["git", "push", "origin", branch_name, "--force-with-lease"], cwd=self.work_dir, env=self._git_command_env()
-            )
+        self._merge_base_branch_and_push(branch_name)
         return branch_name
+
+    def push_existing_branch(self, branch_name: str | None = None) -> None:
+        branch_to_push = branch_name or self._current_branch_name()
+        self._run_command(["git", "push", "origin", branch_to_push], cwd=self.work_dir, env=self._git_command_env())
 
     def create_pr(self, title: str, body: str, base_branch: str = "main") -> dict[str, Any]:
         """
@@ -635,6 +699,84 @@ class CodingSession:
             raise RuntimeError("unable to determine current git branch")
         self._branch_name = branch_name
         return branch_name
+
+    def _merge_base_branch_and_push(self, branch_name: str) -> None:
+        base_ref = f"origin/{self.base_branch}"
+        logger.info("Merging %s into branch %s for %s#%s", base_ref, branch_name, self.repo, self.issue_number)
+        self._run_command(["git", "fetch", "origin", self.base_branch], cwd=self.work_dir, env=self._git_command_env())
+        merge_result = self._run_command(
+            [
+                "git",
+                "-c",
+                f"user.name={_GIT_USER_NAME}",
+                "-c",
+                f"user.email={_GIT_USER_EMAIL}",
+                "merge",
+                "--no-edit",
+                base_ref,
+            ],
+            cwd=self.work_dir,
+            check=False,
+        )
+        if merge_result.returncode != 0:
+            summary = self._summarize_branch_sync_failure(branch_name, merge_result)
+            logger.warning("Branch sync failed for %s#%s on branch %s: %s", self.repo, self.issue_number, branch_name, summary)
+            self._run_command(["git", "merge", "--abort"], cwd=self.work_dir, check=False)
+            raise BranchSyncError(summary)
+
+        self._run_command(["git", "push", "origin", branch_name], cwd=self.work_dir, env=self._git_command_env())
+
+    def _summarize_branch_sync_failure(
+        self,
+        branch_name: str,
+        merge_result: subprocess.CompletedProcess[str],
+    ) -> str:
+        base_ref = f"origin/{self.base_branch}"
+        status_result = self._run_command(["git", "status", "--short"], cwd=self.work_dir, check=False)
+        unmerged_result = self._run_command(
+            ["git", "diff", "--name-only", "--diff-filter=U"],
+            cwd=self.work_dir,
+            check=False,
+        )
+        unmerged_files = [line.strip() for line in unmerged_result.stdout.splitlines() if line.strip()]
+        details: list[str] = [
+            f"Branch `{branch_name}` does not merge cleanly with `{base_ref}`."
+        ]
+        first_line = self._first_nonempty_line(merge_result.stderr) or self._first_nonempty_line(merge_result.stdout)
+        if first_line:
+            details.append(first_line)
+        if unmerged_files:
+            details.append(
+                "Conflicted files:\n" + "\n".join(f"- `{path}`" for path in unmerged_files[:5])
+            )
+        snippets = self._conflict_snippets(unmerged_files)
+        if snippets:
+            details.append("Conflict excerpts:\n" + "\n\n".join(snippets))
+        status_text = status_result.stdout.strip()
+        if status_text:
+            details.append("Git status:\n" + status_text[:800])
+        return "\n\n".join(details)[:4000]
+
+    def _conflict_snippets(self, paths: list[str], *, max_files: int = 3, context_lines: int = 3) -> list[str]:
+        snippets: list[str] = []
+        for relative_path in paths[:max_files]:
+            try:
+                content = self._resolve_repo_path(relative_path).read_text(encoding="utf-8")
+            except (OSError, RuntimeError):
+                continue
+            lines = content.splitlines()
+            for index, line in enumerate(lines):
+                if not line.startswith("<<<<<<<"):
+                    continue
+                start = max(index - context_lines, 0)
+                end = min(index + context_lines + 8, len(lines))
+                excerpt = "\n".join(
+                    f"{line_no + 1}: {lines[line_no]}"
+                    for line_no in range(start, end)
+                )
+                snippets.append(f"`{relative_path}`\n```\n{excerpt}\n```")
+                break
+        return snippets
 
     def _run_command(
         self,

@@ -74,6 +74,20 @@ class FakeEngine:
             },
         }
 
+    def run_raw_text_handler(self, event, prompt_path, role="pm", variables=None, cwd=None):
+        self.calls.append(
+            (
+                "run_raw_text_handler",
+                event.event_type,
+                prompt_path,
+                role,
+            )
+        )
+        return {
+            "raw_text": "Thanks, I saw the mention.",
+            "action": {"executed": False, "action_type": "none"},
+        }
+
 
 class HandlerResolutionTest(unittest.TestCase):
     def test_resolve_high_value_handlers(self) -> None:
@@ -100,6 +114,7 @@ class HandlerResolutionTest(unittest.TestCase):
             ("pull_request_review", "pull_request_review_approved", {"state": "APPROVED"}),
             ("issue_event_review_requested", "issue_event_review_requested", {"review_requested_reviewer": "bob"}),
             ("discussion_comment", "discussion_ai"),
+            ("mention", "mention"),
             ("release_readiness", "release_readiness"),
             ("review_churn", "review_churn"),
             ("repeated_ci_instability", "repeated_ci_instability"),
@@ -244,6 +259,20 @@ class HandlerResolutionTest(unittest.TestCase):
         self.assertEqual(result["plan"]["reason"], "ai-route")
         self.assertEqual(result["routing"]["stage"], "clarify")
         self.assertEqual(result["routing"]["risk_level"], "high")
+
+    def test_mentions_use_raw_text_handler(self) -> None:
+        engine = FakeEngine()
+        event = self._event(
+            "mention",
+            target_kind="discussion",
+            target_number=4,
+            body="@sjunsong please confirm",
+        )
+        name, handler = resolve_handler(engine, event)
+        self.assertEqual(name, "mention")
+        result = handler(engine, event)
+        self.assertEqual(result["raw_text"], "Thanks, I saw the mention.")
+        self.assertEqual(engine.calls[0], ("run_raw_text_handler", "mention", "prompts/actions/mention_response.md", "pm"))
 
     def test_project_changed_routes_to_clarify_with_low_risk(self) -> None:
         engine = FakeEngine()

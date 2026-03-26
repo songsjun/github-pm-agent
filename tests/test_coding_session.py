@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from github_pm_agent.coding_session import CodingPlan, CodingSession, TestResult
+from github_pm_agent.coding_session import BranchSyncError, CodingPlan, CodingSession, TestResult
 
 
 def _completed(
@@ -293,6 +293,197 @@ class CodingSessionTest(unittest.TestCase):
             CodingSession._remote_branch_refspec("feature/test-branch"),
             "feature/test-branch:refs/remotes/origin/feature/test-branch",
         )
+
+    def test_fix_and_push_raises_when_merge_conflicts(self) -> None:
+        session, _client = self._make_session()
+        (session.work_dir / "src").mkdir(parents=True, exist_ok=True)
+        (session.work_dir / "src/module.py").write_text("value = 1\n", encoding="utf-8")
+        (session.work_dir / "src/conflicted.ts").write_text(
+            "<<<<<<< HEAD\nbranch\n=======\nmain\n>>>>>>> origin/main\n",
+            encoding="utf-8",
+        )
+        plan = self._make_plan(
+            files=[{"path": "src/module.py", "content": "value = 2\n"}],
+            branch_name="feature/test-plan",
+            commit_message="Update module",
+        )
+        commands: list[list[str]] = []
+
+        def fake_run(command, *, cwd=None, env=None, check=True):
+            commands.append(command)
+            if command[:3] == ["git", "fetch", "origin"] and "refs/remotes/origin/feature/test-plan" in command[-1]:
+                return _completed()
+            if command[:3] == ["git", "rev-parse", "--verify"]:
+                return _completed()
+            if command[:2] == ["git", "checkout"]:
+                return _completed()
+            if command[:2] == ["git", "reset"] and command[-1] == "origin/feature/test-plan":
+                return _completed()
+            if command == ["git", "add", "-A"]:
+                return _completed()
+            if command == ["git", "diff", "--cached", "--quiet"]:
+                return _completed(returncode=1)
+            if command[:2] == ["git", "commit"]:
+                return _completed()
+            if command == ["git", "fetch", "origin", "main"]:
+                return _completed()
+            if command[:7] == ["git", "-c", "user.name=github-pm-agent", "-c", "user.email=github-pm-agent@local", "merge", "--no-edit"]:
+                return _completed(returncode=1, stderr="CONFLICT (content): Merge conflict in src/conflicted.ts")
+            if command == ["git", "status", "--short"]:
+                return _completed(stdout="UU src/conflicted.ts\n")
+            if command == ["git", "diff", "--name-only", "--diff-filter=U"]:
+                return _completed(stdout="src/conflicted.ts\n")
+            if command == ["git", "merge", "--abort"]:
+                return _completed()
+            raise AssertionError(f"unexpected command: {command!r}")
+
+        with patch.object(session, "_run_command", side_effect=fake_run):
+            with self.assertRaisesRegex(BranchSyncError, "does not merge cleanly"):
+                session.fix_and_push(plan)
+
+        self.assertFalse(any(command[:3] == ["git", "push", "origin"] for command in commands))
+
+    def test_push_branch_raises_when_merge_conflicts(self) -> None:
+        session, _client = self._make_session()
+        (session.work_dir / "src").mkdir(parents=True, exist_ok=True)
+        (session.work_dir / "src/conflicted.ts").write_text(
+            "<<<<<<< HEAD\nbranch\n=======\nmain\n>>>>>>> origin/main\n",
+            encoding="utf-8",
+        )
+        commands: list[list[str]] = []
+
+        def fake_run(command, *, cwd=None, env=None, check=True):
+            commands.append(command)
+            if command == ["git", "branch", "--show-current"]:
+                return _completed(stdout="feature/test-branch\n")
+            if command == ["git", "fetch", "origin", "main"]:
+                return _completed()
+            if command[:7] == ["git", "-c", "user.name=github-pm-agent", "-c", "user.email=github-pm-agent@local", "merge", "--no-edit"]:
+                return _completed(returncode=1, stderr="CONFLICT (content): Merge conflict in src/conflicted.ts")
+            if command == ["git", "status", "--short"]:
+                return _completed(stdout="UU src/conflicted.ts\n")
+            if command == ["git", "diff", "--name-only", "--diff-filter=U"]:
+                return _completed(stdout="src/conflicted.ts\n")
+            if command == ["git", "merge", "--abort"]:
+                return _completed()
+            raise AssertionError(f"unexpected command: {command!r}")
+
+        with patch.object(session, "_run_command", side_effect=fake_run):
+            with self.assertRaisesRegex(BranchSyncError, "does not merge cleanly"):
+                session.push_branch()
+
+        self.assertFalse(any(command[:3] == ["git", "push", "origin"] for command in commands))
+
+    def test_push_branch_uses_configured_base_branch(self) -> None:
+        session, _client = self._make_session()
+        session.base_branch = "develop"
+        commands: list[list[str]] = []
+
+        def fake_run(command, *, cwd=None, env=None, check=True):
+            commands.append(command)
+            if command == ["git", "branch", "--show-current"]:
+                return _completed(stdout="feature/test-branch\n")
+            if command == ["git", "fetch", "origin", "develop"]:
+                return _completed()
+            if command[:7] == ["git", "-c", "user.name=github-pm-agent", "-c", "user.email=github-pm-agent@local", "merge", "--no-edit"]:
+                self.assertEqual(command[-1], "origin/develop")
+                return _completed()
+            if command[:3] == ["git", "push", "origin"]:
+                return _completed()
+            raise AssertionError(f"unexpected command: {command!r}")
+
+        with patch.object(session, "_run_command", side_effect=fake_run):
+            assert session.push_branch() == "feature/test-branch"
+
+    def test_fix_and_push_uses_configured_base_branch_in_conflict_summary(self) -> None:
+        session, _client = self._make_session()
+        session.base_branch = "develop"
+        (session.work_dir / "src").mkdir(parents=True, exist_ok=True)
+        (session.work_dir / "src/module.py").write_text("value = 1\n", encoding="utf-8")
+        (session.work_dir / "src/conflicted.ts").write_text(
+            "<<<<<<< HEAD\nbranch\n=======\ndevelop\n>>>>>>> origin/develop\n",
+            encoding="utf-8",
+        )
+        plan = self._make_plan(
+            files=[{"path": "src/module.py", "content": "value = 2\n"}],
+            branch_name="feature/test-plan",
+            commit_message="Update module",
+        )
+
+        def fake_run(command, *, cwd=None, env=None, check=True):
+            if command[:3] == ["git", "fetch", "origin"] and "refs/remotes/origin/feature/test-plan" in command[-1]:
+                return _completed()
+            if command[:3] == ["git", "rev-parse", "--verify"]:
+                return _completed()
+            if command[:2] == ["git", "checkout"]:
+                return _completed()
+            if command[:2] == ["git", "reset"] and command[-1] == "origin/feature/test-plan":
+                return _completed()
+            if command == ["git", "add", "-A"]:
+                return _completed()
+            if command == ["git", "diff", "--cached", "--quiet"]:
+                return _completed(returncode=1)
+            if command[:2] == ["git", "commit"]:
+                return _completed()
+            if command == ["git", "fetch", "origin", "develop"]:
+                return _completed()
+            if command[:7] == ["git", "-c", "user.name=github-pm-agent", "-c", "user.email=github-pm-agent@local", "merge", "--no-edit"]:
+                return _completed(returncode=1, stderr="CONFLICT (content): Merge conflict in src/conflicted.ts")
+            if command == ["git", "status", "--short"]:
+                return _completed(stdout="UU src/conflicted.ts\n")
+            if command == ["git", "diff", "--name-only", "--diff-filter=U"]:
+                return _completed(stdout="src/conflicted.ts\n")
+            if command == ["git", "merge", "--abort"]:
+                return _completed()
+            raise AssertionError(f"unexpected command: {command!r}")
+
+        with patch.object(session, "_run_command", side_effect=fake_run):
+            with self.assertRaisesRegex(BranchSyncError, "origin/develop"):
+                session.fix_and_push(plan)
+
+    def test_resolve_merge_conflict_commits_resolution_without_pushing(self) -> None:
+        session, _client = self._make_session()
+        (session.work_dir / "src").mkdir(parents=True, exist_ok=True)
+        (session.work_dir / "src/conflicted.ts").write_text(
+            "<<<<<<< HEAD\nbranch\n=======\nmain\n>>>>>>> origin/main\n",
+            encoding="utf-8",
+        )
+        plan = self._make_plan(
+            files=[{"path": "src/conflicted.ts", "content": "resolved\n"}],
+            branch_name="feature/test-plan",
+            commit_message="Resolve merge conflict",
+        )
+        commands: list[list[str]] = []
+
+        def fake_run(command, *, cwd=None, env=None, check=True):
+            commands.append(command)
+            if command[:3] == ["git", "fetch", "origin"] and "refs/remotes/origin/feature/test-plan" in command[-1]:
+                return _completed()
+            if command[:3] == ["git", "rev-parse", "--verify"]:
+                return _completed()
+            if command[:2] == ["git", "checkout"]:
+                return _completed()
+            if command[:2] == ["git", "reset"] and command[-1] == "origin/feature/test-plan":
+                return _completed()
+            if command == ["git", "fetch", "origin", "main"]:
+                return _completed()
+            if command[:8] == ["git", "-c", "user.name=github-pm-agent", "-c", "user.email=github-pm-agent@local", "merge", "--no-commit", "--no-ff"]:
+                return _completed(returncode=1, stderr="CONFLICT (content): Merge conflict in src/conflicted.ts")
+            if command == ["git", "add", "-A"]:
+                return _completed()
+            if command == ["git", "diff", "--name-only", "--diff-filter=U"]:
+                return _completed(stdout="")
+            if command == ["git", "diff", "--cached", "--quiet"]:
+                return _completed(returncode=1)
+            if command[:2] == ["git", "commit"]:
+                return _completed()
+            raise AssertionError(f"unexpected command: {command!r}")
+
+        with patch.object(session, "_run_command", side_effect=fake_run):
+            session.resolve_merge_conflict(plan)
+
+        self.assertFalse(any(command[:3] == ["git", "push", "origin"] for command in commands))
+        self.assertEqual((session.work_dir / "src/conflicted.ts").read_text(encoding="utf-8"), "resolved\n")
 
 
 if __name__ == "__main__":

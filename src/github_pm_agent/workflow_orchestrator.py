@@ -483,6 +483,15 @@ class WorkflowOrchestrator:
                         "terminated_reason": instance.get_terminated_reason(),
                         "escalation_refs": [],
                     }
+                if ai_cwd and current_phase == "merge_conflict_resolution":
+                    github_token = self._get_worker_github_token(executors) or self._get_default_github_token()
+                    variables.update(
+                        self._collect_merge_conflict_prompt_context(
+                            ai_cwd,
+                            default_branch=self.config.get("github", {}).get("default_branch", "main"),
+                            github_token=github_token,
+                        )
+                    )
 
             for executor in executors:
                 exec_vars = {**variables, **executor["extra_vars"]}
@@ -633,6 +642,7 @@ class WorkflowOrchestrator:
                         issue_number=event.target_number,
                         github_token=github_token,
                         base_image=base_image,
+                        base_branch=self.config.get("github", {}).get("default_branch", "main"),
                     )
                     session.iteration = max(previous_iteration + 1, 1)
 
@@ -801,6 +811,25 @@ class WorkflowOrchestrator:
                 elif review_summary["blocking_count"] == 0:
                     # LGTM or warnings only → approve PR, advance to pm_decision
                     if _pr_num:
+                        pr_state = self._load_pull_request_state(event.repo, _pr_num)
+                        if self._pull_request_has_merge_conflict(pr_state):
+                            conflict_reason = (
+                                f"PR #{_pr_num} no longer merges cleanly against "
+                                f"`{self.config.get('github', {}).get('default_branch', 'main')}`. "
+                                "Resolve the branch conflict before opening the final merge gate."
+                            )
+                            self.actions.comment("issue", event.target_number, conflict_reason)
+                            self._requeue_issue_coding_phase(
+                                instance,
+                                event,
+                                phase="merge_conflict_resolution",
+                                reason="review_conflict_detected",
+                                human_comment=conflict_reason,
+                                response_type="merge_conflict",
+                            )
+                            step_succeeded = True
+                            break
+                    if _pr_num:
                         try:
                             self.actions.submit_pr_review(
                                 _pr_num, "APPROVE",
@@ -855,7 +884,7 @@ class WorkflowOrchestrator:
                 break  # always stop current loop; re-queue handles continuation
             elif step.get("action") == "fix_coding_session":
                 try:
-                    from github_pm_agent.coding_session import CodingSession
+                    from github_pm_agent.coding_session import BranchSyncError, CodingSession
                     from github_pm_agent.devenv_client import DevEnvClient
 
                     plan = CodingSession.parse_plan(last_content)
@@ -879,15 +908,25 @@ class WorkflowOrchestrator:
                         issue_number=event.target_number,
                         github_token=github_token,
                         base_image=base_image,
+                        base_branch=self.config.get("github", {}).get("default_branch", "main"),
                     )
 
                     error_message = ""
+                    requeue_conflict_message = ""
                     original_event = instance.get_original_event() or event.to_dict()
 
                     try:
                         session.setup()
-                        session.fix_and_push(plan)
+                        if current_phase == "merge_conflict_resolution":
+                            session.resolve_merge_conflict(
+                                plan,
+                                base_branch=self.config.get("github", {}).get("default_branch", "main"),
+                            )
+                        else:
+                            session.fix_and_push(plan)
                         test_result = session.run_tests(plan)
+                        if test_result.passed and current_phase == "merge_conflict_resolution":
+                            session.push_existing_branch(plan.branch_name)
                         import json as _json
                         instance.set_artifact("test_result", _json.dumps({
                             "passed": test_result.passed,
@@ -918,6 +957,8 @@ class WorkflowOrchestrator:
                                 f"{test_result.summary}"
                             )
                             instance.set_terminated(f"Fix tests failed at round {fix_round}")
+                    except BranchSyncError as exc:
+                        requeue_conflict_message = str(exc)
                     except Exception as exc:  # noqa: BLE001
                         error_message = str(exc)
                     finally:
@@ -928,6 +969,31 @@ class WorkflowOrchestrator:
                                 error_message = f"{error_message}; cleanup: {cleanup_exc}"
                             else:
                                 error_message = f"cleanup: {cleanup_exc}"
+
+                    if requeue_conflict_message:
+                        if current_phase == "merge_conflict_resolution":
+                            self.actions.comment(
+                                "issue",
+                                event.target_number,
+                                f"Merge conflict resolution failed.\n\n{requeue_conflict_message}",
+                            )
+                            instance.set_terminated(f"Merge conflict resolution failed: {requeue_conflict_message[:160]}")
+                        else:
+                            self.actions.comment(
+                                "issue",
+                                event.target_number,
+                                f"Branch sync failed after the fix attempt.\n\n{requeue_conflict_message}",
+                            )
+                            self._requeue_issue_coding_phase(
+                                instance,
+                                event,
+                                phase="merge_conflict_resolution",
+                                reason="fix_rebase_conflict",
+                                human_comment=requeue_conflict_message,
+                                response_type="merge_conflict",
+                            )
+                            step_succeeded = True
+                        break
 
                     if error_message:
                         self.actions.comment(
@@ -982,9 +1048,10 @@ class WorkflowOrchestrator:
                     if decision == "merge":
                         pr_state = self._load_pull_request_state(event.repo, pr_number)
                         if self._pull_request_has_merge_conflict(pr_state):
+                            default_branch = self.config.get("github", {}).get("default_branch", "main")
                             conflict_reason = (
-                                f"PR #{pr_number} no longer merges cleanly against `{self.config.get('github', {}).get('default_branch', 'main')}`. "
-                                "Rebase or update the branch on the latest main, resolve conflicts, rerun tests, and send it back through review."
+                                f"PR #{pr_number} no longer merges cleanly against `{default_branch}`. "
+                                f"Update the branch on the latest `{default_branch}`, resolve conflicts, rerun tests, and send it back through review."
                             )
                             self.actions.comment("issue", issue_number, conflict_reason)
                             if pending:
@@ -1012,9 +1079,10 @@ class WorkflowOrchestrator:
                         if decision == "merge":
                             pr_state = self._load_pull_request_state(event.repo, pr_number)
                             if self._pull_request_has_merge_conflict(pr_state):
+                                default_branch = self.config.get("github", {}).get("default_branch", "main")
                                 conflict_reason = (
-                                    f"Merge of PR #{pr_number} failed because the branch is out of date with `{self.config.get('github', {}).get('default_branch', 'main')}`. "
-                                    "Rebase or update the branch, resolve conflicts, rerun tests, and return to review."
+                                    f"Merge of PR #{pr_number} failed because the branch is out of date with `{default_branch}`. "
+                                    f"Update the branch, resolve conflicts, rerun tests, and return to review against `{default_branch}`."
                                 )
                                 self.actions.comment("issue", issue_number, conflict_reason)
                                 if pending:
@@ -1389,6 +1457,18 @@ class WorkflowOrchestrator:
             should_record_comment = False
         elif owner_login:
             should_record_comment = actor_login == owner_login
+        if should_record_comment and (
+            instance.is_awaiting_clarification()
+            or instance.get_gate_next_phase()
+            or instance.get_discussion_gate_node_id()
+            or instance.get_gate_issue_number()
+        ):
+            return {
+                "recorded": False,
+                "discussion_number": discussion_number,
+                "reason": "handled_by_gate_scanner",
+                "escalation_refs": [],
+            }
         if should_record_comment:
             instance.add_pending_comment(event.body)
         return {"recorded": True, "discussion_number": discussion_number, "escalation_refs": []}
@@ -1551,7 +1631,7 @@ class WorkflowOrchestrator:
 
         try:
             clone_result = subprocess.run(
-                ["git", "clone", "--depth", "1", clone_url, str(context_dir)],
+                ["git", "clone", clone_url, str(context_dir)],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -1605,9 +1685,149 @@ class WorkflowOrchestrator:
 
         return context_dir
 
+    def _collect_merge_conflict_prompt_context(
+        self,
+        context_dir: Path,
+        *,
+        default_branch: str,
+        github_token: str,
+    ) -> Dict[str, str]:
+        git_env = git_auth_env(github_token)
+        base_ref = f"origin/{default_branch}"
+        fetch_result = subprocess.run(
+            ["git", "fetch", "origin", default_branch],
+            cwd=str(context_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+            env=git_env,
+        )
+        if fetch_result.returncode != 0:
+            details = fetch_result.stderr.strip() or fetch_result.stdout.strip() or "no output"
+            return {
+                "merge_conflict_details": (
+                    f"Failed to refresh `{base_ref}` before probing merge conflicts: {details}"
+                ),
+                "merge_conflict_files": "",
+            }
+
+        merge_result = subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=github-pm-agent",
+                "-c",
+                "user.email=github-pm-agent@local",
+                "merge",
+                "--no-commit",
+                "--no-ff",
+                base_ref,
+            ],
+            cwd=str(context_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        status_result = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=str(context_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        unmerged_result = subprocess.run(
+            ["git", "diff", "--name-only", "--diff-filter=U"],
+            cwd=str(context_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        unmerged_files = [line.strip() for line in unmerged_result.stdout.splitlines() if line.strip()]
+        status_text = status_result.stdout.strip()
+
+        snippets = self._conflict_file_snippets(context_dir, unmerged_files)
+        summary_lines = [
+            f"Local merge replay against `{base_ref}` returned exit code {merge_result.returncode}.",
+        ]
+        first_line = (
+            self._first_nonempty_line(merge_result.stderr)
+            or self._first_nonempty_line(merge_result.stdout)
+        )
+        if first_line:
+            summary_lines.append(first_line)
+        if unmerged_files:
+            summary_lines.append("Conflicted files:\n" + "\n".join(f"- `{path}`" for path in unmerged_files[:8]))
+        else:
+            summary_lines.append("Git did not report unmerged files after the local replay.")
+        if status_text:
+            summary_lines.append("Git status after replay:\n" + status_text[:1200])
+        if snippets:
+            summary_lines.append("Conflict excerpts:\n" + "\n\n".join(snippets))
+
+        self._cleanup_merge_probe(context_dir)
+        return {
+            "merge_conflict_details": "\n\n".join(summary_lines)[:6000],
+            "merge_conflict_files": "\n".join(f"- `{path}`" for path in unmerged_files[:8]),
+        }
+
     @staticmethod
     def _remote_branch_refspec(branch_name: str) -> str:
         return f"{branch_name}:refs/remotes/origin/{branch_name}"
+
+    @staticmethod
+    def _first_nonempty_line(text: str) -> str:
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped:
+                return stripped
+        return ""
+
+    def _conflict_file_snippets(
+        self,
+        context_dir: Path,
+        paths: List[str],
+        *,
+        max_files: int = 3,
+        context_lines: int = 3,
+    ) -> List[str]:
+        snippets: List[str] = []
+        for relative_path in paths[:max_files]:
+            file_path = (context_dir / relative_path).resolve()
+            try:
+                file_path.relative_to(context_dir.resolve())
+                content = file_path.read_text(encoding="utf-8")
+            except (OSError, ValueError):
+                continue
+            lines = content.splitlines()
+            for index, line in enumerate(lines):
+                if not line.startswith("<<<<<<<"):
+                    continue
+                start = max(index - context_lines, 0)
+                end = min(index + context_lines + 8, len(lines))
+                excerpt = "\n".join(
+                    f"{line_no + 1}: {lines[line_no]}"
+                    for line_no in range(start, end)
+                )
+                snippets.append(f"`{relative_path}`\n```text\n{excerpt}\n```")
+                break
+        return snippets
+
+    @staticmethod
+    def _cleanup_merge_probe(context_dir: Path) -> None:
+        subprocess.run(
+            ["git", "merge", "--abort"],
+            cwd=str(context_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        subprocess.run(
+            ["git", "reset", "--hard", "HEAD"],
+            cwd=str(context_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
     def _collect_blocking_unknowns(self, ai_outputs: List[Dict[str, Any]], phase: str) -> List[str]:
         """Extract blocking_unknowns from worker outputs in the given phase.

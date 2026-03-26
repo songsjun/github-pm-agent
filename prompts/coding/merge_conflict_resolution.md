@@ -4,6 +4,10 @@ You are resolving a merge conflict in pull request #$pr_number for GitHub issue 
 
 $human_comment
 
+## Deterministic merge-conflict probe
+
+$merge_conflict_details
+
 ## Current PR diff
 
 ```diff

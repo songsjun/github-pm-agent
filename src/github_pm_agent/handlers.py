@@ -105,7 +105,7 @@ def resolve_handler(engine: "EventEngine", event: Event) -> Tuple[str, HandlerFn
 
 
 def handle_mention(engine: "EventEngine", event: Event) -> Dict:
-    return engine.run_ai_handler(
+    return engine.run_raw_text_handler(
         event,
         prompt_path="prompts/actions/mention_response.md",
     )

@@ -558,6 +558,60 @@ def test_record_discussion_comment_no_active_workflow() -> None:
         assert result.get("reason") == "no_active_workflow"
 
 
+def test_record_discussion_comment_skips_owner_gate_reply() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        instance.set_phase("problem_synthesis")
+        instance.set_discussion_gate("node-discussion-1", "2026-03-20T00:00:00Z", "brainstorm_perspectives")
+
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(
+            _project_root(),
+            engine,
+            actions,
+            FakeClient({}),
+            {"github": {"owner": "alice"}},
+        )
+
+        result = orchestrator.process(_discussion_comment_event(actor="alice", body="approve"))
+
+        assert result["recorded"] is False
+        assert result["reason"] == "handled_by_gate_scanner"
+
+        reloaded = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        assert reloaded.get_pending_comments() == []
+
+
+def test_record_discussion_comment_skips_owner_clarification_reply() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        instance.set_phase("problem_framing")
+        instance.set_clarification("problem_framing", "2026-03-20T00:00:00Z")
+
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(
+            _project_root(),
+            engine,
+            actions,
+            FakeClient({}),
+            {"github": {"owner": "alice"}},
+        )
+
+        result = orchestrator.process(_discussion_comment_event(actor="alice", body="Here is the answer."))
+
+        assert result["recorded"] is False
+        assert result["reason"] == "handled_by_gate_scanner"
+
+        reloaded = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        assert reloaded.get_pending_comments() == []
+
+
 def test_completion_summary_posted_to_discussion() -> None:
     """After issue_breakdown completes, a completion summary must be posted to the original Discussion."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1295,6 +1349,52 @@ def test_issue_coding_combined_lgtm_reviews_are_accepted() -> None:
         assert final_instance.is_terminated() is False
 
 
+def test_issue_coding_clean_review_with_conflicting_pr_requeues_merge_conflict_resolution() -> None:
+    from github_pm_agent.queue_store import QueueStore
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        store = QueueStore(runtime_dir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_phase("code_review")
+        instance.set_artifact(
+            "code_review_combined",
+            "\n\n---\n\n".join(
+                [
+                    "### worker1_slot1\n\nLGTM — no issues found.",
+                    "### worker2_slot2\n\nLGTM — no issues found.",
+                ]
+            ),
+        )
+        instance.set_artifact("code_review", "LGTM — no issues found.")
+        instance.set_artifact("pr_number", "17")
+        instance.set_original_event(_issue_coding_event().to_dict())
+
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        client = FakeClient(
+            {
+                "repos/songsjun/example/pulls/17": {
+                    "mergeable": False,
+                    "mergeable_state": "dirty",
+                }
+            }
+        )
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, client, {})
+
+        orchestrator.process(_issue_coding_event())
+
+        assert actions.submit_pr_review_calls == []
+        assert any(
+            "Resolve the branch conflict before opening the final merge gate." in call["message"]
+            for call in actions.comment_calls
+        )
+        resumed = store.pop()
+        assert resumed is not None
+        assert resumed.metadata["advance_to_phase"] == "merge_conflict_resolution"
+        assert resumed.metadata["gate_response_type"] == "merge_conflict"
+
+
 def test_issue_coding_context_prep_failure_terminates_workflow() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         runtime_dir = Path(tmpdir)
@@ -1348,8 +1448,6 @@ def test_prepare_phase_ai_cwd_clones_with_auth_env_without_token_in_url() -> Non
         assert clone_call["command"] == [
             "git",
             "clone",
-            "--depth",
-            "1",
             "https://github.com/songsjun/example.git",
             str(ai_cwd),
         ]
@@ -1364,6 +1462,69 @@ def test_prepare_phase_ai_cwd_clones_with_auth_env_without_token_in_url() -> Non
             "origin",
             "ai/issue-2-place-search-parser:refs/remotes/origin/ai/issue-2-place-search-parser",
         ]
+
+
+def test_merge_conflict_resolution_prompt_receives_deterministic_conflict_context() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_phase("merge_conflict_resolution")
+        instance.set_artifact("branch_name", "ai/issue-42")
+        instance.set_artifact("pr_number", "17")
+        instance.set_original_event(_issue_coding_event(advance_to_phase="merge_conflict_resolution").to_dict())
+
+        captured: dict[str, Any] = {}
+
+        class FakeEngineMergeConflict(FakeEngine):
+            def run_raw_text_handler(
+                self,
+                event: Any,
+                prompt_path: str,
+                role: str = "pm",
+                variables: Optional[Dict[str, Any]] = None,
+                cwd: Optional[str] = None,
+            ) -> Dict[str, Any]:
+                captured["prompt_path"] = prompt_path
+                captured["variables"] = dict(variables or {})
+                captured["cwd"] = cwd
+                return {"raw_text": _valid_coding_plan_json()}
+
+        actions = RecordingActions()
+        engine = FakeEngineMergeConflict(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        with tempfile.TemporaryDirectory() as context_tmpdir:
+            context_dir = Path(context_tmpdir)
+            with (
+                patch.object(WorkflowOrchestrator, "_prepare_phase_ai_cwd", return_value=context_dir),
+                patch.object(
+                    WorkflowOrchestrator,
+                    "_collect_merge_conflict_prompt_context",
+                    return_value={
+                        "merge_conflict_details": "Conflicted files:\n- `jest.config.cjs`",
+                        "merge_conflict_files": "- `jest.config.cjs`",
+                    },
+                ),
+                patch("github_pm_agent.coding_session.CodingSession.setup", return_value=None),
+                patch("github_pm_agent.coding_session.CodingSession.resolve_merge_conflict", return_value=None),
+                patch(
+                    "github_pm_agent.coding_session.CodingSession.run_tests",
+                    return_value=CodingTestResult(
+                        passed=True,
+                        exit_code=0,
+                        stdout="ok",
+                        stderr="",
+                        summary="Tests PASSED (exit code 0).",
+                    ),
+                ),
+                patch("github_pm_agent.coding_session.CodingSession.push_existing_branch", return_value=None),
+                patch("github_pm_agent.coding_session.CodingSession.cleanup", return_value=None),
+            ):
+                orchestrator.process(_issue_coding_event(advance_to_phase="merge_conflict_resolution"))
+
+        assert captured["prompt_path"] == "prompts/coding/merge_conflict_resolution.md"
+        assert captured["variables"]["merge_conflict_details"] == "Conflicted files:\n- `jest.config.cjs`"
+        assert captured["variables"]["merge_conflict_files"] == "- `jest.config.cjs`"
 
 
 def test_issue_coding_blocking_reviews_requeue_fix_iteration_with_new_event_id() -> None:

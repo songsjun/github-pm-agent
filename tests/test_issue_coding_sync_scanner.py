@@ -22,8 +22,12 @@ class RecordingActions:
 class FakeClient:
     def __init__(self, responses: Dict[str, Any]) -> None:
         self.responses = responses
+        self.calls: List[Dict[str, Any]] = []
 
     def api(self, path: str, params: Any = None, method: str = "GET") -> Any:
+        self.calls.append({"path": path, "params": params, "method": method})
+        if method == "PATCH" and isinstance(params, dict):
+            self.responses[path] = {**dict(self.responses.get(path, {})), **params}
         return self.responses.get(path, {})
 
 
@@ -112,3 +116,99 @@ def test_issue_coding_sync_scanner_ignores_open_pr() -> None:
         reloaded = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
         assert reloaded.is_completed() is False
         assert actions.remove_label_calls == []
+
+
+def test_issue_coding_sync_scanner_closes_open_pr_after_workflow_failure() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        queue = QueueStore(runtime_dir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_workflow_type("issue_coding")
+        instance.set_phase("fix_iteration")
+        instance.set_original_event(_issue_coding_event_dict())
+        instance.set_artifact("pr_number", "17")
+        instance.set_terminated("Fix tests failed at round 0")
+
+        actions = RecordingActions()
+        client = FakeClient(
+            {
+                "repos/songsjun/example/pulls/17": {
+                    "state": "open",
+                    "merged_at": None,
+                }
+            }
+        )
+        scanner = IssueCodingSyncScanner(queue, client, actions)
+
+        results = scanner.scan_and_sync()
+
+        assert results == [
+            {
+                "repo": "songsjun/example",
+                "issue_number": 42,
+                "pr_number": 17,
+                "phase": "fix_iteration",
+                "synced_state": "closed_open_pr_after_workflow_failure",
+            }
+        ]
+        assert any(
+            call["method"] == "PATCH"
+            and call["path"] == "repos/songsjun/example/pulls/17"
+            and call["params"] == {"state": "closed"}
+            for call in client.calls
+        )
+        assert actions.remove_label_calls == [{"number": 42, "labels": ["ready-to-code"]}]
+
+
+def test_issue_coding_sync_scanner_keeps_pr_open_for_gate_limit_termination() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        queue = QueueStore(runtime_dir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_workflow_type("issue_coding")
+        instance.set_phase("pm_decision")
+        instance.set_original_event(_issue_coding_event_dict())
+        instance.set_artifact("pr_number", "17")
+        instance.set_terminated("Phase `pm_decision` exceeded the automatic gate limit (3 attempt(s)).")
+
+        actions = RecordingActions()
+        client = FakeClient(
+            {
+                "repos/songsjun/example/pulls/17": {
+                    "state": "open",
+                    "merged_at": None,
+                }
+            }
+        )
+        scanner = IssueCodingSyncScanner(queue, client, actions)
+
+        assert scanner.scan_and_sync() == []
+        assert actions.remove_label_calls == []
+        assert not any(call["method"] == "PATCH" for call in client.calls)
+
+
+def test_issue_coding_sync_scanner_keeps_pr_open_for_manual_review_handoff() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        queue = QueueStore(runtime_dir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_workflow_type("issue_coding")
+        instance.set_phase("code_review")
+        instance.set_original_event(_issue_coding_event_dict())
+        instance.set_artifact("pr_number", "17")
+        instance.set_terminated("Code review output was not machine-verifiable")
+
+        actions = RecordingActions()
+        client = FakeClient(
+            {
+                "repos/songsjun/example/pulls/17": {
+                    "state": "open",
+                    "merged_at": None,
+                }
+            }
+        )
+        scanner = IssueCodingSyncScanner(queue, client, actions)
+
+        assert scanner.scan_and_sync() == []
+        assert actions.remove_label_calls == []
+        assert not any(call["method"] == "PATCH" for call in client.calls)
