@@ -23,8 +23,10 @@ $artifact_test_result
 Update the existing PR branch so it merges cleanly with the latest base branch while preserving the intended feature behavior. If the branch is out of date with the base branch, incorporate the required base-branch changes into the conflicting files and resolve the conflict deterministically.
 
 Requirements:
+- Prefer the smallest possible change set. Only edit files that are actually needed to resolve the merge conflict or keep tests passing.
 - Keep the original branch name from `$artifact_implement`.
 - Preserve existing issue scope. Do not add unrelated changes.
+- Preserve the existing project setup. Do not rewrite `package.json`, `tsconfig.json`, `jest.config.*`, lockfiles, or other build/test configuration files unless they are themselves part of the conflict or the current branch is already broken because of them.
 - If previous review warnings/blockers exist, do not regress them.
 - Return FULL file contents for every changed file.
 - The result must make the PR merge cleanly and keep tests passing.
