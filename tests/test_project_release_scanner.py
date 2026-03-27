@@ -184,6 +184,68 @@ class ProjectReleaseScannerTest(unittest.TestCase):
             self.assertEqual(client.created_issues[0]["labels"], ["ready-to-code"])
             self.assertIsNone(queue.pop())
 
+    def test_skips_release_when_standalone_app_is_not_runnable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_dir = Path(tmpdir)
+            queue = QueueStore(runtime_dir)
+
+            discussion = WorkflowInstance.load(runtime_dir, "acme/widgets", 1)
+            discussion.set_workflow_type("discussion")
+            discussion.set_artifact(
+                "project_context_contract",
+                '{"delivery_type":"standalone_website","requires_runnable_app":true,"required_capabilities":["local_run"]}',
+            )
+            discussion.set_completed()
+
+            issue = WorkflowInstance.load(runtime_dir, "acme/widgets", 3)
+            issue.set_workflow_type("issue_coding")
+            issue.set_completed()
+
+            client = FakeClient(
+                {
+                    "repos/acme/widgets/issues": [],
+                    ("repos/acme/widgets/pulls", "open"): [],
+                    ("repos/acme/widgets/pulls", "closed"): [
+                        {
+                            "number": 12,
+                            "title": "feat: ship widget",
+                            "merged_at": "2026-03-26T10:00:00Z",
+                            "updated_at": "2026-03-26T10:00:00Z",
+                        }
+                    ],
+                    "repos/acme/widgets/releases": [],
+                    "repos/acme/widgets/readme": self._readme_payload(
+                        "# Demo\n\n## Overview\nProject overview.\n\n## Install\nInstall steps.\n\n## Run\nRun steps.\n\n## Deployment\nDeploy steps.\n"
+                    ),
+                    "repos/acme/widgets/contents/package.json": self._readme_payload(
+                        '{"name":"widgets","scripts":{"test":"jest"}}'
+                    ),
+                }
+            )
+
+            scanner = ProjectReleaseScanner(
+                queue,
+                {"acme/widgets": client},
+                {"github": {"default_branch": "main"}},
+            )
+
+            result = scanner.scan_and_enqueue()
+
+            self.assertEqual(
+                result,
+                [
+                    {
+                        "repo": "acme/widgets",
+                        "blocked_reason": "missing_runnable_app_files",
+                        "missing_files": ["index.html", "src/main.* or src/index.*", "src/App.*"],
+                        "missing_scripts": ["dev/build/start"],
+                        "created_issue_number": 901,
+                    }
+                ],
+            )
+            self.assertEqual(client.created_issues[0]["title"], ProjectReleaseScanner.RUNNABLE_APP_ISSUE_TITLE)
+            self.assertIsNone(queue.pop())
+
 
 if __name__ == "__main__":
     unittest.main()

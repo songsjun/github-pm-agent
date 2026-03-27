@@ -14,6 +14,10 @@ $pr_diff
 
 $artifact_implement
 
+## Project-level context pack
+
+$project_context_pack
+
 ## Test failure context (if tests failed after a previous fix)
 
 $test_failure_context
@@ -58,6 +62,7 @@ Return a single JSON block in ```json ... ``` with this exact schema:
 ```
 
 Requirements:
+- Preserve the product intent and delivery contract from the project-level context pack. Do not "fix" the current issue in a way that narrows the promised product.
 - Provide FULL file content for every changed file, not diffs.
 - If a file must be removed to make the tests pass or to resolve the review finding, list it in `delete_files`.
 - The fix must make all tests pass.

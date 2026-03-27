@@ -12,6 +12,7 @@ $pending_comments
 
 **SCOPE CALIBRATION — do this first, silently:**
 Read the PRD's "Scope" section. Design for that scope, not a larger one.
+Also read the PRD's "Delivery contract" section. Preserve the promised deliverable shape. Do not turn a website into a library, a product into a prototype-only module set, or a runnable app into non-runnable components.
 
 Right-sizing rules:
 - Single-user / personal tool: prefer SQLite over PostgreSQL, local file storage over S3/Redis, single process over microservices, static hosting over Kubernetes

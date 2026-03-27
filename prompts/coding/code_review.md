@@ -3,6 +3,9 @@ You are reviewing pull request #$pr_number for GitHub issue "$issue_title" (revi
 Issue body:
 $issue_body
 
+Project-level context pack:
+$project_context_pack
+
 Review slot: $slot_number of $total_slots
 
 PR diff:
@@ -32,4 +35,5 @@ Rules:
 - Do not label a finding as blocking unless it would fail the stated issue behavior, break existing behavior, or make the tests unreliable.
 - Treat acceptance-test snippets in the issue body as behavioral examples. If the repo already uses Jest/Vitest/node:test, do not require converting tests to a different harness just because the issue description used a different snippet style.
 - Do not raise a blocking finding solely because a test uses `describe`/`it` instead of top-level assertions when the configured project test runner supports that style and the behavior under test is still covered.
+- If the diff satisfies the narrow issue but regresses or silently narrows an explicit requirement preserved in the project-level context pack, that is a blocking issue.
 - Do not add any text before, after, or between findings outside the required format.

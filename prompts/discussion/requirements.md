@@ -38,6 +38,11 @@ Write a PRD using this template:
 **Scope**
 Target users and deployment context. (1 sentence — this anchors everything)
 
+**Delivery contract**
+- Deliverable type: standalone website | library | API | internal tool
+- Runnable outcome: what a user can actually run/use at the end
+- Non-degradation rule: explicit requirements in this PRD cannot be deferred or downgraded later unless proven impossible under stated constraints
+
 **Problem statement**
 What pain does this solve for those users? (1 paragraph)
 

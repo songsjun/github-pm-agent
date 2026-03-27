@@ -18,6 +18,10 @@ $pr_diff
 
 $artifact_implement
 
+## Project-level context pack
+
+$project_context_pack
+
 ## Latest test result
 
 $artifact_test_result
@@ -28,6 +32,7 @@ Update the existing PR branch so it merges cleanly with the latest base branch w
 
 Requirements:
 - Prefer the smallest possible change set. Only edit files that are actually needed to resolve the merge conflict or keep tests passing.
+- Preserve the higher-level product contract from the project-level context pack while resolving the conflict.
 - Keep the original branch name from `$artifact_implement`.
 - Preserve existing issue scope. Do not add unrelated changes.
 - Preserve the existing project setup. Do not rewrite `package.json`, `tsconfig.json`, `jest.config.*`, lockfiles, or other build/test configuration files unless they are themselves part of the conflict or the current branch is already broken because of them.

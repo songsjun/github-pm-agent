@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import re
 from typing import Any, Dict, List, Optional
 
@@ -13,6 +14,7 @@ from github_pm_agent.workflow_instance import WorkflowInstance
 class ProjectReleaseScanner:
     """Enqueue a deterministic release event once a managed project run is fully complete."""
     README_ISSUE_TITLE = "Write release README"
+    RUNNABLE_APP_ISSUE_TITLE = "Finish runnable app shell"
 
     REQUIRED_README_SECTIONS = {
         "overview": (
@@ -81,12 +83,14 @@ class ProjectReleaseScanner:
         client: Any,
     ) -> tuple[Optional[Event], Optional[Dict[str, Any]]]:
         discussion_complete = False
+        discussion_instances: List[WorkflowInstance] = []
         issue_coding_instances: List[WorkflowInstance] = []
         for state_path in repo_dir.glob("*/state.json"):
             instance = WorkflowInstance(state_path)
             workflow_type = instance.get_workflow_type()
             if workflow_type == "discussion" and instance.is_completed():
                 discussion_complete = True
+                discussion_instances.append(instance)
             elif workflow_type == "issue_coding":
                 issue_coding_instances.append(instance)
 
@@ -119,6 +123,17 @@ class ProjectReleaseScanner:
                 "repo": repo,
                 "blocked_reason": docs_status["reason"],
                 "missing_sections": docs_status.get("missing_sections", []),
+                "created_issue_number": issue_number,
+            }
+
+        runnable_status = self._runnable_app_release_status(client, repo, discussion_instances)
+        if runnable_status is not None:
+            issue_number = self._ensure_runnable_app_issue(client, repo, runnable_status, unreleased_prs)
+            return None, {
+                "repo": repo,
+                "blocked_reason": runnable_status["reason"],
+                "missing_files": runnable_status.get("missing_files", []),
+                "missing_scripts": runnable_status.get("missing_scripts", []),
                 "created_issue_number": issue_number,
             }
 
@@ -222,6 +237,59 @@ class ProjectReleaseScanner:
                 return result.get("number")
         return None
 
+    def _ensure_runnable_app_issue(
+        self,
+        client: Any,
+        repo: str,
+        runnable_status: Dict[str, Any],
+        unreleased_prs: List[Dict[str, Any]],
+    ) -> Optional[int]:
+        open_issues = self._open_business_issues(client, repo)
+        for issue in open_issues:
+            if str(issue.get("title") or "").strip() == self.RUNNABLE_APP_ISSUE_TITLE:
+                return int(issue.get("number")) if issue.get("number") is not None else None
+
+        missing_files = runnable_status.get("missing_files", [])
+        missing_scripts = runnable_status.get("missing_scripts", [])
+        pr_lines = "\n".join(
+            f"- #{pr.get('number')} {str(pr.get('title') or '').strip() or 'Untitled PR'}"
+            for pr in unreleased_prs
+        )
+        body = (
+            "## What to change\n"
+            "Finish the repository so the promised standalone app is actually runnable before release.\n\n"
+            "## Missing runtime pieces\n"
+            f"- Missing files: {', '.join(missing_files) or '(none)'}\n"
+            f"- Missing scripts: {', '.join(missing_scripts) or '(none)'}\n\n"
+            "## Required outcome\n"
+            "- The repository must contain a real app entry/build path, not only reusable modules.\n"
+            "- `package.json` must expose a runnable local workflow (`dev`, `build`, or `start`).\n"
+            "- The repo must include frontend entry files such as `index.html` and `src/main.*` / `src/App.*`.\n\n"
+            "## Recent merged work\n"
+            f"{pr_lines}\n"
+        )
+
+        try:
+            if hasattr(client, "create_issue"):
+                issue = client.create_issue(self.RUNNABLE_APP_ISSUE_TITLE, body, ["ready-to-code"])
+            else:
+                issue = client.api(
+                    f"repos/{repo}/issues",
+                    {"title": self.RUNNABLE_APP_ISSUE_TITLE, "body": body, "labels[]": ["ready-to-code"]},
+                    method="POST",
+                )
+        except Exception:
+            return None
+
+        if isinstance(issue, dict):
+            number = issue.get("number")
+            if isinstance(number, int):
+                return number
+            result = issue.get("result")
+            if isinstance(result, dict) and isinstance(result.get("number"), int):
+                return result.get("number")
+        return None
+
     def _readme_text(self, client: Any, repo: str) -> str:
         try:
             payload = client.api(f"repos/{repo}/readme", method="GET")
@@ -237,6 +305,83 @@ class ProjectReleaseScanner:
             except Exception:
                 return ""
         return ""
+
+    def _repo_file_text(self, client: Any, repo: str, path: str) -> str:
+        try:
+            payload = client.api(f"repos/{repo}/contents/{path}", method="GET")
+        except Exception:
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        content = payload.get("content")
+        if isinstance(content, str) and content.strip():
+            try:
+                normalized = content.replace("\n", "")
+                return base64.b64decode(normalized).decode("utf-8", errors="replace")
+            except Exception:
+                return ""
+        return ""
+
+    def _discussion_contract(self, discussions: List[WorkflowInstance]) -> Dict[str, Any]:
+        for discussion in discussions:
+            contract_raw = str(discussion.get_artifacts().get("project_context_contract") or "").strip()
+            if not contract_raw:
+                continue
+            try:
+                payload = json.loads(contract_raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                return payload
+        return {}
+
+    def _runnable_app_release_status(
+        self,
+        client: Any,
+        repo: str,
+        discussions: List[WorkflowInstance],
+    ) -> Optional[Dict[str, Any]]:
+        contract = self._discussion_contract(discussions)
+        if not contract.get("requires_runnable_app"):
+            return None
+
+        package_text = self._repo_file_text(client, repo, "package.json")
+        if not package_text.strip():
+            return {"reason": "missing_runnable_app_files", "missing_files": ["package.json"], "missing_scripts": []}
+
+        try:
+            package_json = json.loads(package_text)
+        except json.JSONDecodeError:
+            return {"reason": "invalid_package_json", "missing_files": ["package.json"], "missing_scripts": ["package.json parse failed"]}
+
+        scripts = package_json.get("scripts") if isinstance(package_json, dict) else {}
+        if not isinstance(scripts, dict):
+            scripts = {}
+        missing_scripts: List[str] = []
+        if not any(str(scripts.get(name) or "").strip() for name in ("dev", "build", "start")):
+            missing_scripts.append("dev/build/start")
+
+        entry_candidates = (
+            "index.html",
+            "src/main.tsx",
+            "src/main.ts",
+            "src/index.tsx",
+            "src/index.ts",
+            "src/App.tsx",
+            "src/App.jsx",
+        )
+        has_entry = any(self._repo_file_text(client, repo, path).strip() for path in entry_candidates)
+        missing_files: List[str] = []
+        if not has_entry:
+            missing_files.extend(["index.html", "src/main.* or src/index.*", "src/App.*"])
+
+        if missing_files or missing_scripts:
+            return {
+                "reason": "missing_runnable_app_files",
+                "missing_files": missing_files,
+                "missing_scripts": missing_scripts,
+            }
+        return None
 
     def _has_required_section(self, readme_text: str, patterns: tuple[str, ...]) -> bool:
         for pattern in patterns:

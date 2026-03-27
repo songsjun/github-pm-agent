@@ -1,0 +1,5 @@
+{
+  "role": "critic",
+  "allowed": ["comment", "none"],
+  "forbidden": ["merge", "create_release", "state", "assign", "issue"]
+}

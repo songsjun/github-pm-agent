@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from github_pm_agent.coding_session import TestResult as CodingTestResult
 from github_pm_agent.models import Event
+from github_pm_agent.prompt_library import PromptLibrary
 from github_pm_agent.workflow_instance import WorkflowInstance
 from github_pm_agent.workflow_orchestrator import WorkflowOrchestrator
 
@@ -322,19 +323,27 @@ def _discussion_event(**metadata: Any) -> Event:
     )
 
 
-def test_phase_workflow_stops_at_tech_review_gate_after_design_evaluation() -> None:
-    """After tech_proposal completes, tech_review must evaluate first, then open a gate to issue_breakdown."""
+def test_discussion_autonomously_runs_through_design_resolution_and_issue_breakdown() -> None:
+    """After tech_review, autonomous discussion mode should continue through critic review and issue breakdown without owner gates."""
     with tempfile.TemporaryDirectory() as tmpdir:
         runtime_dir = Path(tmpdir)
 
-        # Pre-create instance at tech_proposal phase after the prior gate has already advanced.
         instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
         instance.set_phase("tech_proposal")
         instance.set_artifact("requirements", "some requirements text")
-        instance.add_pending_comment("Please include background jobs.")
 
         issue_json = '[{"title": "Task 1", "body": "desc", "labels": ["enhancement"]}]'
-        tech_review_json = '{"decision": "proceed", "docker_compatible": true, "final_design": "use FastAPI", "evaluation_summary": "good", "problem_coverage": []}'
+        tech_review_json = '{"decision": "proceed", "docker_compatible": true, "final_design": "original design", "evaluation_summary": "good", "problem_coverage": []}'
+        delivery_challenge_json = (
+            '{"decision":"revise","requirements_to_preserve":[{"requirement":"standalone website","evidence":"PRD"}],'
+            '"downgrade_findings":[{"requirement":"standalone website","problem":"design drift","evidence":"critic","required_change":"restore runnable app shell"}],'
+            '"implementability_blockers":[],"required_design_changes":["restore runnable app shell"]}'
+        )
+        design_resolution_json = (
+            '{"decision":"proceed","resolution_summary":"Restored standalone website delivery.",'
+            '"resolved_design":"resolved design with runnable app shell","preserved_requirements":["standalone website"],'
+            '"unresolved_blockers":[]}'
+        )
 
         class FakeEngineWithIssueBreakdown(FakeEngine):
             def run_raw_text_handler(self, event: Any, prompt_path: str, role: str = "pm", variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -343,6 +352,10 @@ def test_phase_workflow_stops_at_tech_review_gate_after_design_evaluation() -> N
                 )
                 if "issue_breakdown" in prompt_path:
                     return {"raw_text": issue_json}
+                if "delivery_challenge" in prompt_path:
+                    return {"raw_text": delivery_challenge_json}
+                if "design_resolution" in prompt_path:
+                    return {"raw_text": design_resolution_json}
                 if "tech_review" in prompt_path:
                     return {"raw_text": tech_review_json}
                 return {"raw_text": f"output for {role}"}
@@ -351,39 +364,24 @@ def test_phase_workflow_stops_at_tech_review_gate_after_design_evaluation() -> N
         engine = FakeEngineWithIssueBreakdown(actions, runtime_dir=runtime_dir)
         orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
 
-        result = orchestrator.process(_discussion_event(node_id="D_tech_review_gate"))
+        result = orchestrator.process(_discussion_event(node_id="D_autonomous"))
 
         phases_called = [c["prompt_path"] for c in engine.run_raw_text_handler_calls]
         assert any("tech_proposal" in p for p in phases_called)
         assert any("tech_review" in p for p in phases_called)
-        assert not any("issue_breakdown" in p for p in phases_called)
+        assert any("delivery_challenge" in p for p in phases_called)
+        assert any("design_resolution" in p for p in phases_called)
+        assert any("issue_breakdown" in p for p in phases_called)
 
-        assert actions.create_issue_calls == []
-        gate_comments = [
-            call for call in actions.comment_on_discussion_calls if "**Phase `tech_review` complete.**" in call["message"]
-        ]
-        assert len(gate_comments) == 1
-        gate_comment = gate_comments[0]
-        assert gate_comment["discussion_id"] == "D_tech_review_gate"
-        assert gate_comment["number"] == 5
-        assert "**Phase `tech_review` complete.**" in gate_comment["message"]
-        assert "use FastAPI" in gate_comment["message"]
-        gate = result.get("gate")
-        assert gate is not None
-        assert gate["gate_discussion_node_id"] == "D_tech_review_gate"
-        assert gate["next_phase"] == "assumption_check"
-        assert gate["gate_posted_at"]
-        assert result.get("created_issues", []) == []
+        assert len(actions.create_issue_calls) == 1
+        assert result.get("created_issues", []) != []
         assert result.get("issue_creation_error", "") == ""
 
         final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
-        assert final_instance.get_artifacts().get("final_design") == "use FastAPI"
+        assert final_instance.get_artifacts().get("final_design") == "resolved design with runnable app shell"
         assert final_instance.get_gate_issue_number() is None
-        assert final_instance.get_discussion_gate_node_id() == "D_tech_review_gate"
-        assert final_instance.get_gate_posted_at() == gate["gate_posted_at"]
-        assert final_instance.get_gate_next_phase() == "assumption_check"
         assert final_instance.get_pending_comments() == []
-        assert final_instance.is_completed() is False
+        assert final_instance.is_completed() is True
 
 
 def test_phase_workflow_output_per_role_uses_first_matching_agent_toolkit_by_role() -> None:
@@ -511,6 +509,45 @@ def test_create_issues_from_artifact_adds_ready_to_code_label() -> None:
     assert actions.create_issue_calls[0]["labels"] == ["frontend", "enhancement", "ready-to-code"]
 
 
+def test_create_issues_from_artifact_rejects_standalone_app_breakdown_without_app_invariants() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        instance.set_workflow_type("discussion")
+        instance.set_artifact(
+            "project_context_contract",
+            json.dumps(
+                {
+                    "delivery_type": "standalone_website",
+                    "requires_runnable_app": True,
+                    "required_capabilities": ["scope_switching", "list_map_toggle", "real_api_integration"],
+                }
+            ),
+        )
+
+        actions = RecordingActions()
+        engine = FakeEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        created, error = orchestrator._create_issues_from_artifact(
+            json.dumps(
+                [
+                    {
+                        "title": "Parse route state",
+                        "body": "## What to change\nAdd parser.\n\n## Location\n- File: `src/lib/urlState.ts`\n- Function: `parseRouteState()`\n\n## Current behavior\nmissing\n\n## Expected behavior\nworks\n\n## Acceptance test\n`ok`",
+                        "labels": ["frontend", "enhancement"],
+                    }
+                ]
+            ),
+            _discussion_event(),
+            instance,
+        )
+
+        assert created == []
+        assert "standalone app delivery contract" in error
+        assert actions.create_issue_calls == []
+
+
 def test_issue_breakdown_does_not_create_duplicate_issues_when_refs_exist() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         runtime_dir = Path(tmpdir)
@@ -542,6 +579,174 @@ def test_issue_breakdown_does_not_create_duplicate_issues_when_refs_exist() -> N
         assert actions.create_issue_calls == []
         final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
         assert final_instance.is_completed() is True
+
+
+def test_issue_coding_loads_project_context_pack_from_originating_discussion() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+
+        discussion = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        discussion.set_workflow_type("discussion")
+        discussion.set_original_event(
+            _discussion_event(
+                title="Weather Atlas",
+                body=(
+                    "Build a production-shaped MVP website. Support Global, Country, Region/State, City, "
+                    "plus List and Map view."
+                ),
+            ).to_dict()
+        )
+        discussion.set_artifact("problem_synthesis", "Users need a fast public weather website, not a component library.")
+        discussion.set_artifact(
+            "requirements",
+            (
+                "**Delivery contract**\n"
+                "- Deliverable type: standalone website\n"
+                "- Runnable outcome: users can run a real frontend locally\n"
+                "- Non-degradation rule: do not defer scope switching or map/list support without proof of impossibility"
+            ),
+        )
+        discussion.set_artifact(
+            "final_design",
+            "Use React/Vite with an app shell, router, real Open-Meteo fetch integration, and city/list/map flow.",
+        )
+        discussion.set_artifact(
+            "design_resolution_summary",
+            "Preserve standalone website delivery, app shell, and the real weather browsing flow.",
+        )
+        discussion.set_created_issue_refs([{"number": 42, "title": "Parse and serialize shareable route state"}])
+        discussion.set_completed()
+
+        class CaptureEngine(FakeEngine):
+            def run_raw_text_handler(
+                self,
+                event: Event,
+                prompt_path: str,
+                role: str = "pm",
+                variables: Optional[Dict[str, Any]] = None,
+            ) -> Dict[str, Any]:
+                self.run_raw_text_handler_calls.append(
+                    {
+                        "event_id": event.event_id,
+                        "prompt_path": prompt_path,
+                        "role": role,
+                        "variables": dict(variables or {}),
+                    }
+                )
+                return {"raw_text": "noop"}
+
+        actions = RecordingActions()
+        engine = CaptureEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        orchestrator._process_phase_workflow(
+            _issue_coding_event(
+                title="Parse and serialize shareable route state",
+                body="Add parseRouteState() and serializeRouteState() in src/lib/urlState.ts.",
+            ),
+            {
+                "event_type": "issue_coding",
+                "steps": [
+                    {
+                        "phase": "implement",
+                        "roles": ["worker"],
+                        "prompt_path": "prompts/coding/implement.md",
+                        "gate": False,
+                    }
+                ],
+            },
+        )
+
+        captured = engine.run_raw_text_handler_calls[0]["variables"]
+        assert "standalone website" in captured["project_context_pack"]
+        assert "React/Vite" in captured["project_context_pack"]
+        issue_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert "standalone website" in issue_instance.get_artifacts()["project_context_pack"]
+        contract = json.loads(issue_instance.get_artifacts()["project_context_contract"])
+        assert contract["delivery_type"] == "standalone_website"
+        assert contract["requires_runnable_app"] is True
+
+
+def test_multi_stage_prompt_render_preserves_product_requirements_beyond_narrow_issue_slice() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+
+        discussion = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
+        discussion.set_workflow_type("discussion")
+        discussion.set_original_event(
+            _discussion_event(
+                title="Weather Atlas",
+                body="Build a production-shaped MVP website with scope switching and list/map toggle.",
+            ).to_dict()
+        )
+        discussion.set_artifact(
+            "requirements",
+            (
+                "**Delivery contract**\n"
+                "- Deliverable type: standalone website\n"
+                "- Runnable outcome: local `dev`/`build` path and a usable frontend route\n\n"
+                "**User stories**\n"
+                "- As a casual user, I can switch between Global/Country/Region/City and List/Map."
+            ),
+        )
+        discussion.set_artifact(
+            "final_design",
+            "Use React/Vite, app shell entrypoint, router wiring, and real Open-Meteo API integration.",
+        )
+        discussion.set_created_issue_refs([{"number": 42, "title": "Parse and serialize shareable route state"}])
+        discussion.set_completed()
+
+        class CaptureEngine(FakeEngine):
+            def run_raw_text_handler(
+                self,
+                event: Event,
+                prompt_path: str,
+                role: str = "pm",
+                variables: Optional[Dict[str, Any]] = None,
+            ) -> Dict[str, Any]:
+                self.run_raw_text_handler_calls.append(
+                    {
+                        "event_id": event.event_id,
+                        "prompt_path": prompt_path,
+                        "role": role,
+                        "variables": dict(variables or {}),
+                    }
+                )
+                return {"raw_text": "noop"}
+
+        actions = RecordingActions()
+        engine = CaptureEngine(actions, runtime_dir=runtime_dir)
+        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
+
+        orchestrator._process_phase_workflow(
+            _issue_coding_event(
+                title="Parse and serialize shareable route state",
+                body="Add parseRouteState() and serializeRouteState() in src/lib/urlState.ts.",
+            ),
+            {
+                "event_type": "issue_coding",
+                "steps": [
+                    {
+                        "phase": "implement",
+                        "roles": ["worker"],
+                        "prompt_path": "prompts/coding/implement.md",
+                        "gate": False,
+                    }
+                ],
+            },
+        )
+
+        variables = engine.run_raw_text_handler_calls[0]["variables"]
+        rendered = PromptLibrary(_project_root()).render(
+            system_prompt_path="prompts/system/worker.md",
+            prompt_path="prompts/coding/implement.md",
+            variables=variables,
+        )
+        assert "Add parseRouteState() and serializeRouteState()" in rendered
+        assert "standalone website" in rendered
+        assert "Global/Country/Region/City" in rendered
+        assert "List/Map" in rendered
+        assert "React/Vite" in rendered
 
 
 def test_phase_workflow_skips_when_gate_already_open() -> None:
@@ -756,8 +961,7 @@ def test_evaluate_design_terminates_on_docker_incompatible() -> None:
         assert final_instance.is_terminated() is True
 
 
-def test_evaluate_design_proceeds_and_opens_gate_to_issue_breakdown() -> None:
-    """When tech_review outputs proceed, final_design is saved before opening the next gate."""
+def test_evaluate_design_proceeds_without_opening_owner_gate() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         runtime_dir = Path(tmpdir)
 
@@ -785,61 +989,43 @@ def test_evaluate_design_proceeds_and_opens_gate_to_issue_breakdown() -> None:
         result = orchestrator.process(_discussion_event(node_id="D_issue_breakdown_gate"))
 
         assert not result.get("terminated")
-        assert actions.create_issue_calls == []
-        gate_comments = [
-            call for call in actions.comment_on_discussion_calls if "**Phase `tech_review` complete.**" in call["message"]
-        ]
-        assert len(gate_comments) == 1
-        gate_comment = gate_comments[0]
-        assert gate_comment["discussion_id"] == "D_issue_breakdown_gate"
-        assert gate_comment["number"] == 5
-        gate = result.get("gate")
-        assert gate is not None
-        assert gate["gate_discussion_node_id"] == "D_issue_breakdown_gate"
-        assert gate["next_phase"] == "assumption_check"
-        assert gate["gate_posted_at"]
         final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
         assert final_instance.get_artifacts().get("final_design") == "use FastAPI"
         assert final_instance.get_gate_issue_number() is None
-        assert final_instance.get_discussion_gate_node_id() == "D_issue_breakdown_gate"
-        assert final_instance.get_gate_posted_at() == gate["gate_posted_at"]
         assert final_instance.is_completed() is False
 
 
-def test_evaluate_design_escalation_sets_issue_gate_posted_at() -> None:
+def test_delivery_challenge_terminate_stops_discussion_without_owner_gate() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         runtime_dir = Path(tmpdir)
 
         instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
-        instance.set_phase("tech_review")
+        instance.set_phase("delivery_challenge")
         instance.set_artifact("requirements", "some requirements text")
-        instance.set_artifact("tech_proposal_engineer", "some proposal text")
+        instance.set_artifact("final_design", "some proposal text")
 
-        escalate_json = (
-            '{"decision": "escalate", "docker_compatible": true, '
-            '"evaluation_summary": "Need human input before issue breakdown.", "problem_coverage": []}'
+        terminate_json = (
+            '{"decision":"terminate","requirements_to_preserve":[{"requirement":"standalone website","evidence":"PRD"}],'
+            '"downgrade_findings":[],"implementability_blockers":[{"blocker":"GPU-only dependency","proof":"requires CUDA","can_be_resolved_in_design":false,"required_change":""}],'
+            '"required_design_changes":[],"termination_reason":"standalone website is impossible under stated hardware constraints"}'
         )
 
-        class FakeEngineEscalate(FakeEngine):
+        class FakeEngineTerminate(FakeEngine):
             def run_raw_text_handler(self, event: Any, prompt_path: str, role: str = "pm", variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                 self.run_raw_text_handler_calls.append({"event_id": event.event_id, "prompt_path": prompt_path, "role": role})
-                if "tech_review" in prompt_path:
-                    return {"raw_text": escalate_json}
+                if "delivery_challenge" in prompt_path:
+                    return {"raw_text": terminate_json}
                 return {"raw_text": f"output for {role}"}
 
         actions = NumberedRecordingActions()
-        engine = FakeEngineEscalate(actions, runtime_dir=runtime_dir)
+        engine = FakeEngineTerminate(actions, runtime_dir=runtime_dir)
         orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
 
         result = orchestrator.process(_discussion_event())
 
-        gate = result["gate"]
-        assert gate["gate_issue_number"] == 100
-        assert gate["next_phase"] == "tech_review"
-        assert gate["gate_posted_at"]
+        assert result["terminated"] is True
         final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
-        assert final_instance.get_gate_issue_number() == 100
-        assert final_instance.get_gate_posted_at() == gate["gate_posted_at"]
+        assert final_instance.is_terminated() is True
 
 
 def test_gate_human_comment_is_passed_to_resumed_prompt_variables() -> None:
@@ -901,7 +1087,7 @@ def test_gate_human_comment_placeholders_exist_in_resumed_prompts() -> None:
     assert "$human_comment" in (_project_root() / "prompts/discussion/issue_breakdown.md").read_text(encoding="utf-8")
 
 
-def test_discussion_clarification_limit_opens_gate_instead_of_terminating() -> None:
+def test_discussion_clarification_limit_terminates_in_autonomous_mode() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         runtime_dir = Path(tmpdir)
         instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
@@ -928,17 +1114,15 @@ def test_discussion_clarification_limit_opens_gate_instead_of_terminating() -> N
 
         result = orchestrator.process(_discussion_event(node_id="D_disc_5"))
 
-        assert result["terminated"] is False
-        assert result["gate"]["gate_discussion_node_id"] == "D_disc_5"
-        assert result["gate"]["next_phase"] == "problem_synthesis"
+        assert result["terminated"] is True
         assert any(
             "automatic clarification limit" in call["message"]
             for call in actions.comment_on_discussion_calls
         )
         reloaded = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
-        assert reloaded.is_terminated() is False
+        assert reloaded.is_terminated() is True
         assert reloaded.is_awaiting_clarification() is False
-        assert reloaded.get_discussion_gate_node_id() == "D_disc_5"
+        assert reloaded.get_discussion_gate_node_id() is None
 
 
 def test_issue_coding_clarification_limit_still_terminates_phase() -> None:
@@ -980,15 +1164,28 @@ def test_phase_workflow_gate_limit_terminates_phase() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         runtime_dir = Path(tmpdir)
         instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 5)
-        instance.set_phase("problem_synthesis")
+        instance.set_phase("synthetic_gate_phase")
         for _ in range(WorkflowOrchestrator.MAX_PHASE_GATE_OPENS):
-            instance.increment_gate_open_count("problem_synthesis")
+            instance.increment_gate_open_count("synthetic_gate_phase")
 
         actions = RecordingActions()
         engine = FakeEngine(actions, runtime_dir=runtime_dir)
         orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
 
-        result = orchestrator.process(_discussion_event(node_id="D_disc_5"))
+        result = orchestrator._process_phase_workflow(
+            _discussion_event(node_id="D_disc_5"),
+            {
+                "event_type": "discussion",
+                "steps": [
+                    {
+                        "phase": "synthetic_gate_phase",
+                        "roles": ["pm"],
+                        "prompt_path": "prompts/discussion/problem_synthesis.md",
+                        "gate": True,
+                    }
+                ],
+            },
+        )
 
         assert result["terminated"] is True
         assert "automatic gate limit" in result["terminated_reason"]
@@ -1253,62 +1450,10 @@ def test_issue_coding_pm_decision_opens_issue_gate_before_merge() -> None:
 
         result = orchestrator.process(_issue_coding_event())
 
-        assert actions.merge_or_reopen_calls == []
-        gate_comments = [c for c in actions.comment_calls if c.get("target_kind") == "issue"]
-        assert len(gate_comments) == 1
-        assert "confirm and execute this decision" in gate_comments[0]["message"]
-        assert "Tests passed and the review is clean." in gate_comments[0]["message"]
-        assert result["gate"]["gate_issue_number"] == 42
-        final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
-        assert final_instance.get_gate_issue_number() == 42
-        assert final_instance.get_gate_next_phase() == "pm_decision"
-        assert final_instance.get_gate_resume_mode() == "execute_action"
-        assert final_instance.is_completed() is False
-
-
-def test_issue_coding_pm_decision_confirmation_executes_without_rerunning_ai() -> None:
-    with tempfile.TemporaryDirectory() as tmpdir:
-        runtime_dir = Path(tmpdir)
-        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
-        instance.set_phase("pm_decision")
-        instance.set_artifact(
-            "pm_decision",
-            "```json\n"
-            '{"decision":"reopen","reason":"model picked the wrong outcome","reopen_comment":"ignore me"}\n'
-            "```\n"
-            "Tests passed and the review is clean.",
-        )
-        instance.set_artifact("pr_number", "17")
-        instance.set_artifact("pr_url", "https://example.test/pr/17")
-        instance.set_artifact("code_review_combined", "LGTM — no issues found.")
-        instance.set_artifact("test_result", json.dumps({"passed": True, "summary": "3 passed"}))
-
-        class FailingEngine(FakeEngine):
-            def run_raw_text_handler(
-                self,
-                event: Any,
-                prompt_path: str,
-                role: str = "pm",
-                variables: Optional[Dict[str, Any]] = None,
-            ) -> Dict[str, Any]:
-                raise AssertionError("pm_decision should not rerun after confirmation")
-
-        actions = RecordingActions()
-        engine = FailingEngine(actions, runtime_dir=runtime_dir)
-        orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, FakeClient({}), {})
-
-        orchestrator.process(
-            _issue_coding_event(
-                advance_to_phase="pm_decision",
-                execute_gated_action=True,
-                gate_human_comment="ok",
-            )
-        )
-
         assert len(actions.merge_or_reopen_calls) == 1
         assert actions.merge_or_reopen_calls[0]["decision"] == "merge"
-        assert actions.merge_or_reopen_calls[0]["reopen_comment"] == ""
         final_instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        assert final_instance.get_gate_issue_number() is None
         assert final_instance.is_completed() is True
 
 
@@ -1341,13 +1486,7 @@ def test_issue_coding_pm_decision_merge_conflict_requeues_merge_conflict_resolut
         )
         orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, client, {})
 
-        orchestrator.process(
-            _issue_coding_event(
-                advance_to_phase="pm_decision",
-                execute_gated_action=True,
-                gate_human_comment="ok",
-            )
-        )
+        orchestrator.process(_issue_coding_event())
 
         assert actions.merge_or_reopen_calls == []
         assert any(
@@ -1406,13 +1545,7 @@ def test_issue_coding_pm_decision_non_conflict_merge_failure_terminates() -> Non
         )
         orchestrator = WorkflowOrchestrator(_project_root(), engine, actions, client, {})
 
-        orchestrator.process(
-            _issue_coding_event(
-                advance_to_phase="pm_decision",
-                execute_gated_action=True,
-                gate_human_comment="ok",
-            )
-        )
+        orchestrator.process(_issue_coding_event())
 
         assert any(
             "Final `merge` action failed" in call["message"]

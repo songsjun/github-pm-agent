@@ -230,6 +230,170 @@ class WorkflowOrchestrator:
             )
         return "Stay inside the issue's declared scope and avoid unrelated files."
 
+    def _sync_project_context_pack(self, event: Any, instance: Any) -> None:
+        workflow_type = instance.get_workflow_type()
+        if workflow_type == "discussion":
+            pack = self._build_project_context_pack(instance, event)
+            if pack:
+                instance.set_artifact("project_context_pack", pack)
+            contract = self._build_project_context_contract(instance, event)
+            if contract:
+                instance.set_artifact("project_context_contract", contract)
+            return
+        if workflow_type != "issue_coding":
+            return
+        artifacts = instance.get_artifacts()
+        if artifacts.get("project_context_pack") and artifacts.get("project_context_contract"):
+            return
+        pack, contract = self._load_related_project_context_pack(event.repo, event.target_number or None)
+        if pack:
+            instance.set_artifact("project_context_pack", pack)
+        if contract:
+            instance.set_artifact("project_context_contract", contract)
+
+    def _load_related_project_context_pack(self, repo: str, issue_number: Optional[int]) -> Tuple[str, str]:
+        from github_pm_agent.workflow_instance import WorkflowInstance
+
+        repo_dir = self.engine.runtime_dir / "workflows" / repo.replace("/", "__")
+        if not repo_dir.exists():
+            return "", ""
+
+        discussions: List[Tuple[int, WorkflowInstance]] = []
+        for state_path in repo_dir.glob("*/state.json"):
+            try:
+                number = int(state_path.parts[-2])
+            except (TypeError, ValueError):
+                continue
+            instance = WorkflowInstance(state_path)
+            if instance.get_workflow_type() != "discussion":
+                continue
+            discussions.append((number, instance))
+        discussions.sort(key=lambda item: item[0], reverse=True)
+
+        if issue_number is not None:
+            for _, discussion in discussions:
+                if any(ref.get("number") == issue_number for ref in discussion.get_created_issue_refs()):
+                    pack = discussion.get_artifacts().get("project_context_pack") or self._build_project_context_pack(discussion)
+                    contract = discussion.get_artifacts().get("project_context_contract") or self._build_project_context_contract(discussion)
+                    if pack and not discussion.get_artifacts().get("project_context_pack"):
+                        discussion.set_artifact("project_context_pack", pack)
+                    if contract and not discussion.get_artifacts().get("project_context_contract"):
+                        discussion.set_artifact("project_context_contract", contract)
+                    return pack, contract
+
+        for _, discussion in discussions:
+            if not discussion.is_completed() and not discussion.get_artifacts().get("project_context_pack"):
+                continue
+            pack = discussion.get_artifacts().get("project_context_pack") or self._build_project_context_pack(discussion)
+            contract = discussion.get_artifacts().get("project_context_contract") or self._build_project_context_contract(discussion)
+            if pack and not discussion.get_artifacts().get("project_context_pack"):
+                discussion.set_artifact("project_context_pack", pack)
+            if contract and not discussion.get_artifacts().get("project_context_contract"):
+                discussion.set_artifact("project_context_contract", contract)
+            if pack:
+                return pack, contract
+        return "", ""
+
+    def _build_project_context_pack(self, instance: Any, event: Any = None) -> str:
+        original_event = instance.get_original_event() or (event.to_dict() if event is not None else {})
+        artifacts = instance.get_artifacts()
+        title = str(original_event.get("title") or "").strip()
+        body = str(original_event.get("body") or "").strip()
+
+        sections: List[str] = [
+            "# Project Context Pack",
+            "Use this as higher-priority product context than any single implementation issue. Preserve explicit requirements and delivery shape unless they were proven impossible under stated constraints.",
+        ]
+        if title or body:
+            request_parts = ["## Original Request"]
+            if title:
+                request_parts.append(f"Title: {title}")
+            if body:
+                request_parts.append(body)
+            sections.append("\n".join(request_parts))
+
+        artifact_sections = [
+            ("problem_synthesis", "Problem Definition"),
+            ("requirements", "Approved Product Requirements"),
+            ("final_design", "Approved Technical Design"),
+            ("delivery_challenge", "Internal Critic Review"),
+            ("design_resolution_summary", "Design Resolution Summary"),
+        ]
+        for artifact_key, heading in artifact_sections:
+            text = str(artifacts.get(artifact_key) or "").strip()
+            if text:
+                sections.append(f"## {heading}\n{text}")
+
+        created_refs = instance.get_created_issue_refs()
+        if created_refs:
+            lines = [
+                f"- #{ref.get('number')}: {str(ref.get('title') or '').strip()}"
+                for ref in created_refs
+                if ref.get("number")
+            ]
+            if lines:
+                sections.append("## Planned Implementation Slices\n" + "\n".join(lines))
+
+        pack = "\n\n".join(section for section in sections if section.strip()).strip()
+        return pack + "\n" if pack else ""
+
+    def _build_project_context_contract(self, instance: Any, event: Any = None) -> str:
+        original_event = instance.get_original_event() or (event.to_dict() if event is not None else {})
+        artifacts = instance.get_artifacts()
+        requirements = str(artifacts.get("requirements") or "")
+        final_design = str(artifacts.get("final_design") or "")
+        source_text = "\n\n".join(
+            part for part in [str(original_event.get("title") or ""), str(original_event.get("body") or ""), requirements, final_design]
+            if part
+        )
+        delivery_type = self._infer_delivery_type(requirements, source_text)
+        contract = {
+            "delivery_type": delivery_type,
+            "requires_runnable_app": delivery_type in {"standalone_website", "frontend_app"},
+            "required_capabilities": self._infer_required_capabilities(source_text),
+        }
+        runnable_match = re.search(r"(?im)^-\s*Runnable outcome:\s*(.+)$", requirements)
+        if runnable_match:
+            contract["runnable_outcome"] = runnable_match.group(1).strip()
+        return json.dumps(contract, ensure_ascii=False, indent=2)
+
+    def _infer_delivery_type(self, requirements: str, source_text: str) -> str:
+        match = re.search(r"(?im)^-\s*Deliverable type:\s*(.+)$", requirements)
+        value = match.group(1).strip().lower() if match else ""
+        normalized = re.sub(r"[^a-z0-9]+", "_", value).strip("_")
+        if normalized:
+            if normalized in {"standalone_website", "standalone_web_app", "website", "web_app"}:
+                return "standalone_website"
+            if normalized in {"frontend_app", "frontend_application"}:
+                return "frontend_app"
+            if normalized in {"library", "api", "internal_tool"}:
+                return normalized
+        lower = source_text.lower()
+        if "standalone website" in lower or "mvp website" in lower or "public-facing mvp website" in lower:
+            return "standalone_website"
+        if "frontend app" in lower or "static frontend application" in lower:
+            return "frontend_app"
+        return "unknown"
+
+    def _infer_required_capabilities(self, source_text: str) -> List[str]:
+        text = source_text.lower()
+        capabilities: List[str] = []
+        checks = [
+            ("scope_switching", ["global", "country", "region", "city"]),
+            ("list_map_toggle", ["list view", "map view"]),
+            ("city_search", ["search for a city", "city search"]),
+            ("real_api_integration", ["open-meteo", "forecast api", "geocoding api"]),
+            ("local_run", ["run locally", "local dev", "local build"]),
+        ]
+        for name, needles in checks:
+            if all(needle in text for needle in needles) or any(needle in text for needle in needles[:1]):
+                if name == "scope_switching":
+                    if all(needle in text for needle in needles):
+                        capabilities.append(name)
+                elif name not in capabilities and any(needle in text for needle in needles):
+                    capabilities.append(name)
+        return capabilities
+
     def _validate_coding_plan_scope(self, plan: Any, event: Any, instance: Any) -> str:
         labels, location_files = self._issue_scope_details(event, instance)
         if "test" not in labels:
@@ -575,6 +739,8 @@ class WorkflowOrchestrator:
             if step is None:
                 return {"error": f"no workflow step for phase={current_phase}", "escalation_refs": []}
 
+            self._sync_project_context_pack(event, instance)
+
             # Refresh artifacts each iteration so later steps see earlier artifacts
             artifacts = meta.get("artifacts") or instance.get_artifacts()
             variables: Dict[str, Any] = {
@@ -603,6 +769,8 @@ class WorkflowOrchestrator:
             for phase_name, artifact_text in artifacts.items():
                 if not phase_name.startswith("_"):
                     variables[f"artifact_{phase_name}"] = artifact_text
+            variables["project_context_pack"] = str(artifacts.get("project_context_pack") or "")
+            variables["project_context_contract_json"] = str(artifacts.get("project_context_contract") or "")
             # Coding workflow convenience aliases from artifacts
             test_result = artifacts.get("test_result") or {}
             if isinstance(test_result, str):
@@ -765,34 +933,6 @@ class WorkflowOrchestrator:
                 questions = self._collect_blocking_unknowns(all_ai_outputs, current_phase)
                 if questions:
                     if instance.get_clarification_round(current_phase) >= self.MAX_CLARIFICATION_ROUNDS:
-                        idx = next((i for i, s in enumerate(steps) if s.get("phase") == current_phase), -1)
-                        next_step = steps[idx + 1] if 0 <= idx < len(steps) - 1 else None
-                        next_phase = next_step["phase"] if next_step else ""
-                        if event.target_kind == "discussion" and next_phase:
-                            gate_result = self._open_clarification_limit_gate(
-                                event,
-                                instance,
-                                phase=current_phase,
-                                questions=questions,
-                                node_id=node_id,
-                                target_number=target_number,
-                                next_phase=next_phase,
-                            )
-                            if gate_result.get("terminated"):
-                                return {
-                                    "phase": current_phase,
-                                    "ai_outputs": all_ai_outputs,
-                                    "gate": {},
-                                    "artifacts": instance.get_artifacts(),
-                                    "created_issues": created_issues,
-                                    "issue_creation_error": issue_creation_error,
-                                    "terminated": True,
-                                    "terminated_reason": instance.get_terminated_reason(),
-                                    "escalation_refs": [],
-                                }
-                            if pending:
-                                instance.clear_pending_comments()
-                            break
                         self._terminate_phase_limit(
                             event,
                             instance,
@@ -829,7 +969,7 @@ class WorkflowOrchestrator:
                         for ref in existing_refs
                     ]
                 else:
-                    created_issues, issue_creation_error = self._create_issues_from_artifact(last_content, event)
+                    created_issues, issue_creation_error = self._create_issues_from_artifact(last_content, event, instance)
                     issue_refs = []
                     for item in created_issues:
                         number = (item.get("result") or {}).get("number") or item.get("number")
@@ -864,6 +1004,42 @@ class WorkflowOrchestrator:
                 if eval_result.get("error"):
                     issue_creation_error = eval_result["error"]
                     # Don't advance on error — break without set_completed to allow retry
+                    break
+                step_succeeded = True
+            elif step.get("action") == "evaluate_delivery_challenge":
+                challenge_result = self._evaluate_delivery_challenge(last_content, instance)
+                if challenge_result.get("terminated"):
+                    return {
+                        "phase": current_phase,
+                        "ai_outputs": all_ai_outputs,
+                        "gate": {},
+                        "artifacts": instance.get_artifacts(),
+                        "created_issues": [],
+                        "issue_creation_error": "",
+                        "terminated": True,
+                        "terminated_reason": challenge_result.get("reason", ""),
+                        "escalation_refs": [],
+                    }
+                if challenge_result.get("error"):
+                    issue_creation_error = challenge_result["error"]
+                    break
+                step_succeeded = True
+            elif step.get("action") == "resolve_design_challenge":
+                resolution_result = self._resolve_design_challenge(last_content, instance)
+                if resolution_result.get("terminated"):
+                    return {
+                        "phase": current_phase,
+                        "ai_outputs": all_ai_outputs,
+                        "gate": {},
+                        "artifacts": instance.get_artifacts(),
+                        "created_issues": [],
+                        "issue_creation_error": "",
+                        "terminated": True,
+                        "terminated_reason": resolution_result.get("reason", ""),
+                        "escalation_refs": [],
+                    }
+                if resolution_result.get("error"):
+                    issue_creation_error = resolution_result["error"]
                     break
                 step_succeeded = True
             elif step.get("action") == "coding_session":
@@ -1354,6 +1530,8 @@ class WorkflowOrchestrator:
             else:
                 step_succeeded = True
 
+            self._sync_project_context_pack(event, instance)
+
             if step.get("gate") and not meta.get("execute_gated_action"):
                 from github_pm_agent.utils import utc_now_iso
                 owner = self.config.get("github", {}).get("owner", "")
@@ -1611,13 +1789,16 @@ class WorkflowOrchestrator:
         return stripped
 
     def _create_issues_from_artifact(
-        self, content: str, event: Any
+        self, content: str, event: Any, instance: Any = None
     ) -> Tuple[List[Dict[str, Any]], str]:
         """Parse AI output as JSON issue list and create each issue. Returns (created, error)."""
         from github_pm_agent.utils import extract_json_object
         parsed = extract_json_object(content)
         if not isinstance(parsed, list):
             return [], f"issue_breakdown output was not a JSON array: {content[:200]}"
+        contract_error = self._validate_issue_breakdown_against_contract(parsed, instance)
+        if contract_error:
+            return [], contract_error
         created = []
         for item in parsed:
             if not isinstance(item, dict) or not item.get("title"):
@@ -1636,6 +1817,88 @@ class WorkflowOrchestrator:
             )
             created.append(result)
         return created, ""
+
+    def _validate_issue_breakdown_against_contract(self, issues: List[Dict[str, Any]], instance: Any = None) -> str:
+        if instance is None:
+            return ""
+        artifacts = instance.get_artifacts()
+        contract_raw = str(artifacts.get("project_context_contract") or "").strip()
+        if not contract_raw:
+            return ""
+        try:
+            contract = json.loads(contract_raw)
+        except json.JSONDecodeError:
+            return ""
+        delivery_type = str(contract.get("delivery_type") or "")
+        if delivery_type not in {"standalone_website", "frontend_app"}:
+            return ""
+
+        buckets = {
+            "app_shell": False,
+            "run_build": False,
+            "primary_flow": False,
+            "api_integration": False,
+        }
+        for item in issues:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "")
+            body = str(item.get("body") or "")
+            combined = f"{title}\n{body}".lower()
+            files = [self._normalize_repo_path(path) for path in self._extract_issue_location_files(body)]
+
+            if (
+                any(
+                    re.fullmatch(pattern, path)
+                    for path in files
+                    for pattern in (
+                        r"src/main\.[a-z0-9]+",
+                        r"src/app\.[a-z0-9]+",
+                        r"src/routes/.+",
+                        r"index\.html",
+                    )
+                )
+                or "app shell" in combined
+                or "entrypoint" in combined
+                or "router" in combined
+            ):
+                buckets["app_shell"] = True
+
+            if (
+                any(
+                    re.fullmatch(pattern, path)
+                    for path in files
+                    for pattern in (r"package\.json", r"vite\.config\.[a-z0-9]+", r"index\.html", r"src/main\.[a-z0-9]+")
+                )
+                or "npm run dev" in combined
+                or "npm run build" in combined
+                or "local run" in combined
+                or "build wiring" in combined
+            ):
+                buckets["run_build"] = True
+
+            if (
+                any(path.startswith(("src/routes/", "src/pages/", "src/components/")) for path in files)
+                and any(term in combined for term in ("route", "screen", "page", "weather", "search", "map", "list"))
+            ) or "primary user flow" in combined:
+                buckets["primary_flow"] = True
+
+            if (
+                any(path.startswith(("src/api/", "src/lib/", "src/services/")) for path in files)
+                and any(term in combined for term in ("open-meteo", "fetch", "request", "api", "forecast", "geocoding"))
+            ):
+                buckets["api_integration"] = True
+
+        missing = [name for name, present in buckets.items() if not present]
+        if not missing:
+            return ""
+        missing_text = ", ".join(missing)
+        return (
+            "issue_breakdown did not preserve the standalone app delivery contract. "
+            f"Missing required implementation slice(s): {missing_text}. "
+            "A standalone website must include app shell/entrypoint wiring, local run/build wiring, "
+            "the primary user flow, and real API integration."
+        )
 
     def _evaluate_design(
         self,
@@ -1660,40 +1923,60 @@ class WorkflowOrchestrator:
             return {"terminated": True, "reason": reason}
 
         if decision == "escalate":
-            from github_pm_agent.utils import utc_now_iso
-
-            owner = self.config.get("github", {}).get("owner", "")
-            evaluation = parsed.get("evaluation_summary", content[:500])
-            gate_title = f"[workflow-gate] {event.repo} Discussion #{event.target_number} phase={current_phase}"
-            gate_body = (
-                f"{'@' + owner + chr(10) + chr(10) if owner else ''}"
-                f"Technical design review requires human input.\n\n"
-                f"**PM Evaluation:**\n{evaluation}\n\n"
-                f"Reply with guidance to re-run the design review."
+            reason = parsed.get("escalation_reason") or (
+                "technical design requested human clarification, but autonomous discussion mode requires either "
+                "a resolved design or a concrete termination reason"
             )
-            gate_issue = self.actions.create_issue(
-                title=gate_title, body=gate_body, labels=["workflow-gate"]
-            )
-            gate_number: Optional[int] = None
-            posted_at = utc_now_iso()
-            if isinstance(gate_issue, dict):
-                gate_number = gate_issue.get("number") or (gate_issue.get("result") or {}).get("number")
-            # Self-loop: gate advances back to the same phase
-            if gate_number:
-                instance.set_gate(gate_number, current_phase, posted_at=posted_at)
-            return {
-                "escalated": True,
-                "gate": {
-                    "gate_issue_number": gate_number,
-                    "next_phase": current_phase,
-                    "gate_posted_at": posted_at,
-                },
-            }
+            instance.set_terminated(reason)
+            return {"terminated": True, "reason": reason}
 
         # proceed or merge: save final design
         final_design = parsed.get("final_design", "")
         if final_design:
             instance.set_artifact("final_design", final_design)
+        return {"proceeded": True}
+
+    def _evaluate_delivery_challenge(self, content: str, instance: Any) -> Dict[str, Any]:
+        from github_pm_agent.utils import extract_json_object
+
+        parsed = extract_json_object(content)
+        if not isinstance(parsed, dict):
+            return {"error": f"delivery_challenge output was not a JSON object: {content[:200]}"}
+
+        decision = str(parsed.get("decision", "pass")).strip().lower()
+        if decision not in {"pass", "revise", "terminate"}:
+            return {"error": f"delivery_challenge decision was invalid: {decision!r}"}
+
+        if decision == "terminate":
+            reason = str(parsed.get("termination_reason", "")).strip() or "critic proved the requested delivery is not implementable"
+            instance.set_terminated(reason)
+            return {"terminated": True, "reason": reason}
+
+        return {"proceeded": True}
+
+    def _resolve_design_challenge(self, content: str, instance: Any) -> Dict[str, Any]:
+        from github_pm_agent.utils import extract_json_object
+
+        parsed = extract_json_object(content)
+        if not isinstance(parsed, dict):
+            return {"error": f"design_resolution output was not a JSON object: {content[:200]}"}
+
+        decision = str(parsed.get("decision", "proceed")).strip().lower()
+        if decision not in {"proceed", "terminate"}:
+            return {"error": f"design_resolution decision was invalid: {decision!r}"}
+
+        if decision == "terminate":
+            reason = str(parsed.get("termination_reason", "")).strip() or "critic objections could not be resolved without degrading scope"
+            instance.set_terminated(reason)
+            return {"terminated": True, "reason": reason}
+
+        resolved_design = str(parsed.get("resolved_design", "")).strip()
+        if not resolved_design:
+            return {"error": "design_resolution did not provide resolved_design"}
+        instance.set_artifact("final_design", resolved_design)
+        summary = str(parsed.get("resolution_summary", "")).strip()
+        if summary:
+            instance.set_artifact("design_resolution_summary", summary)
         return {"proceeded": True}
 
     def _record_discussion_comment(self, event: Any) -> Dict[str, Any]:

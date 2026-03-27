@@ -39,10 +39,9 @@ steps:
     action: fix_coding_session
     gate: false
 
-  # Phase 5: PM makes the final merge / reopen decision (human-gated).
+  # Phase 5: PM records the final deterministic merge / reopen decision.
   - phase: pm_decision
     roles: [pm]
     prompt_path: prompts/coding/pm_decision.md
     action: merge_or_reopen
-    gate: true
-    gate_before_action: true
+    gate: false

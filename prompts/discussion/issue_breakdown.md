@@ -8,6 +8,9 @@ $artifact_requirements
 **Final Technical Design:**
 $artifact_final_design
 
+**Critic Review:**
+$artifact_delivery_challenge
+
 $human_comment
 $pending_comments
 
@@ -18,6 +21,7 @@ Review the PRD scope. Issues must:
 1. Match the actual architecture (e.g., if SQLite was chosen, do not create issues for PostgreSQL migrations)
 2. Cover the **full product**, not just infrastructure — include domain-specific functionality issues
 3. Be completable at the stated scope — no issue should require skills or infrastructure beyond what the PRD describes
+4. Preserve the delivery contract — do not break a promised standalone website/app into a non-runnable module collection
 
 **Balance rule**: At least 1/3 of issues must cover domain/functional features (the actual user-facing value), not infrastructure setup. For example, a French learning tool needs issues for content types, exercise logic, and learning flow — not just "set up database" and "configure Docker".
 
@@ -36,8 +40,8 @@ Forbidden verbs: "improve", "optimize", "refactor", "enhance", "consider". Each 
 **Rule 3 — Include a runnable acceptance test.**
 Every issue body must end with a concrete test condition in code form: `assert func(input) == expected_output` or `GET /endpoint returns {"key": "value"}`. This is the single source of truth for "done".
 
-**Rule 4 — Limit scope to 1–2 files.**
-If implementing a feature requires touching more than 2 files, split it into multiple issues. Cross-file coordination is the #1 cause of agent failure.
+**Rule 4 — Keep slices small, but preserve runnable product shape.**
+Prefer issues that touch 1–3 files. Foundational bootstrap slices for a standalone app may touch the minimum entrypoint/build files needed to make the product runnable. Do not fragment the app so aggressively that no issue owns app shell, build/run wiring, or the main user flow.
 
 **Rule 5 — Order by dependency.**
 Issues must be listed in the order workers should implement them. Each issue may optionally reference which earlier issue it depends on.
@@ -82,6 +86,12 @@ Example:
 ]
 
 Extract 4–8 issues, ordered by implementation dependency (foundational first).
+
+If the PRD or design says the deliverable is a standalone website/frontend app, the issue list MUST include:
+- at least one issue for app shell / entrypoint wiring
+- at least one issue for local run/build wiring (`dev`/`build` path or equivalent)
+- at least one issue for the primary user flow end-to-end, not just isolated utility modules
+- if data comes from an external API, at least one issue for the actual fetch/integration path
 
 Prefer **vertical slices** over implementation/test pairs:
 - Each implementation issue should include the code change **and the unit tests needed to prove it**.

@@ -2,6 +2,9 @@ You are the PM making the final decision on PR #$pr_number for GitHub issue #$is
 
 PR URL: $pr_url
 
+Project-level context pack:
+$project_context_pack
+
 Code review findings (all reviewers, final round):
 $artifact_code_review_combined
 
@@ -30,4 +33,4 @@ Output a JSON block first:
 ```
 `reopen_comment` is only required when `decision == "reopen"`: post it on the issue explaining exactly what must be fixed before the next attempt.
 
-After the JSON, add a short human-readable summary (2–3 sentences) for the gate confirmation comment.
+After the JSON, add a short human-readable summary (2–3 sentences) for the automation log comment.

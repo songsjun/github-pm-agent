@@ -5,6 +5,9 @@ Issue title: $issue_title
 Issue body:
 $issue_body
 
+Project-level context pack:
+$project_context_pack
+
 Repository context:
 - Default branch: $default_branch
 - Base branch: $base_branch
@@ -41,6 +44,7 @@ Return a single JSON block in ```json ... ``` with this exact schema:
 ```
 
 Requirements:
+- Treat the project-level context pack as authoritative for product intent, delivery shape, and preserved requirements. The issue body is a local slice, not the whole product contract.
 - Include ALL files that need to change, whether new or modified.
 - If a file must be removed to satisfy the issue or keep the repo valid, list it in `delete_files`.
 - For every entry in `files`, provide the FULL file content, not diffs.

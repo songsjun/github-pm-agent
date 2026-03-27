@@ -13,7 +13,7 @@ steps:
     roles: [pm]
     prompt_path: prompts/discussion/problem_synthesis.md
     output_mode: raw_text
-    gate: true
+    gate: false
 
   # Phase 1a: Workers explore opportunities from 6 perspectives (six thinking hats)
   - phase: brainstorm_perspectives
@@ -27,7 +27,7 @@ steps:
     roles: [pm]
     prompt_path: prompts/discussion/brainstorm.md
     output_mode: raw_text
-    gate: true
+    gate: false
 
   # Phase 2a: Workers challenge requirements (Kano + MoSCoW + assumption recording)
   - phase: requirements_challenge
@@ -48,7 +48,7 @@ steps:
     roles: [pm]
     prompt_path: prompts/discussion/requirements.md
     output_mode: raw_text
-    gate: true
+    gate: false
 
   # Phase 3a: Engineer writes technical design proposal
   - phase: tech_proposal
@@ -69,14 +69,23 @@ steps:
   - phase: tech_review
     roles: [pm]
     prompt_path: prompts/discussion/tech_review.md
-    gate: true
+    gate: false
     action: evaluate_design
 
-  # Phase 4b: Workers validate assumptions and define MVP boundary
-  - phase: assumption_check
-    slots: 2
-    prompt_path: prompts/discussion/assumption_check.md
-    output_per_role: true
+  # Phase 4b: Critic challenges any scope cuts or unsupported feasibility claims.
+  - phase: delivery_challenge
+    roles: [critic]
+    prompt_path: prompts/discussion/delivery_challenge.md
+    output_mode: raw_text
+    action: evaluate_delivery_challenge
+    gate: false
+
+  # Phase 4c: PM resolves critic objections without asking the owner again.
+  - phase: design_resolution
+    roles: [pm]
+    prompt_path: prompts/discussion/design_resolution.md
+    output_mode: raw_text
+    action: resolve_design_challenge
     gate: false
 
   # Phase 5: PM breaks down into GitHub Issues (dev + test tasks)
