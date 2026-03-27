@@ -12,6 +12,7 @@ from github_pm_agent.workflow_instance import WorkflowInstance
 
 class ProjectReleaseScanner:
     """Enqueue a deterministic release event once a managed project run is fully complete."""
+    README_ISSUE_TITLE = "Write release README"
 
     REQUIRED_README_SECTIONS = {
         "overview": (
@@ -55,7 +56,10 @@ class ProjectReleaseScanner:
             if client is None:
                 continue
 
-            release_event = self._build_release_event(repo, repo_dir, client)
+            release_event, blocked = self._build_release_event(repo, repo_dir, client)
+            if blocked is not None:
+                results.append(blocked)
+                continue
             if release_event is None:
                 continue
             if self.queue.enqueue([release_event]) != 1:
@@ -70,7 +74,12 @@ class ProjectReleaseScanner:
             )
         return results
 
-    def _build_release_event(self, repo: str, repo_dir: Any, client: Any) -> Optional[Event]:
+    def _build_release_event(
+        self,
+        repo: str,
+        repo_dir: Any,
+        client: Any,
+    ) -> tuple[Optional[Event], Optional[Dict[str, Any]]]:
         discussion_complete = False
         issue_coding_instances: List[WorkflowInstance] = []
         for state_path in repo_dir.glob("*/state.json"):
@@ -82,30 +91,36 @@ class ProjectReleaseScanner:
                 issue_coding_instances.append(instance)
 
         if not discussion_complete or not issue_coding_instances:
-            return None
+            return None, None
         if not all(instance.is_completed() for instance in issue_coding_instances):
-            return None
+            return None, None
 
         open_issues = self._open_business_issues(client, repo)
         if open_issues:
-            return None
+            return None, None
         open_prs = self._open_pull_requests(client, repo)
         if open_prs:
-            return None
+            return None, None
 
         releases = self._releases(client, repo)
         latest_release = releases[0] if releases else None
         merged_prs = self._merged_pull_requests(client, repo)
         if not merged_prs:
-            return None
+            return None, None
 
         unreleased_prs = self._unreleased_pull_requests(merged_prs, latest_release)
         if not unreleased_prs:
-            return None
+            return None, None
 
         docs_status = self._readme_release_status(client, repo)
         if docs_status is not None:
-            return None
+            issue_number = self._ensure_readme_issue(client, repo, docs_status, unreleased_prs)
+            return None, {
+                "repo": repo,
+                "blocked_reason": docs_status["reason"],
+                "missing_sections": docs_status.get("missing_sections", []),
+                "created_issue_number": issue_number,
+            }
 
         tag_name = self._next_release_tag(latest_release)
         release_name = f"Release {tag_name}"
@@ -136,7 +151,7 @@ class ProjectReleaseScanner:
                 "latest_release_tag": (latest_release or {}).get("tag_name", ""),
                 "default_branch": default_branch,
             },
-        )
+        ), None
 
     def _readme_release_status(self, client: Any, repo: str) -> Optional[Dict[str, Any]]:
         readme_text = self._readme_text(client, repo)
@@ -149,6 +164,62 @@ class ProjectReleaseScanner:
         ]
         if missing:
             return {"reason": "missing_readme_sections", "missing_sections": missing}
+        return None
+
+    def _ensure_readme_issue(
+        self,
+        client: Any,
+        repo: str,
+        docs_status: Dict[str, Any],
+        unreleased_prs: List[Dict[str, Any]],
+    ) -> Optional[int]:
+        open_issues = self._open_business_issues(client, repo)
+        for issue in open_issues:
+            if str(issue.get("title") or "").strip() == self.README_ISSUE_TITLE:
+                return int(issue.get("number")) if issue.get("number") is not None else None
+
+        missing_sections = docs_status.get("missing_sections", [])
+        missing_text = ", ".join(str(section) for section in missing_sections) or "overview, install, run, deployment"
+        pr_lines = "\n".join(
+            f"- #{pr.get('number')} {str(pr.get('title') or '').strip() or 'Untitled PR'}"
+            for pr in unreleased_prs
+        )
+        body = (
+            "## What to change\n"
+            "Create or rewrite `README.md` so the repository is releasable.\n\n"
+            "## Required sections\n"
+            f"- Missing right now: {missing_text}\n"
+            "- Overview: what the project does and current scope\n"
+            "- Install: prerequisites and `npm install`\n"
+            "- Run/Usage: how to exercise the code that exists today\n"
+            "- Deployment: how to deploy or integrate the current project safely\n\n"
+            "## Constraints\n"
+            "- Be honest about repository scope; do not claim a full app shell exists if it does not.\n"
+            "- Use the actual scripts, files, and modules present in the repository.\n"
+            "- Keep the README user-facing.\n\n"
+            "## Recent merged work\n"
+            f"{pr_lines}\n"
+        )
+
+        try:
+            if hasattr(client, "create_issue"):
+                issue = client.create_issue(self.README_ISSUE_TITLE, body, ["ready-to-code"])
+            else:
+                issue = client.api(
+                    f"repos/{repo}/issues",
+                    {"title": self.README_ISSUE_TITLE, "body": body, "labels[]": ["ready-to-code"]},
+                    method="POST",
+                )
+        except Exception:
+            return None
+
+        if isinstance(issue, dict):
+            number = issue.get("number")
+            if isinstance(number, int):
+                return number
+            result = issue.get("result")
+            if isinstance(result, dict) and isinstance(result.get("number"), int):
+                return result.get("number")
         return None
 
     def _readme_text(self, client: Any, repo: str) -> str:

@@ -197,6 +197,8 @@ A managed project is only releaseable when all of the following are true:
   - run/usage instructions
   - deployment instructions
 
+If the README is missing or incomplete, the runtime creates a `ready-to-code` issue titled `Write release README` instead of releasing immediately.
+
 When those checks pass, the runtime emits `project_release_ready` and executes `create_release` against GitHub.
 
 ## Limitations

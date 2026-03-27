@@ -13,12 +13,19 @@ from github_pm_agent.workflow_instance import WorkflowInstance
 class FakeClient:
     def __init__(self, responses):
         self.responses = responses
+        self.created_issues = []
 
     def api(self, path, params=None, method="GET"):
         state = None if not isinstance(params, dict) else params.get("state")
         if (path, state) in self.responses:
             return self.responses[(path, state)]
         return self.responses.get(path, [])
+
+    def create_issue(self, title, body, labels=None):
+        number = 900 + len(self.created_issues) + 1
+        payload = {"number": number, "title": title, "body": body, "labels": list(labels or [])}
+        self.created_issues.append(payload)
+        return payload
 
 
 class ProjectReleaseScannerTest(unittest.TestCase):
@@ -161,7 +168,20 @@ class ProjectReleaseScannerTest(unittest.TestCase):
 
             result = scanner.scan_and_enqueue()
 
-            self.assertEqual(result, [])
+            self.assertEqual(
+                result,
+                [
+                    {
+                        "repo": "acme/widgets",
+                        "blocked_reason": "missing_readme_sections",
+                        "missing_sections": ["deployment"],
+                        "created_issue_number": 901,
+                    }
+                ],
+            )
+            self.assertEqual(len(client.created_issues), 1)
+            self.assertEqual(client.created_issues[0]["title"], ProjectReleaseScanner.README_ISSUE_TITLE)
+            self.assertEqual(client.created_issues[0]["labels"], ["ready-to-code"])
             self.assertIsNone(queue.pop())
 
 
