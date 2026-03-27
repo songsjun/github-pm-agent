@@ -213,6 +213,8 @@ class GitHubPoller:
                 action = "opened" if self._is_newer_than(created_at, since_dt) else "edited"
                 labels = [(label or {}).get("name") for label in item.get("labels", [])]
                 is_ready_to_code = target_kind == "issue" and "ready-to-code" in labels
+                if target_kind == "issue" and "workflow-gate" in labels and not is_ready_to_code:
+                    continue
                 if item.get("pull_request"):
                     event_type = "pull_request_changed"
                 elif is_ready_to_code and action == "opened":

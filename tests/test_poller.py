@@ -222,6 +222,35 @@ class GitHubPollerTest(unittest.TestCase):
         self.assertEqual(events[0].target_number, 7)
         self.assertEqual(events[1].target_number, 8)
 
+    def test_workflow_gate_issue_is_skipped_in_issue_polling(self) -> None:
+        since = "2026-03-19T10:00:00Z"
+        client = FakeClient(
+            api_pages={
+                "repos/acme/widgets/issues": [
+                    [
+                        {
+                            "id": 201,
+                            "number": 21,
+                            "title": "[workflow-gate] acme/widgets Discussion #1 phase=tech_review",
+                            "body": "gate body",
+                            "created_at": "2026-03-19T10:01:00Z",
+                            "updated_at": "2026-03-19T10:01:00Z",
+                            "html_url": "https://example.test/issues/21",
+                            "state": "open",
+                            "state_reason": None,
+                            "labels": [{"name": "workflow-gate"}],
+                            "user": {"login": "pm"},
+                        }
+                    ]
+                ]
+            }
+        )
+        poller = GitHubPoller(client, "acme/widgets", "main", [])
+
+        events = poller._poll_issues(since)
+
+        self.assertEqual(events, [])
+
     def test_ready_to_code_label_event_routes_to_issue_coding(self) -> None:
         since = "2026-03-19T10:00:00Z"
         client = FakeClient(

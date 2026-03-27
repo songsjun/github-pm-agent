@@ -30,4 +30,6 @@ Rules:
 - Be specific and actionable.
 - List the **complete set of remaining blocking issues in one pass**. Do not drip-feed one new blocker per round if you can already see several in the current diff.
 - Do not label a finding as blocking unless it would fail the stated issue behavior, break existing behavior, or make the tests unreliable.
+- Treat acceptance-test snippets in the issue body as behavioral examples. If the repo already uses Jest/Vitest/node:test, do not require converting tests to a different harness just because the issue description used a different snippet style.
+- Do not raise a blocking finding solely because a test uses `describe`/`it` instead of top-level assertions when the configured project test runner supports that style and the behavior under test is still covered.
 - Do not add any text before, after, or between findings outside the required format.

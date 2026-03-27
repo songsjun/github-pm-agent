@@ -341,7 +341,28 @@ class PhaseGateScanner:
                 "advanced_at": utc_now_iso(),
             },
         )
+        self._close_workflow_gate_issue(repo, instance.get_gate_issue_number())
         instance.clear_gate()
+
+    def _close_workflow_gate_issue(self, repo: str, gate_issue_number: Optional[int]) -> None:
+        if gate_issue_number is None or self.actions is None:
+            return
+        try:
+            issue = self.client.api(f"repos/{repo}/issues/{gate_issue_number}", method="GET")
+        except Exception:
+            return
+        if not isinstance(issue, dict):
+            return
+        labels = {
+            str((label or {}).get("name", "")).strip()
+            for label in issue.get("labels", [])
+            if isinstance(label, dict)
+        }
+        if "workflow-gate" not in labels:
+            return
+        if str(issue.get("state") or "").lower() == "closed":
+            return
+        self.actions.edit("issue", gate_issue_number, {"state": "closed"})
 
     def _build_gate_key(
         self,

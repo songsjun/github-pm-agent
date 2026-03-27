@@ -81,6 +81,8 @@ def resolve_handler(engine: "EventEngine", event: Event) -> Tuple[str, HandlerFn
         return "repeated_ci_instability", handle_repeated_ci_instability
     if event.event_type == "release_readiness":
         return "release_readiness", handle_release_readiness
+    if event.event_type == "project_release_ready":
+        return "project_release_ready", handle_project_release_ready
     if event.event_type == "review_churn":
         return "review_churn", handle_review_churn
     if event.event_type == "stale_discussion_decision":
@@ -112,6 +114,18 @@ def handle_mention(engine: "EventEngine", event: Event) -> Dict:
 
 
 def handle_issue_changed(engine: "EventEngine", event: Event) -> Dict:
+    labels = {str(label).strip() for label in event.metadata.get("labels", []) if str(label).strip()}
+    if "workflow-gate" in labels:
+        return engine.finish_plan(
+            event,
+            _memory_only_plan(
+                engine,
+                reason="workflow-gate issues are synthetic control-plane state and do not need issue analysis",
+                target_kind="issue",
+                target_number=event.target_number,
+                memory_note=f"workflow gate issue #{event.target_number or 0} updated",
+            ),
+        )
     return _run_capability_route(engine, event)
 
 
@@ -492,6 +506,34 @@ def handle_check_run_pending(engine: "EventEngine", event: Event) -> Dict:
 
 def handle_release_readiness(engine: "EventEngine", event: Event) -> Dict:
     return _run_capability_route(engine, event)
+
+
+def handle_project_release_ready(engine: "EventEngine", event: Event) -> Dict:
+    metadata = event.metadata or {}
+    tag_name = str(metadata.get("tag_name") or "").strip() or "v0.1.0"
+    release_name = str(metadata.get("release_name") or "").strip() or f"Release {tag_name}"
+    release_body = str(metadata.get("release_body") or event.body or "").strip()
+    target_commitish = str(metadata.get("target_commitish") or "main").strip() or "main"
+    merged_pr_count = int(metadata.get("merged_pr_count") or 0)
+    plan = engine.make_plan(
+        should_act=True,
+        reason="all managed implementation workflows completed and repository has no remaining open work",
+        action_type="create_release",
+        target_kind="repo",
+        target_number=None,
+        message="",
+        action_input={
+            "tag_name": tag_name,
+            "name": release_name,
+            "body": release_body,
+            "target_commitish": target_commitish,
+            "draft": False,
+            "prerelease": False,
+            "generate_release_notes": False,
+        },
+        memory_note=f"project release {tag_name} prepared after {merged_pr_count} merged pull request(s)",
+    )
+    return engine.finish_plan(event, plan)
 
 
 def handle_review_churn(engine: "EventEngine", event: Event) -> Dict:

@@ -73,6 +73,7 @@ class GitHubPMAgentAppTest(unittest.TestCase):
             patch("github_pm_agent.app.IssueCodingSyncScanner", return_value=Mock()),
             patch("github_pm_agent.app.MergeConflictScanner", return_value=Mock()),
             patch("github_pm_agent.app.IssueCodingRecoveryScanner", return_value=Mock()),
+            patch("github_pm_agent.app.ProjectReleaseScanner", return_value=Mock()),
             patch("github_pm_agent.app.RoleRegistry", return_value=Mock()),
         ):
             return GitHubPMAgentApp(self.config, self.project_root)
@@ -123,6 +124,7 @@ class GitHubPMAgentAppTest(unittest.TestCase):
         app.issue_coding_sync_scanner.scan_and_sync = Mock(return_value=[])
         app.merge_conflict_scanner.scan_and_requeue = Mock(return_value=[])
         app.issue_coding_recovery_scanner.scan_and_requeue = Mock(return_value=[])
+        app.project_release_scanner.scan_and_enqueue = Mock(return_value=[])
         app.gate_scanner.scan_and_advance = Mock(return_value=[])
 
         result = app.cycle()
@@ -133,12 +135,14 @@ class GitHubPMAgentAppTest(unittest.TestCase):
         self.assertEqual(result["active_phase_recovery"], [])
         self.assertEqual(result["created_issue_fanout"], [])
         self.assertEqual(result["workflow_recovery"], [])
+        self.assertEqual(result["project_release"], [])
         self.assertEqual(len(result["processed"]), 1)
         app.active_phase_recovery_scanner.scan_and_requeue.assert_called_once()
         app.created_issue_fanout_scanner.scan_and_enqueue.assert_called_once()
         app.issue_coding_sync_scanner.scan_and_sync.assert_called_once()
         app.merge_conflict_scanner.scan_and_requeue.assert_called_once()
         app.issue_coding_recovery_scanner.scan_and_requeue.assert_called_once()
+        app.project_release_scanner.scan_and_enqueue.assert_called_once()
         queue.mark_done.assert_called_once()
         queue.mark_failed.assert_called_once_with(event_two, "boom")
         # Verify both drain_queue() calls ran (cycle design: poll → drain → gate_scan → drain).
@@ -159,6 +163,7 @@ class GitHubPMAgentAppTest(unittest.TestCase):
         app.issue_coding_sync_scanner.scan_and_sync = Mock(return_value=[])
         app.merge_conflict_scanner.scan_and_requeue = Mock(return_value=[])
         app.issue_coding_recovery_scanner.scan_and_requeue = Mock(return_value=[])
+        app.project_release_scanner.scan_and_enqueue = Mock(return_value=[])
         app.gate_scanner.scan_and_advance = Mock(return_value=[])
 
         with self.assertRaisesRegex(RuntimeError, "boom"):
@@ -211,6 +216,7 @@ class GitHubPMAgentAppTest(unittest.TestCase):
             patch("github_pm_agent.app.IssueCodingSyncScanner", return_value=Mock()),
             patch("github_pm_agent.app.MergeConflictScanner", return_value=Mock()),
             patch("github_pm_agent.app.IssueCodingRecoveryScanner", return_value=Mock()),
+            patch("github_pm_agent.app.ProjectReleaseScanner", return_value=Mock()),
             patch("github_pm_agent.app.RoleRegistry", return_value=Mock()),
             patch("github_pm_agent.app.utc_now_iso", return_value="2026-03-19T12:00:00Z"),
         ):
@@ -294,6 +300,28 @@ class GitHubPMAgentAppTest(unittest.TestCase):
 
         assert event is not None
         self.assertEqual(event.event_type, "issue_event_labeled")
+
+    def test_workflow_gate_issue_webhook_does_not_route_to_issue_changed(self) -> None:
+        app = self._build_app()
+
+        event = app._event_from_github_payload(
+            "issues",
+            {
+                "action": "edited",
+                "repository": {"full_name": "acme/widgets"},
+                "issue": {
+                    "number": 19,
+                    "title": "[workflow-gate] acme/widgets Discussion #1 phase=tech_review",
+                    "body": "gate body",
+                    "labels": [{"name": "workflow-gate"}],
+                },
+                "sender": {"login": "pm"},
+                "updated_at": "2026-03-19T12:06:00Z",
+            },
+        )
+
+        assert event is not None
+        self.assertEqual(event.event_type, "issue_event_gate_observation")
 
     def test_issue_comment_webhook_keeps_comment_body(self) -> None:
         app = self._build_app()

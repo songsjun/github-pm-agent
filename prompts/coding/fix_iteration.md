@@ -62,6 +62,8 @@ Requirements:
 - If a file must be removed to make the tests pass or to resolve the review finding, list it in `delete_files`.
 - The fix must make all tests pass.
 - Do NOT create a new branch — use the exact branch name from the original plan.
+- Preserve the repository's existing test runner and test harness. Treat acceptance-test snippets in the issue body as behavioral examples, not literal instructions to switch a Jest/Vitest/node:test file into a different execution style.
+- If the configured `test_command` runs Jest/Vitest, keep the test file in a format that runner will execute. Do not rewrite tests into bare top-level assertions unless the configured runner supports them directly.
 - Respect the original issue boundary. Stay inside the declared issue file(s) unless a directly related test-support/config file must also change.
 - If the issue labels include `test`, do not modify production runtime modules. Limit changes to the declared test file(s) and test-support/config files.
 

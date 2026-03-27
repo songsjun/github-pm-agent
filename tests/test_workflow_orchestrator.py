@@ -22,6 +22,7 @@ class RecordingActions:
         self.coding_session_calls: List[Dict[str, Any]] = []
         self.submit_pr_review_calls: List[Dict[str, Any]] = []
         self.merge_or_reopen_calls: List[Dict[str, Any]] = []
+        self.edit_calls: List[Dict[str, Any]] = []
 
     def comment(self, target_kind: str, target_number: Optional[int], message: str) -> Dict[str, Any]:
         payload = {
@@ -53,6 +54,16 @@ class RecordingActions:
     def create_issue(self, title: str, body: str, labels: Optional[List[str]] = None) -> Dict[str, Any]:
         payload = {"title": title, "body": body, "labels": list(labels or []), "dry_run": self.dry_run}
         self.create_issue_calls.append(payload)
+        return payload
+
+    def edit(self, target_kind: str, target_number: Optional[int], fields: Dict[str, Any]) -> Dict[str, Any]:
+        payload = {
+            "target_kind": target_kind,
+            "target_number": target_number,
+            "fields": dict(fields),
+            "dry_run": self.dry_run,
+        }
+        self.edit_calls.append(payload)
         return payload
 
     def coding_session(
@@ -2338,6 +2349,57 @@ def test_phase_gate_scanner_repeated_issue_gate_uses_gate_instance_key() -> None
         resumed = store.pop()
         assert resumed is not None
         assert resumed.metadata["execute_gated_action"] is True
+
+
+def test_phase_gate_scanner_closes_consumed_workflow_gate_issue() -> None:
+    from github_pm_agent.phase_gate_scanner import PhaseGateScanner
+    from github_pm_agent.queue_store import QueueStore
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runtime_dir = Path(tmpdir)
+        store = QueueStore(runtime_dir)
+
+        instance = WorkflowInstance.load(runtime_dir, "songsjun/example", 42)
+        instance.set_phase("tech_review")
+        instance.set_gate(99, "tech_review", posted_at="2026-03-20T12:00:00Z")
+        instance.set_original_event(_discussion_event().to_dict())
+
+        class FakeClientComments:
+            def api(self, path: str, params: Any = None, method: str = "GET") -> Any:
+                if path == "repos/songsjun/example/issues/99/comments":
+                    return [
+                        {
+                            "created_at": "2026-03-20T12:05:00Z",
+                            "user": {"login": "owner"},
+                            "body": "approve",
+                        }
+                    ]
+                if path == "repos/songsjun/example/issues/99":
+                    return {"state": "open", "labels": [{"name": "workflow-gate"}]}
+                return []
+
+        actions = RecordingActions()
+        scanner = PhaseGateScanner(store, FakeClientComments(), "owner", actions)
+
+        advanced = scanner.scan_and_advance()
+
+        assert advanced == [
+            {
+                "repo": "songsjun/example",
+                "discussion_number": 42,
+                "from_phase": "tech_review",
+                "to_phase": "tech_review",
+                "response_type": "confirm",
+            }
+        ]
+        assert actions.edit_calls == [
+            {
+                "target_kind": "issue",
+                "target_number": 99,
+                "fields": {"state": "closed"},
+                "dry_run": True,
+            }
+        ]
 
 
 def test_review_output_with_trailing_newlines_is_not_contract_violation() -> None:

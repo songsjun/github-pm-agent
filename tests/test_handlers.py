@@ -3,12 +3,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from github_pm_agent.handlers import (
+    handle_issue_changed,
     handle_issue_event_assigned,
     handle_issue_event_closed,
     handle_workflow_failed,
     handle_workflow_run,
     handle_issue_event_review_requested,
     handle_issue_event_reopened,
+    handle_project_release_ready,
     handle_pull_request_review_approved,
     handle_pull_request_review_changes_requested,
     resolve_handler,
@@ -115,6 +117,7 @@ class HandlerResolutionTest(unittest.TestCase):
             ("issue_event_review_requested", "issue_event_review_requested", {"review_requested_reviewer": "bob"}),
             ("discussion_comment", "discussion_ai"),
             ("mention", "mention"),
+            ("project_release_ready", "project_release_ready"),
             ("release_readiness", "release_readiness"),
             ("review_churn", "review_churn"),
             ("repeated_ci_instability", "repeated_ci_instability"),
@@ -244,6 +247,44 @@ class HandlerResolutionTest(unittest.TestCase):
         self.assertEqual(result["plan"]["action_type"], "none")
         self.assertIn("@owner1", result["plan"]["memory_note"])
         self.assertIn("@manager1", result["plan"]["memory_note"])
+
+    def test_workflow_gate_issue_changed_is_memory_only(self) -> None:
+        engine = FakeEngine()
+        event = self._event(
+            "issue_changed",
+            target_kind="issue",
+            target_number=2,
+            metadata={"labels": ["workflow-gate"]},
+        )
+
+        result = handle_issue_changed(engine, event)
+
+        self.assertFalse(result["plan"]["should_act"])
+        self.assertEqual(result["plan"]["action_type"], "none")
+        self.assertIn("workflow-gate issues are synthetic", result["plan"]["reason"])
+
+    def test_project_release_ready_creates_release(self) -> None:
+        engine = FakeEngine()
+        event = self._event(
+            "project_release_ready",
+            target_kind="repo",
+            target_number=None,
+            body="Automated release body",
+            metadata={
+                "tag_name": "v0.1.0",
+                "release_name": "Release v0.1.0",
+                "release_body": "Automated release body",
+                "target_commitish": "main",
+                "merged_pr_count": 7,
+            },
+        )
+
+        result = handle_project_release_ready(engine, event)
+
+        self.assertTrue(result["plan"]["should_act"])
+        self.assertEqual(result["plan"]["action_type"], "create_release")
+        self.assertEqual(result["plan"]["action_input"]["tag_name"], "v0.1.0")
+        self.assertEqual(result["plan"]["action_input"]["target_commitish"], "main")
 
     def test_discussion_comments_route_to_ai(self) -> None:
         engine = FakeEngine()

@@ -27,6 +27,7 @@ from github_pm_agent.phase_gate_scanner import PhaseGateScanner
 from github_pm_agent.issue_coding_recovery_scanner import IssueCodingRecoveryScanner
 from github_pm_agent.issue_coding_sync_scanner import IssueCodingSyncScanner
 from github_pm_agent.merge_conflict_scanner import MergeConflictScanner
+from github_pm_agent.project_release_scanner import ProjectReleaseScanner
 from github_pm_agent.workflow_orchestrator import WorkflowOrchestrator
 
 
@@ -101,6 +102,11 @@ class GitHubPMAgentApp:
             self.queue,
             self.config.get("github", {}).get("default_branch", "main"),
         )
+        self.project_release_scanner = ProjectReleaseScanner(
+            self.queue,
+            {repo_runtime.repo: repo_runtime.client for repo_runtime in self.repo_runtimes},
+            config,
+        )
         self.cursors_path = self.runtime_dir / "cursors.json"
 
     def poll(self) -> Dict[str, Any]:
@@ -155,6 +161,7 @@ class GitHubPMAgentApp:
             active_phase_recovery_result = self.active_phase_recovery_scanner.scan_and_requeue()
             created_issue_fanout_result = self.created_issue_fanout_scanner.scan_and_enqueue()
             workflow_recovery_result = self.issue_coding_recovery_scanner.scan_and_requeue()
+            project_release_result = self.project_release_scanner.scan_and_enqueue()
             gate_advance_result = self.gate_scanner.scan_and_advance()
             # Drain the conflict/gate advance events produced after the main queue pass.
             processed = processed + self.drain_queue()
@@ -166,6 +173,7 @@ class GitHubPMAgentApp:
                 "active_phase_recovery": active_phase_recovery_result,
                 "created_issue_fanout": created_issue_fanout_result,
                 "workflow_recovery": workflow_recovery_result,
+                "project_release": project_release_result,
                 "gate_advance": gate_advance_result,
                 "processed": processed,
             }
@@ -449,6 +457,8 @@ class GitHubPMAgentApp:
             issue_state = str(issue_payload.get("state") or payload.get("state") or "").lower()
             labels = [str((label or {}).get("name", "")) for label in issue_payload.get("labels", []) if isinstance(label, dict)]
             label_name = str((payload.get("label") or {}).get("name") or "")
+            if "workflow-gate" in labels:
+                return "issue_event_gate_observation"
             if issue_state != "closed" and action == "labeled" and label_name == "ready-to-code":
                 return "issue_coding"
             if issue_state != "closed" and action == "reopened" and "ready-to-code" in labels:

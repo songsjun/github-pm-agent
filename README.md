@@ -1,87 +1,57 @@
 # github-pm-agent
 
-`github-pm-agent` is a polling-driven GitHub PM agent runtime for a target repository.
+`github-pm-agent` is a polling-driven GitHub project manager for multi-agent software delivery. It watches GitHub state, runs structured PM/worker workflows, opens and reviews PRs, and can now finish the loop by creating a release once delivery gates are satisfied.
 
-This repository is intentionally scoped as an MVP:
+## Overview
 
-- single process
-- synchronous execution
-- local file-backed queue and state
-- optional multi-repo polling from one local runtime
-- `gh api` for GitHub reads/writes
-- pluggable AI adapters
-- prompt/template/skill library
-- optional supervisory pass for memory extraction
+The runtime is built around deterministic control flow with bounded AI usage.
 
-## Why this shape
+- GitHub events are polled and normalized into a local queue.
+- Workflow YAML files define discussion, coding, and recovery phases.
+- Agents collaborate through prompts, artifacts, and GitHub comments instead of hidden memory.
+- High-risk state changes stay machine-checked: tests, mergeability, gate handling, and release creation are explicit steps.
 
-The goal is not to let an LLM freestyle over raw GitHub state.
+## Core Workflow
 
-The runtime is split into six small layers:
+The main project flow is:
 
-1. `poller`: fetch new GitHub state changes since the last cursor
-2. `queue`: persist normalized events locally as JSONL
-3. `engine`: classify events and dispatch them to handlers
-4. `ai adapter`: unify model calls behind one request/response interface
-5. `github actions`: wrap repo mutations with dry-run support
-6. `supervisor`: optionally review important interactions and write memory notes
+1. `discussion` — clarify the request, produce requirements, review a technical design, and break work into GitHub issues.
+2. `issue_coding` — implement on per-issue branches, run tests, open PRs, review, fix, and merge.
+3. `project_release_ready` — when all managed coding issues are complete and the repo is clean, create a GitHub Release.
 
-Deterministic work stays deterministic. AI is used for summarization, drafting, and judgment where text synthesis actually helps.
+Release is intentionally gated by repository documentation. A release is blocked if the target repository README is missing required sections for overview, install, run, or deployment.
 
-## What it covers
+## Features
 
-- repo notifications for stronger mention signals
-- repo events for push, force-push, branch create/delete, and release signals
-- issue, issue comment, issue event polling
-- milestone polling and project change polling
-- pull request, review, review comment polling
-- workflow run, deployment, release, check-run, and commit-status polling
-- commit polling from the default branch
-- discussion and discussion comment polling through GraphQL
-- mention detection from notifications plus bodies/comments
-- local queue and cursor state
-- follow-up scheduling and replay from local memory notes
-- typed memory signals for policy and execution trends
-- durable artifacts for brief/spec/release/retro reuse
-- handler registry for event types
-- `poll`, `cycle`, `reconcile`, `daemon`, `webhook`, `analytics`, and queue inspection commands
-- provider/model-selectable AI adapter
-- prompt, template, memory, and skill loading
-- GitHub mutation helpers with dry-run mode, including merge/review/discussion/release/project actions
-- optional second-opinion review mode for high-risk PRs
+- Multi-agent GitHub workflow orchestration
+- Discussion-driven planning before coding starts
+- Deterministic gate handling with human confirmation support
+- Isolated coding sessions with test execution in DevEnv
+- Recovery scanners for stalled workflows, merge conflicts, and repo-state drift
+- GitHub mutations for comments, labels, reviews, merges, discussions, and releases
+- Local file-backed runtime for queue, memory, sessions, artifacts, and cursors
+- CLI entrypoints for `poll`, `cycle`, `reconcile`, `daemon`, `webhook`, and queue inspection
 
-## What it does not cover yet
+## Repository Layout
 
-- concurrency
-- database-backed state
-- advanced scheduling
-- autonomous merge/release behavior
-- a fully declarative policy engine for every PM rule
+- `src/github_pm_agent/` — runtime, queue, orchestrator, handlers, scanners, GitHub client
+- `workflows/` — YAML workflow definitions
+- `prompts/` — system, discussion, coding, and action prompts
+- `roles/` — role configuration used by the orchestrator
+- `scripts/` — local helpers, AI CLI wrapper, E2E runner, local DevEnv server
+- `config/` — example configs and E2E configs
+- `tests/` — unit tests for orchestrator, scanners, handlers, poller, coding session, adapters
+- `.runtime/` or `runtime/` — local state, queues, logs, artifacts, sessions
 
-Those can come later if the loop proves useful.
+## Install
 
-## Quick start
-
-### Requirements
+Requirements:
 
 - Python 3.9+
-- GitHub CLI installed and authenticated
-- local Codex CLI and/or Gemini CLI installed if you want to use CLI-backed providers
+- GitHub CLI authenticated for the accounts you want to use
+- `codex` and/or `gemini` CLI if you use CLI-backed providers
 
-Check `gh`:
-
-```bash
-gh auth status
-```
-
-Check local AI CLIs:
-
-```bash
-codex --version
-gemini --version
-```
-
-### Install
+Install locally:
 
 ```bash
 python3 -m venv .venv
@@ -89,108 +59,152 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-### Configure
+Check local tools:
 
-Copy the example config:
+```bash
+gh auth status
+codex --version
+gemini --version
+```
+
+## Configure
+
+Start from the example config:
 
 ```bash
 cp config/example.json config/local.json
 ```
 
-Then set the target repository, mentions to watch, and AI provider settings.
+Key fields:
 
-You can also provide `github.repos` as a list if you want one runtime to poll multiple repositories.
+- `github.repo` or `github.repos` — target repository list
+- `github.default_branch` — release and merge base branch
+- `engine.dry_run` — keep `true` while validating behavior
+- `ai.default_provider` — usually `codex_cli`
+- `runtime.state_dir` — local queue and state directory
 
-The example config already includes two local providers:
+For the multi-account E2E flow, see `config/e2e-weather.yaml` and the generated live config `config/e2e-weather-live.json`.
 
-- `codex_cli` via `scripts/run_ai_cli.py`
-- `gemini_cli` via `scripts/run_ai_cli.py`
+## Run
 
-The example config resolves `gh`, `codex`, and `gemini` from `PATH`. If your executables live elsewhere, set explicit paths in `config/local.json`.
-
-`codex_cli` is the default because it has been the more stable local CLI provider in practice. For Gemini, prefer `gemini-2.5-flash` over the preview default because the preview model may reject requests when capacity is tight.
-
-### Run one cycle
+Run one full poll/process cycle:
 
 ```bash
-github-pm-agent cycle --config config/local.json
+github-pm-agent --config config/local.json cycle
 ```
 
-This does:
+Useful commands:
+
+```bash
+github-pm-agent --config config/local.json poll
+github-pm-agent --config config/local.json reconcile
+github-pm-agent --config config/local.json daemon --interval 60
+github-pm-agent --config config/local.json analytics
+github-pm-agent --config config/local.json queue peek --limit 10
+```
+
+What `cycle` does:
 
 1. poll GitHub
 2. enqueue normalized events
 3. drain the queue
-4. route each event to a handler
-5. write proposed or executed actions
+4. run workflow scanners and gate scanners
+5. apply actions or record failures
 
-Current concrete handlers:
+## E2E Demo
 
-- `mention`: AI drafts a bounded response
-- `issue_changed`, `issue_comment`, `pull_request_changed`, `pull_request_review_comment`, `commit`: stage-routed AI handling
-- `stale_pr_review`: deterministic reminder on open PRs with no review after threshold
-- `blocked_issue_stale`: deterministic reminder on long-blocked issues
-- `workflow_failed`, `commit_status_failed`, `check_run_failed`: deterministic triage with escalation metadata
-- `release_readiness`, `review_churn`, `repeated_ci_instability`, `stale_discussion_decision`, `docs_drift_before_release`: synthetic PM signals
-- `issue_event_labeled` with label `blocked`: deterministic blocker-template comment
-- unknown `issue_event_*`: memory-only observation fallback
-- other events fall back to stage-aware AI routing rather than one generic prompt
-
-### Useful commands
+The repository includes a full end-to-end runner for the Weather Atlas demo:
 
 ```bash
-github-pm-agent poll --config config/local.json
-github-pm-agent queue list --config config/local.json
-github-pm-agent queue peek --config config/local.json --limit 5
-github-pm-agent cycle --config config/local.json
-github-pm-agent reconcile --config config/local.json
-github-pm-agent analytics --config config/local.json
-github-pm-agent daemon --config config/local.json --interval 60
-github-pm-agent webhook --config config/local.json --event-type issues --payload-file payload.json
+python3 scripts/e2e_weather_runner.py start
+python3 scripts/e2e_weather_runner.py status
+python3 scripts/e2e_weather_runner.py confirm --comment "approve"
+python3 scripts/e2e_weather_runner.py stop
 ```
 
-## Runtime layout
+This runner can:
 
-Everything is local files under `runtime/`:
+- generate a requirements file
+- create a GitHub repo and discussion
+- start local background services
+- monitor workflow state under `.runtime/e2e-weather/`
+
+## Deployment
+
+### Docker
+
+Build the runtime image:
+
+```bash
+docker build -t github-pm-agent:latest .
+```
+
+Run it with a config path and GitHub credentials:
+
+```bash
+docker run --rm \
+  -e CONFIG_PATH=/app/config/devenv.yaml \
+  -e GITHUB_TOKEN_PM=... \
+  -e GITHUB_TOKEN_ENGINEER=... \
+  -e GITHUB_TOKEN_SECURITY=... \
+  github-pm-agent:latest
+```
+
+### DevEnv
+
+A DevEnv-oriented config is provided in `config/devenv.yaml`. It assumes the capability bridge will inject `DEVENV_CAPS_URL` and that GitHub tokens are passed as environment variables.
+
+Typical shape:
+
+```bash
+devenv build . --tag pm-agent:latest
+devenv run pm-agent:latest \
+  --env CONFIG_PATH=/app/config/devenv.yaml \
+  --env GITHUB_TOKEN_PM=... \
+  --env GITHUB_TOKEN_ENGINEER=... \
+  --env GITHUB_TOKEN_SECURITY=...
+```
+
+## Runtime State
+
+The runtime is intentionally file-backed and inspectable.
+
+Common files:
 
 - `runtime/cursors.json`
 - `runtime/queue_pending.jsonl`
 - `runtime/queue_done.jsonl`
 - `runtime/queue_dead.jsonl`
-- `runtime/seen_ids.json`
 - `runtime/outbox.jsonl`
-- `runtime/memory_notes.jsonl`
-- `runtime/followups.jsonl`
 - `runtime/sessions/`
-- `runtime/memory/distilled.md`
-- `runtime/memory/policy.md`
-- `runtime/memory/trends.md`
-- `runtime/memory/retro.md`
+- `runtime/memory/`
+- `.runtime/e2e-weather/logs/`
 
-This keeps the MVP inspectable and easy to reset.
+This makes failure analysis and replay straightforward.
 
-## Provider adapter
+## Release Gate
 
-The normalized CLI adapter script is `scripts/run_ai_cli.py`.
+A managed project is only releaseable when all of the following are true:
 
-It standardizes:
+- the `discussion` workflow completed
+- all `issue_coding` workflows completed
+- no business issues remain open
+- no PRs remain open
+- unreleased merged PRs exist
+- the target repo README includes:
+  - project overview
+  - install instructions
+  - run/usage instructions
+  - deployment instructions
 
-- provider selection: `codex` or `gemini`
-- prompt file input
-- cwd pinning
-- optional schema handoff for Codex
-- normalized JSON output back to the runtime
+When those checks pass, the runtime emits `project_release_ready` and executes `create_release` against GitHub.
 
-## Design decisions
+## Limitations
 
-- GitHub access uses `gh api` instead of a custom auth stack.
-- Queue/state is JSONL plus a few small JSON files, not SQLite.
-- Event handlers are plain Python functions registered by event type.
-- AI session continuity is local and provider-agnostic first.
-- All GitHub actions support `dry_run`; default config keeps it enabled.
+Current gaps are still real:
 
-## Suggested next steps
-
-- introduce repo-specific PM policies
-- add a more declarative cooldown and escalation policy layer
-- add richer artifact types for release checklists and roadmap sync
+- queue/state is local JSONL, not database-backed
+- concurrency is intentionally limited
+- release notes are deterministic but still simple
+- repo-specific policies are prompt- and config-driven, not a full policy DSL
+- workflow quality still depends on prompt contracts and test quality in the target repo
